@@ -645,6 +645,29 @@ def _persist_session(session: "ClaudeSession") -> None:
         log.warning("Failed to persist session: %s", exc)
 
 
+def _restore_sessions_from_disk() -> None:
+    """Load saved_sessions.json into _SESSIONS so sessions survive bridge restarts."""
+    saved = _load_saved_sessions()
+    count = 0
+    for sid, data in saved.items():
+        if sid in _SESSIONS:
+            continue
+        try:
+            session = ClaudeSession(
+                session_id=sid,
+                name=data.get("name", sid[:8]),
+                created_at=float(data.get("last_used", time.time())),
+                cwd=data.get("cwd", "/Users/wulala"),
+            )
+            session.claude_session_uuid = data.get("claude_uuid") or None
+            _SESSIONS[sid] = session
+            count += 1
+        except Exception as exc:
+            log.warning("Failed to restore session %s: %s", sid, exc)
+    if count:
+        log.info("Restored %d session(s) from disk", count)
+
+
 # ---------------------------------------------------------------------------
 # stdout_reader — parses NDJSON from claude subprocess
 # ---------------------------------------------------------------------------
@@ -1374,6 +1397,7 @@ async def handler(ws: ServerConnection) -> None:
 # ---------------------------------------------------------------------------
 async def main(port: int) -> None:
     init_firebase()
+    _restore_sessions_from_disk()
     log.info("Claude Bridge v2 starting on port %d", port)
     async with serve(
         handler,
