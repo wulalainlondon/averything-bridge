@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.wulala.claude-bridge</string>
+  <key>Program</key><string>/opt/homebrew/Cellar/python@3.14/3.14.4/Frameworks/Python.framework/Versions/3.14/bin/python3.14</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/Cellar/python@3.14/3.14.4/Frameworks/Python.framework/Versions/3.14/bin/python3.14</string>
+    <string>/Users/wulala/Downloads/Helper/claude-bridge/bridge/claude_bridge.py</string>
+    <string>--port</string><string>8765</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/wulala/Downloads/Helper/claude-bridge/bridge</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/wulala/Downloads/Helper/claude-bridge/bridge/bridge.log</string>
+  <key>StandardErrorPath</key><string>/Users/wulala/Downloads/Helper/claude-bridge/bridge/bridge.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/wulala/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>/Users/wulala</string>
+    <key>PYTHONPATH</key><string>/Users/wulala/Downloads/Helper/claude-bridge/bridge/venv/lib/python3.14/site-packages</string>
+  </dict>
+</dict>
+</plist>
