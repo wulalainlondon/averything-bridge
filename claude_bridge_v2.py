@@ -638,6 +638,14 @@ def _persist_session(session: "ClaudeSession") -> None:
         "last_used": int(time.time()),
         "cwd": session.cwd,
     }
+    # Prune entries older than 90 days (keep at most 200)
+    cutoff = int(time.time()) - 90 * 24 * 3600
+    saved = {
+        k: v for k, v in saved.items()
+        if v.get("last_used", 0) > cutoff
+    }
+    if len(saved) > 200:
+        saved = dict(sorted(saved.items(), key=lambda x: x[1].get("last_used", 0), reverse=True)[:200])
     try:
         with open(SAVED_SESSIONS_FILE, "w") as f:
             json.dump(saved, f, indent=2, ensure_ascii=False)
