@@ -298,6 +298,9 @@ def _msg_session_history(session_id: str, messages: list[dict]) -> dict:
 def _msg_resumable_sessions(sessions: list[dict]) -> dict:
     return {"type": "resumable_sessions", "sessions": sessions}
 
+def _msg_session_uuid(session_id: str, claude_uuid: str) -> dict:
+    return {"type": "session_uuid", "session_id": session_id, "claude_uuid": claude_uuid}
+
 def _msg_shell_created(shell_id: str) -> dict:
     return {"type": "shell_created", "shell_id": shell_id}
 
@@ -410,6 +413,7 @@ class Session:
     is_streaming: bool = False
     is_stopping: bool = False
     resume_id: Optional[str] = None
+    effort: str = ""
     last_activity: float = 0.0
     accumulated_text: str = ""
     ws_ref: Optional[Any] = field(default=None, repr=False)
@@ -664,6 +668,7 @@ async def handler(ws: ServerConnection) -> None:
                 name             = msg["name"]
                 cwd              = msg.get("cwd", DEFAULT_CWD)
                 resume_claude_id = msg.get("resume_claude_id", "")
+                effort           = msg.get("effort", "")
 
                 async with _SESSIONS_LOCK:
                     if sid in _SESSIONS:
@@ -694,6 +699,7 @@ async def handler(ws: ServerConnection) -> None:
                         cwd=cwd,
                         ws_ref=ws,
                         resume_id=resume_claude_id or None,
+                        effort=effort,
                     )
                     _SESSIONS[sid] = session
 
@@ -796,6 +802,20 @@ async def handler(ws: ServerConnection) -> None:
                     continue
                 session.ws_ref = ws
                 asyncio.create_task(_BACKEND.clear(session))
+
+            # ------------------------------------------------------------------
+            elif mtype == "set_effort":
+                sid    = msg.get("session_id", "")
+                effort = msg.get("effort", "")
+                session = _SESSIONS.get(sid)
+                if session:
+                    session.effort = effort
+                    session.ws_ref = ws
+                    label = effort or "auto"
+                    await send_event(session, _evt_session_warning(f"Effort set to {label}, restarting…"))
+                    asyncio.create_task(_BACKEND.stop(session))
+                    await asyncio.sleep(0.5)
+                    asyncio.create_task(_BACKEND.spawn(session))
 
             # ------------------------------------------------------------------
             elif mtype == "get_usage":

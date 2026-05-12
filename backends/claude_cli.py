@@ -408,6 +408,8 @@ console.log(JSON.stringify(data));
         ]
         if session.resume_id:
             cmd += ["--resume", session.resume_id]
+        if session.effort and session.effort != "auto":
+            cmd += ["--effort", session.effort]
 
         log.info("[%s] Spawning claude: %s (cwd=%s)", session.session_id, cmd, session.cwd)
 
@@ -494,8 +496,18 @@ console.log(JSON.stringify(data));
                 if subtype == "success":
                     log.info("[%s] result success, claude_uuid=%s", session.session_id, new_uuid)
                     if new_uuid:
+                        first_uuid = session.resume_id is None
                         session.resume_id = new_uuid
                         _persist_session(session)
+                        if first_uuid:
+                            from claude_bridge_v2 import _msg_session_uuid
+                            try:
+                                if session.ws_ref and session.ws_ref.open:
+                                    await session.ws_ref.send(json.dumps(
+                                        _msg_session_uuid(session.session_id, new_uuid)
+                                    ))
+                            except Exception:
+                                pass
                     asyncio.create_task(notify_fcm(session.name, session.accumulated_text, session.session_id))
                     await send_event(session, _evt_done())
                     session.accumulated_text = ""
