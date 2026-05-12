@@ -1,0 +1,3 @@
+websockets>=14.0
+firebase-admin>=6.0  # optional: FCM push notifications
+aiohttp>=3.9         # optional: Ollama backend

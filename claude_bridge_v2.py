@@ -14,11 +14,12 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import time
-import signal
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, NotRequired, Optional, TypedDict
+from typing import Any, Dict, Literal, NotRequired, Optional, TYPE_CHECKING, TypedDict
 from urllib.parse import quote as urlquote
 
 from websockets.asyncio.server import serve, ServerConnection
@@ -32,8 +33,9 @@ except ImportError:
 
 BRIDGE_DIR           = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE             = os.path.join(BRIDGE_DIR, "bridge_v2.log")
-CLAUDE_BIN           = "/Users/wulala/.npm-global/bin/claude"
-BUN_BIN              = "/opt/homebrew/bin/bun"
+CLAUDE_BIN           = ""
+BUN_BIN              = ""
+DEFAULT_CWD          = os.path.expanduser("~")
 HTTP_PORT            = 9090
 MAX_SESSIONS         = 10
 OFFLINE_BUFFER_MAX   = 500
@@ -42,6 +44,59 @@ FCM_TOKEN_FILE        = os.path.join(BRIDGE_DIR, "fcm_token.txt")
 SERVICE_ACCOUNT_FILE  = os.path.join(BRIDGE_DIR, "serviceAccountKey.json")
 SAVED_SESSIONS_FILE   = os.path.join(BRIDGE_DIR, "saved_sessions.json")
 CLAUDE_PROJECTS_DIR   = os.path.expanduser("~/.claude/projects")
+
+def _find_claude_bin() -> str:
+    env = os.environ.get("CLAUDE_PATH")
+    if env and os.path.isfile(env):
+        return env
+    found = shutil.which("claude")
+    if found:
+        return found
+    candidates = [
+        "~/.npm-global/bin/claude",
+        "~/.local/bin/claude",
+        "~/.bun/bin/claude",
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+    ]
+    for c in candidates:
+        p = os.path.expanduser(c)
+        if os.path.isfile(p):
+            return p
+    print("ERROR: claude binary not found. Set CLAUDE_PATH env var or ensure claude is on PATH.")
+    sys.exit(1)
+
+
+def _find_bun_bin() -> str:
+    env = os.environ.get("BUN_PATH")
+    if env and os.path.isfile(env):
+        return env
+    found = shutil.which("bun")
+    if found:
+        return found
+    candidates = [
+        "/opt/homebrew/bin/bun",
+        "~/.bun/bin/bun",
+        "/usr/local/bin/bun",
+    ]
+    for c in candidates:
+        p = os.path.expanduser(c)
+        if os.path.isfile(p):
+            return p
+    return "bun"
+
+
+def _detect_tailscale_ip() -> "str | None":
+    ts = shutil.which("tailscale")
+    if not ts:
+        return None
+    try:
+        result = subprocess.run([ts, "ip", "-4"], capture_output=True, text=True, timeout=3)
+        ip = result.stdout.strip().split("\n")[0]
+        return ip if ip else None
+    except Exception:
+        return None
+
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -292,10 +347,18 @@ async def ensure_http_server() -> None:
     )
 
 
+if TYPE_CHECKING:
+    from backends.base import Backend
+
+# ---------------------------------------------------------------------------
+# Global backend instance
+# ---------------------------------------------------------------------------
+_BACKEND: "Backend | None" = None
+
 # ---------------------------------------------------------------------------
 # Global session registry
 # ---------------------------------------------------------------------------
-_SESSIONS: Dict[str, "ClaudeSession"] = {}
+_SESSIONS: Dict[str, "Session"] = {}
 _SESSIONS_LOCK = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
@@ -339,79 +402,29 @@ async def _shell_reader(shell: "ShellSession") -> None:
 # Session dataclass
 # ---------------------------------------------------------------------------
 @dataclass
-class ClaudeSession:
+class Session:
     session_id: str
     name: str
     created_at: float
-    cwd: str = "/Users/wulala"
-
-    proc: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
-    stdout_task: Optional[asyncio.Task] = field(default=None, repr=False)
-    stderr_task: Optional[asyncio.Task] = field(default=None, repr=False)
-    watch_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    cwd: str = field(default_factory=lambda: DEFAULT_CWD)
     is_streaming: bool = False
     is_stopping: bool = False
-    claude_session_uuid: Optional[str] = None
+    resume_id: Optional[str] = None
     last_activity: float = 0.0
     accumulated_text: str = ""
-    tool_blocks: dict = field(default_factory=dict)
-    restart_count: int = 0
     ws_ref: Optional[Any] = field(default=None, repr=False)
-    pending_stop: bool = False
     offline_buffer: list = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# fetch_usage — query claude.ai/api/oauth/usage via Bun (same TLS fingerprint)
-# ---------------------------------------------------------------------------
-_BUN_USAGE_SCRIPT = r"""
-const { execSync } = require('child_process');
-const raw = execSync("security find-generic-password -s 'Claude Code-credentials' -g 2>&1").toString();
-const creds = JSON.parse(raw.match(/password: "(.+)"/)[1]);
-const token = creds.claudeAiOauth.accessToken;
-const res = await fetch('https://claude.ai/api/oauth/usage', {
-  headers: { 'Authorization': `Bearer ${token}` }
-});
-const data = await res.json();
-console.log(JSON.stringify(data));
-"""
+# Legacy alias — keeps any remaining references working during transition
+ClaudeSession = Session
 
-async def fetch_usage(ws: ServerConnection) -> None:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            BUN_BIN, "-e", _BUN_USAGE_SCRIPT,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        data = json.loads(stdout.decode().strip())
-
-        def fmt(entry: dict | None) -> dict | None:
-            if not entry:
-                return None
-            return {
-                "utilization": entry.get("utilization"),
-                "resets_at": entry.get("resets_at"),
-            }
-
-        await ws.send(json.dumps(_msg_usage_report(
-            fmt(data.get("five_hour")),
-            fmt(data.get("seven_day")),
-            fmt(data.get("seven_day_sonnet")),
-        )))
-        log.info("Usage report sent")
-    except Exception as exc:
-        log.warning("fetch_usage failed: %s", exc)
-        try:
-            await ws.send(json.dumps(_msg_error(f"Usage fetch failed: {exc}")))
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
 # send_event — all session-scoped outbound events go through here
 # ---------------------------------------------------------------------------
-async def send_event(session: ClaudeSession, event: dict) -> None:
+async def send_event(session: "Session", event: dict) -> None:
     payload = {**event, "session_id": session.session_id}
     if session.ws_ref is not None:
         try:
@@ -428,7 +441,7 @@ async def send_event(session: ClaudeSession, event: dict) -> None:
 # ---------------------------------------------------------------------------
 # stream_text — 4-char chunks, 20 ms delay
 # ---------------------------------------------------------------------------
-async def stream_text(text: str, session: ClaudeSession, chunk_size: int = 4) -> None:
+async def stream_text(text: str, session: "Session", chunk_size: int = 4) -> None:
     for i in range(0, len(text), chunk_size):
         await send_event(session, _evt_text_chunk(text[i:i + chunk_size]))
         await asyncio.sleep(0.02)
@@ -437,7 +450,7 @@ async def stream_text(text: str, session: ClaudeSession, chunk_size: int = 4) ->
 # ---------------------------------------------------------------------------
 # scan_for_media
 # ---------------------------------------------------------------------------
-async def scan_for_media(text: str, session: ClaudeSession) -> None:
+async def scan_for_media(text: str, session: "Session") -> None:
     matches = MEDIA_RE.findall(text)
     for path in matches:
         if not os.path.exists(path):
@@ -509,58 +522,8 @@ async def notify_fcm(session_name: str, last_text: str, session_id: str = "") ->
 
 
 # ---------------------------------------------------------------------------
-# Saved sessions (for resume)
+# Saved sessions (persistence helpers — used by _persist_session, _restore_sessions_from_disk)
 # ---------------------------------------------------------------------------
-def _find_session_file(uuid: str) -> Optional[str]:
-    """Search ~/.claude/projects/ for a JSONL file matching the given UUID."""
-    try:
-        for proj in os.scandir(CLAUDE_PROJECTS_DIR):
-            if not proj.is_dir():
-                continue
-            candidate = os.path.join(proj.path, uuid + ".jsonl")
-            if os.path.isfile(candidate):
-                return candidate
-    except Exception:
-        pass
-    return None
-
-
-def _load_session_history(uuid: str, limit: int = 60) -> list:
-    """Parse JSONL and return last `limit` user/assistant message dicts."""
-    path = _find_session_file(uuid)
-    if not path:
-        return []
-    messages = []
-    try:
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                try:
-                    d = json.loads(raw)
-                    if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
-                        continue
-                    role = d["type"]
-                    content = d.get("message", {}).get("content", "")
-                    text = ""
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        parts = []
-                        for blk in content:
-                            if not isinstance(blk, dict):
-                                continue
-                            if blk.get("type") == "text":
-                                parts.append(blk.get("text", ""))
-                        text = "\n".join(p for p in parts if p)
-                    if not text or text.startswith("<") or text.startswith("[Request interrupted"):
-                        continue
-                    messages.append({"role": role, "content": text})
-                except Exception:
-                    pass
-    except Exception as exc:
-        log.warning("Failed to load session history: %s", exc)
-    return messages[-limit:]
-
-
 def _load_saved_sessions() -> dict:
     try:
         with open(SAVED_SESSIONS_FILE) as f:
@@ -568,73 +531,13 @@ def _load_saved_sessions() -> dict:
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def _scan_local_sessions(limit: int = 100) -> list:
-    """Scan ~/.claude/projects/ and return sessions sorted by last modified."""
-    sessions = []
-    saved_names = {v["claude_uuid"]: v["name"] for v in _load_saved_sessions().values()}
-    try:
-        for proj in os.scandir(CLAUDE_PROJECTS_DIR):
-            if not proj.is_dir():
-                continue
-            try:
-                cwd = "/" + proj.name[1:].replace("-", "/")
-                if not os.path.isdir(cwd):
-                    cwd = os.path.expanduser("~")
-            except Exception:
-                cwd = os.path.expanduser("~")
-
-            for entry in os.scandir(proj.path):
-                if not entry.name.endswith(".jsonl") or not entry.is_file():
-                    continue
-                uuid = entry.name[:-6]
-                mtime = int(entry.stat().st_mtime)
-                if uuid in saved_names:
-                    name = saved_names[uuid]
-                else:
-                    name = proj.name.split("-")[-1] or uuid[:8]
-                    try:
-                        with open(entry.path, encoding="utf-8", errors="ignore") as f:
-                            for raw in f:
-                                try:
-                                    d = json.loads(raw)
-                                    if d.get("type") != "user":
-                                        continue
-                                    content = d.get("message", {}).get("content", "")
-                                    text = ""
-                                    if isinstance(content, str):
-                                        text = content
-                                    elif isinstance(content, list):
-                                        for blk in content:
-                                            if isinstance(blk, dict) and blk.get("type") == "text":
-                                                text = blk.get("text", "")
-                                                break
-                                    if text and not text.startswith("<"):
-                                        name = text[:50].strip()
-                                        break
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-                sessions.append({
-                    "id": uuid,
-                    "name": name,
-                    "claude_uuid": uuid,
-                    "last_used": mtime,
-                    "cwd": cwd,
-                })
-    except Exception as exc:
-        log.warning("Failed to scan local sessions: %s", exc)
-    sessions.sort(key=lambda x: x["last_used"], reverse=True)
-    return sessions[:limit]
-
-
-def _persist_session(session: "ClaudeSession") -> None:
-    if not session.claude_session_uuid:
+def _persist_session(session: "Session") -> None:
+    if not session.resume_id:
         return
     saved = _load_saved_sessions()
     saved[session.session_id] = {
         "name": session.name,
-        "claude_uuid": session.claude_session_uuid,
+        "claude_uuid": session.resume_id,
         "last_used": int(time.time()),
         "cwd": session.cwd,
     }
@@ -661,13 +564,13 @@ def _restore_sessions_from_disk() -> None:
         if sid in _SESSIONS:
             continue
         try:
-            session = ClaudeSession(
+            session = Session(
                 session_id=sid,
                 name=data.get("name", sid[:8]),
                 created_at=float(data.get("last_used", time.time())),
-                cwd=data.get("cwd", "/Users/wulala"),
+                cwd=data.get("cwd", DEFAULT_CWD),
             )
-            session.claude_session_uuid = data.get("claude_uuid") or None
+            session.resume_id = data.get("claude_uuid") or None
             _SESSIONS[sid] = session
             count += 1
         except Exception as exc:
@@ -676,318 +579,6 @@ def _restore_sessions_from_disk() -> None:
         log.info("Restored %d session(s) from disk", count)
 
 
-# ---------------------------------------------------------------------------
-# stdout_reader — parses NDJSON from claude subprocess
-# ---------------------------------------------------------------------------
-async def stdout_reader(session: ClaudeSession) -> None:
-    assert session.proc is not None
-    async for line_bytes in session.proc.stdout:
-        line = line_bytes.decode("utf-8", errors="replace").strip()
-        if not line:
-            continue
-
-        try:
-            evt = json.loads(line)
-        except json.JSONDecodeError:
-            log.debug("[%s] Non-JSON stdout: %s", session.session_id, line[:120])
-            continue
-
-        etype = evt.get("type", "")
-
-        if etype == "assistant":
-            message = evt.get("message", {})
-            content_blocks = message.get("content", [])
-            for block in content_blocks:
-                btype = block.get("type", "")
-                if btype == "text":
-                    text = block.get("text", "")
-                    if text:
-                        session.accumulated_text += text
-                        await stream_text(text, session)
-                        await scan_for_media(text, session)
-                elif btype == "tool_use":
-                    tool_id = block.get("id", "")
-                    name = block.get("name", "")
-                    input_data = block.get("input", {})
-                    command = input_data.get("command", json.dumps(input_data))
-                    session.tool_blocks[tool_id] = {"name": name}
-                    await send_event(session, _evt_tool_start(tool_id, name, command))
-
-        elif etype == "tool_result":
-            tool_id = evt.get("tool_use_id", "")
-            output = evt.get("content", "")
-            if isinstance(output, list):
-                output = "\n".join(
-                    b.get("text", "") for b in output if b.get("type") == "text"
-                )
-            await send_event(session, _evt_tool_result(tool_id, str(output)))
-            await send_event(session, _evt_tool_end(tool_id))
-
-        elif etype == "result":
-            subtype = evt.get("subtype", "")
-            new_uuid = evt.get("session_id")
-            session.is_streaming = False
-            if subtype == "success":
-                log.info("[%s] result success, claude_uuid=%s", session.session_id, new_uuid)
-                if new_uuid:
-                    session.claude_session_uuid = new_uuid
-                    _persist_session(session)
-                asyncio.create_task(notify_fcm(session.name, session.accumulated_text, session.session_id))
-                await send_event(session, _evt_done())
-                session.accumulated_text = ""
-                session.tool_blocks = {}
-            else:
-                err = evt.get("result", "Unknown error")
-                log.error("[%s] result error: %s", session.session_id, err)
-                await send_event(session, _evt_error(str(err)))
-                session.accumulated_text = ""
-                session.tool_blocks = {}
-
-        elif etype == "system":
-            log.debug("[%s] system subtype=%s", session.session_id, evt.get("subtype", ""))
-
-        elif etype == "rate_limit_event":
-            log.debug("[%s] rate_limit_event", session.session_id)
-
-        else:
-            log.debug("[%s] Unhandled event type: %s", session.session_id, etype)
-
-
-# ---------------------------------------------------------------------------
-# stderr_reader
-# ---------------------------------------------------------------------------
-async def stderr_reader(session: ClaudeSession) -> None:
-    assert session.proc is not None
-    async for line_bytes in session.proc.stderr:
-        line = line_bytes.decode("utf-8", errors="replace").strip()
-        if line:
-            log.warning("[%s] claude stderr: %s", session.session_id, line)
-
-
-# ---------------------------------------------------------------------------
-# watch_proc — auto-restart on unexpected crash
-# ---------------------------------------------------------------------------
-async def watch_proc(session: ClaudeSession) -> None:
-    assert session.proc is not None
-    await session.proc.wait()
-
-    if session.is_stopping:
-        return
-
-    rc = session.proc.returncode
-    log.warning("[%s] Claude proc exited unexpectedly (rc=%s)", session.session_id, rc)
-
-    if rc != 0 and session.restart_count < 3:
-        session.restart_count += 1
-        log.info("[%s] Auto-restarting (attempt %d/3)", session.session_id, session.restart_count)
-        await send_event(session, _evt_session_warning(
-            f"Claude process exited (rc={rc}), restarting ({session.restart_count}/3)…"
-        ))
-        await spawn_proc(session)
-    else:
-        log.error("[%s] Session died after %d restart(s)", session.session_id, session.restart_count)
-        await send_event(session, _evt_session_died(
-            f"Claude process exited (rc={rc}) and will not restart."
-        ))
-
-
-# ---------------------------------------------------------------------------
-# spawn_proc — launch / re-launch claude subprocess for a session
-# ---------------------------------------------------------------------------
-async def spawn_proc(session: ClaudeSession) -> None:
-    cmd = [
-        CLAUDE_BIN,
-        "--print",
-        "--input-format", "stream-json",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",
-    ]
-    if session.claude_session_uuid:
-        cmd += ["--resume", session.claude_session_uuid]
-
-    log.info("[%s] Spawning claude: %s (cwd=%s)", session.session_id, cmd, session.cwd)
-
-    try:
-        session.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=session.cwd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except Exception as exc:
-        log.error("[%s] Failed to spawn claude: %s", session.session_id, exc)
-        await send_event(session, _evt_error(f"Failed to spawn claude: {exc}"))
-        return
-
-    session.is_stopping = False
-
-    for attr in ("stdout_task", "stderr_task", "watch_task"):
-        old = getattr(session, attr)
-        if old and not old.done():
-            old.cancel()
-
-    session.stdout_task = asyncio.create_task(stdout_reader(session))
-    session.stderr_task = asyncio.create_task(stderr_reader(session))
-    session.watch_task  = asyncio.create_task(watch_proc(session))
-    log.info("[%s] Claude process started (pid=%d)", session.session_id, session.proc.pid)
-
-
-# ---------------------------------------------------------------------------
-# send_message — write user input to claude stdin
-# ---------------------------------------------------------------------------
-async def send_message(session: ClaudeSession, content: str, images: list | None = None, files: list | None = None) -> None:
-    if session.is_streaming:
-        await send_event(session, _evt_error("Session is currently processing a request.", "session_busy"))
-        return
-
-    if session.proc is None or session.proc.returncode is not None:
-        await send_event(session, _evt_error("Claude process is not running.", "session_dead"))
-        return
-
-    session.accumulated_text = ""
-    session.tool_blocks = {}
-    session.is_streaming = True
-    session.last_activity = asyncio.get_event_loop().time()
-
-    content_blocks: list = []
-    for img in (images or []):
-        content_blocks.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": img.get("media_type", "image/jpeg"),
-                "data": img.get("data", ""),
-            },
-        })
-    for f in (files or []):
-        media_type = f.get("media_type", "text/plain")
-        name = f.get("name", "file")
-        file_content = f.get("content", "")
-        if media_type == "application/pdf":
-            content_blocks.append({
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": file_content,
-                },
-            })
-        else:
-            ext = name.rsplit(".", 1)[-1] if "." in name else ""
-            fence = f"```{ext}\n{file_content}\n```" if ext else file_content
-            content_blocks.append({"type": "text", "text": f"[File: {name}]\n{fence}"})
-    if content:
-        content_blocks.append({"type": "text", "text": content})
-
-    payload = json.dumps({
-        "type": "user",
-        "message": {"role": "user", "content": content_blocks},
-    }) + "\n"
-
-    try:
-        session.proc.stdin.write(payload.encode("utf-8"))
-        await session.proc.stdin.drain()
-        log.info("[%s] Message sent (%d chars, %d images)", session.session_id, len(content), len(images or []))
-    except Exception as exc:
-        session.is_streaming = False
-        log.error("[%s] Failed to write to stdin: %s", session.session_id, exc)
-        await send_event(session, _evt_error(f"stdin write failed: {exc}"))
-
-
-# ---------------------------------------------------------------------------
-# stop_session — send SIGTERM/SIGKILL, emit stopped
-# ---------------------------------------------------------------------------
-async def stop_session(session: ClaudeSession) -> None:
-    if session.proc is None or session.proc.returncode is not None:
-        await send_event(session, _evt_stopped())
-        return
-
-    session.is_stopping = True
-    log.info("[%s] Stopping session (pid=%d)", session.session_id, session.proc.pid)
-
-    try:
-        session.proc.send_signal(signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-
-    await asyncio.sleep(1)
-
-    try:
-        if session.proc.returncode is None:
-            session.proc.kill()
-    except ProcessLookupError:
-        pass
-
-    session.is_streaming = False
-    session.accumulated_text = ""
-    session.tool_blocks = {}
-    await send_event(session, _evt_stopped())
-
-
-# ---------------------------------------------------------------------------
-# close_session — stop proc + cancel tasks + remove from registry
-# ---------------------------------------------------------------------------
-async def close_session(session: ClaudeSession) -> None:
-    session.is_stopping = True
-    log.info("[%s] Closing session", session.session_id)
-
-    if session.proc is not None and session.proc.returncode is None:
-        try:
-            session.proc.terminate()
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(session.proc.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            try:
-                session.proc.kill()
-            except ProcessLookupError:
-                pass
-
-    for attr in ("stdout_task", "stderr_task", "watch_task"):
-        task = getattr(session, attr)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-    async with _SESSIONS_LOCK:
-        _SESSIONS.pop(session.session_id, None)
-
-    await send_event(session, _evt_session_closed())
-
-
-# ---------------------------------------------------------------------------
-# clear_session — kill proc + respawn without --resume (fresh history)
-# ---------------------------------------------------------------------------
-async def clear_session(session: ClaudeSession) -> None:
-    log.info("[%s] Clearing session history", session.session_id)
-    session.is_stopping = True
-    session.claude_session_uuid = None
-    session.accumulated_text = ""
-    session.tool_blocks = {}
-    session.is_streaming = False
-
-    if session.proc is not None and session.proc.returncode is None:
-        try:
-            session.proc.terminate()
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(session.proc.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            try:
-                session.proc.kill()
-            except ProcessLookupError:
-                pass
-
-    session.restart_count = 0
-    await spawn_proc(session)
-    await send_event(session, _evt_session_warning("Session history cleared."))
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +662,7 @@ async def handler(ws: ServerConnection) -> None:
             elif mtype == "new_session":
                 sid              = msg["session_id"]
                 name             = msg["name"]
-                cwd              = msg.get("cwd", "/Users/wulala")
+                cwd              = msg.get("cwd", DEFAULT_CWD)
                 resume_claude_id = msg.get("resume_claude_id", "")
 
                 async with _SESSIONS_LOCK:
@@ -1096,17 +687,17 @@ async def handler(ws: ServerConnection) -> None:
                         continue
 
                     import time as _time
-                    session = ClaudeSession(
+                    session = Session(
                         session_id=sid,
                         name=name,
                         created_at=_time.time(),
                         cwd=cwd,
                         ws_ref=ws,
-                        claude_session_uuid=resume_claude_id or None,
+                        resume_id=resume_claude_id or None,
                     )
                     _SESSIONS[sid] = session
 
-                await spawn_proc(session)
+                await _BACKEND.spawn(session)
 
                 try:
                     await ws.send(json.dumps(_msg_session_created(
@@ -1115,10 +706,8 @@ async def handler(ws: ServerConnection) -> None:
                 except Exception:
                     pass
 
-                if resume_claude_id:
-                    history = await asyncio.get_event_loop().run_in_executor(
-                        None, _load_session_history, resume_claude_id
-                    )
+                if resume_claude_id and _BACKEND.supports_resume():
+                    history = await _BACKEND.load_session_history(resume_claude_id)
                     if history:
                         try:
                             await ws.send(json.dumps(_msg_session_history(sid, history)))
@@ -1148,7 +737,7 @@ async def handler(ws: ServerConnection) -> None:
                     await send_event(session, _evt_error("Empty content"))
                     continue
 
-                await send_message(session, content, images, files)
+                await _BACKEND.send(session, content, images, files)
 
             # ------------------------------------------------------------------
             elif mtype == "stop":
@@ -1161,7 +750,7 @@ async def handler(ws: ServerConnection) -> None:
                         pass
                     continue
                 session.ws_ref = ws
-                asyncio.create_task(stop_session(session))
+                asyncio.create_task(_BACKEND.stop(session))
 
             # ------------------------------------------------------------------
             elif mtype == "close_session":
@@ -1174,7 +763,7 @@ async def handler(ws: ServerConnection) -> None:
                         pass
                     continue
                 session.ws_ref = ws
-                asyncio.create_task(close_session(session))
+                asyncio.create_task(_BACKEND.close(session))
 
             # ------------------------------------------------------------------
             elif mtype == "rename_session":
@@ -1206,19 +795,17 @@ async def handler(ws: ServerConnection) -> None:
                         pass
                     continue
                 session.ws_ref = ws
-                asyncio.create_task(clear_session(session))
+                asyncio.create_task(_BACKEND.clear(session))
 
             # ------------------------------------------------------------------
             elif mtype == "get_usage":
-                asyncio.create_task(fetch_usage(ws))
+                asyncio.create_task(_BACKEND.fetch_usage(ws))
 
             # ------------------------------------------------------------------
             elif mtype == "get_resumable_sessions":
-                resumable = await asyncio.get_event_loop().run_in_executor(
-                    None, _scan_local_sessions, 100
-                )
-                active_uuids = {s.claude_session_uuid for s in _SESSIONS.values() if s.claude_session_uuid}
-                resumable = [r for r in resumable if r["claude_uuid"] not in active_uuids]
+                resumable = await _BACKEND.get_resumable_sessions(100)
+                active_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
+                resumable = [r for r in resumable if r.get("claude_uuid") not in active_uuids]
                 try:
                     await ws.send(json.dumps(_msg_resumable_sessions(resumable)))
                 except Exception:
@@ -1273,11 +860,13 @@ async def handler(ws: ServerConnection) -> None:
             elif mtype == "get_tasks":
                 tasks = []
                 for sid, s in list(_SESSIONS.items()):
+                    from backends.claude_cli import ClaudeCliBackend
+                    pid = _BACKEND.get_pid(s) if isinstance(_BACKEND, ClaudeCliBackend) else None
                     tasks.append({
                         "id": sid,
                         "name": s.name,
                         "type": "claude",
-                        "pid": s.proc.pid if s.proc else None,
+                        "pid": pid,
                         "is_streaming": s.is_streaming,
                         "cwd": s.cwd,
                     })
@@ -1300,10 +889,10 @@ async def handler(ws: ServerConnection) -> None:
                 task_id = msg["id"]
                 killed = False
                 if task_id in _SESSIONS:
+                    from backends.claude_cli import ClaudeCliBackend
                     s = _SESSIONS[task_id]
-                    if s.proc and s.proc.returncode is None:
-                        s.proc.terminate()
-                        killed = True
+                    if isinstance(_BACKEND, ClaudeCliBackend):
+                        killed = _BACKEND.kill_session_proc(s)
                 elif task_id in _SHELL_SESSIONS:
                     sh = _SHELL_SESSIONS.pop(task_id, None)
                     if sh and sh.proc.returncode is None:
@@ -1343,16 +932,16 @@ async def handler(ws: ServerConnection) -> None:
                             sessions_here.append({
                                 "id": sid,
                                 "name": s.name,
-                                "claude_uuid": s.claude_session_uuid or "",
+                                "claude_uuid": s.resume_id or "",
                                 "last_used": int(s.last_activity or s.created_at),
                                 "is_active": True,
                             })
                     except Exception:
                         pass
 
-                active_uuids = {s.claude_session_uuid for s in _SESSIONS.values() if s.claude_session_uuid}
+                active_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
                 try:
-                    resumable = await asyncio.get_event_loop().run_in_executor(None, _scan_local_sessions)
+                    resumable = await _BACKEND.get_resumable_sessions()
                     for r in resumable:
                         try:
                             if os.path.realpath(r["cwd"]) == path and r["claude_uuid"] not in active_uuids:
@@ -1401,12 +990,80 @@ async def handler(ws: ServerConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# cloudflared tunnel helpers
+# ---------------------------------------------------------------------------
+async def _drain_proc_stderr(proc) -> None:
+    try:
+        async for _ in proc.stderr:
+            pass
+    except Exception:
+        pass
+
+
+async def _start_cloudflared_tunnel(port: int) -> None:
+    cfd = shutil.which("cloudflared")
+    if not cfd:
+        print("WARNING: cloudflared not installed, skipping tunnel")
+        print("   Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
+        return
+    proc = await asyncio.create_subprocess_exec(
+        cfd, "tunnel", "--url", f"http://localhost:{port}",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    print("Waiting for cloudflared tunnel...")
+    async for line_bytes in proc.stderr:
+        line = line_bytes.decode(errors="replace")
+        m = re.search(r'https://[\w.-]+\.trycloudflare\.com', line)
+        if m:
+            url = m.group(0)
+            ws_url = url.replace("https://", "wss://")
+            print(f"\n{'='*56}")
+            print(f"Tunnel URL (fill in app Settings):")
+            print(f"   {ws_url}")
+            print(f"{'='*56}\n")
+            log.info("Cloudflared tunnel: %s", ws_url)
+            asyncio.create_task(_drain_proc_stderr(proc))
+            return
+    log.warning("cloudflared tunnel URL not detected")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-async def main(port: int) -> None:
+async def main(port: int, tunnel: bool = False,
+               backend_name: str = "claude", model: str = "",
+               ollama_host: str = "http://localhost:11434") -> None:
+    global CLAUDE_BIN, BUN_BIN, _BACKEND
+
+    if backend_name == "ollama":
+        from backends.ollama import OllamaBackend
+        _BACKEND = OllamaBackend(model=model or "llama3.2", host=ollama_host)
+    else:
+        CLAUDE_BIN = _find_claude_bin()
+        from backends.claude_cli import ClaudeCliBackend
+        _BACKEND = ClaudeCliBackend(claude_bin=CLAUDE_BIN)
+
+    BUN_BIN = _find_bun_bin()
     init_firebase()
     _restore_sessions_from_disk()
-    log.info("Claude Bridge v2 starting on port %d", port)
+
+    ts_ip = _detect_tailscale_ip()
+    print(f"\n{'='*56}")
+    print(f"  Claude Bridge v2  |  port {port}  |  backend: {backend_name}")
+    print(f"{'='*56}")
+    if backend_name == "claude":
+        print(f"  Claude : {CLAUDE_BIN}")
+    else:
+        print(f"  Ollama : {ollama_host}  model={model or 'llama3.2'}")
+    if ts_ip:
+        print(f"  Tailscale: ws://{ts_ip}:{port}")
+    else:
+        print(f"  Local   : ws://127.0.0.1:{port}")
+        print(f"  (No Tailscale — use --tunnel for a public URL)")
+    print(f"{'='*56}\n")
+
+    log.info("Claude Bridge v2 starting on port %d (backend=%s)", port, backend_name)
     async with serve(
         handler,
         "0.0.0.0",
@@ -1415,11 +1072,26 @@ async def main(port: int) -> None:
         ping_timeout=30,
     ):
         log.info("Bridge v2 listening on ws://0.0.0.0:%d", port)
+        if tunnel:
+            asyncio.create_task(_start_cloudflared_tunnel(port))
         await asyncio.Future()  # run forever
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Claude WebSocket Bridge v2")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--tunnel", action="store_true", help="Start a cloudflared tunnel for public access")
+    parser.add_argument("--backend", default="claude", choices=["claude", "ollama"],
+                        help="AI backend (default: claude)")
+    parser.add_argument("--model", default="",
+                        help="Model name (for ollama backend)")
+    parser.add_argument("--ollama-host", default="http://localhost:11434",
+                        help="Ollama server URL")
     args = parser.parse_args()
-    asyncio.run(main(args.port))
+    asyncio.run(main(
+        args.port,
+        tunnel=args.tunnel,
+        backend_name=args.backend,
+        model=args.model,
+        ollama_host=args.ollama_host,
+    ))
