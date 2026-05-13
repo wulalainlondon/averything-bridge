@@ -9,9 +9,16 @@ import logging
 import os
 import signal
 from dataclasses import dataclass, field
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Callable, Coroutine, Optional, TYPE_CHECKING
 
 from .base import Backend
+from .events import (
+    send_event, stream_text, scan_for_media,
+    _evt_error, _evt_stopped, _evt_done,
+    _evt_tool_start, _evt_tool_result, _evt_tool_end,
+    _evt_session_warning, _evt_session_died, _evt_session_closed,
+    _msg_session_uuid, _msg_usage_report, _msg_error,
+)
 
 if TYPE_CHECKING:
     from claude_bridge_v2 import Session
@@ -28,12 +35,26 @@ class _ClaudeState:
     tool_blocks: dict = field(default_factory=dict)
     restart_count: int = 0
     pending_stop: bool = False
+    bad_resume: bool = False
 
 
 class ClaudeCliBackend(Backend):
-    def __init__(self, claude_bin: str = ""):
+    def __init__(
+        self,
+        claude_bin: str = "",
+        bun_bin: str = "bun",
+        notify_fcm_fn: "Callable[[str, str, str], Coroutine] | None" = None,
+        persist_session_fn: "Callable[[Session], None] | None" = None,
+        claude_projects_dir: str = "",
+        load_saved_sessions_fn: "Callable[[], dict] | None" = None,
+    ) -> None:
         self._claude_bin = claude_bin
-        self._states: dict[str, _ClaudeState] = {}  # session_id → state
+        self._bun_bin = bun_bin
+        self._notify_fcm_fn = notify_fcm_fn
+        self._persist_session_fn = persist_session_fn
+        self._claude_projects_dir = claude_projects_dir
+        self._load_saved_sessions_fn = load_saved_sessions_fn
+        self._states: dict[str, _ClaudeState] = {}
 
     def _get_state(self, session: "Session") -> _ClaudeState:
         if session.session_id not in self._states:
@@ -49,8 +70,6 @@ class ClaudeCliBackend(Backend):
 
     async def send(self, session: "Session", content: str,
                    images: list | None = None, files: list | None = None) -> None:
-        from claude_bridge_v2 import send_event, _evt_error
-
         state = self._get_state(session)
 
         if session.is_streaming:
@@ -111,8 +130,6 @@ class ClaudeCliBackend(Backend):
             await send_event(session, _evt_error(f"stdin write failed: {exc}"))
 
     async def stop(self, session: "Session") -> None:
-        from claude_bridge_v2 import send_event, _evt_stopped
-
         state = self._get_state(session)
 
         if state.proc is None or state.proc.returncode is not None:
@@ -141,8 +158,6 @@ class ClaudeCliBackend(Backend):
         await send_event(session, _evt_stopped())
 
     async def clear(self, session: "Session") -> None:
-        from claude_bridge_v2 import send_event, _evt_session_warning
-
         state = self._get_state(session)
 
         log.info("[%s] Clearing session history", session.session_id)
@@ -170,9 +185,6 @@ class ClaudeCliBackend(Backend):
         await send_event(session, _evt_session_warning("Session history cleared."))
 
     async def close(self, session: "Session") -> None:
-        from claude_bridge_v2 import send_event, _evt_session_closed
-        from claude_bridge_v2 import _SESSIONS, _SESSIONS_LOCK
-
         state = self._get_state(session)
 
         session.is_stopping = True
@@ -199,9 +211,7 @@ class ClaudeCliBackend(Backend):
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        async with _SESSIONS_LOCK:
-            _SESSIONS.pop(session.session_id, None)
-
+        # Removal from _SESSIONS is the bridge handler's responsibility
         self._states.pop(session.session_id, None)
         await send_event(session, _evt_session_closed())
 
@@ -230,8 +240,6 @@ class ClaudeCliBackend(Backend):
         return True
 
     async def fetch_usage(self, ws: Any) -> None:
-        from claude_bridge_v2 import BUN_BIN, _msg_usage_report, _msg_error
-
         _BUN_USAGE_SCRIPT = r"""
 const { execSync } = require('child_process');
 const raw = execSync("security find-generic-password -s 'Claude Code-credentials' -g 2>&1").toString();
@@ -245,7 +253,7 @@ console.log(JSON.stringify(data));
 """
         try:
             proc = await asyncio.create_subprocess_exec(
-                BUN_BIN, "-e", _BUN_USAGE_SCRIPT,
+                self._bun_bin, "-e", _BUN_USAGE_SCRIPT,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -282,11 +290,9 @@ console.log(JSON.stringify(data));
     # Private sync helpers (Claude session file scanning)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _find_session_file_sync(uuid: str) -> Optional[str]:
-        from claude_bridge_v2 import CLAUDE_PROJECTS_DIR
+    def _find_session_file_sync(self, uuid: str) -> Optional[str]:
         try:
-            for proj in os.scandir(CLAUDE_PROJECTS_DIR):
+            for proj in os.scandir(self._claude_projects_dir):
                 if not proj.is_dir():
                     continue
                 candidate = os.path.join(proj.path, uuid + ".jsonl")
@@ -331,11 +337,12 @@ console.log(JSON.stringify(data));
         return messages[-limit:]
 
     def _scan_local_sessions_sync(self, limit: int = 100) -> list:
-        from claude_bridge_v2 import CLAUDE_PROJECTS_DIR, _load_saved_sessions
         sessions = []
-        saved_names = {v["claude_uuid"]: v["name"] for v in _load_saved_sessions().values()}
+        saved_names: dict = {}
+        if self._load_saved_sessions_fn is not None:
+            saved_names = {v["claude_uuid"]: v["name"] for v in self._load_saved_sessions_fn().values()}
         try:
-            for proj in os.scandir(CLAUDE_PROJECTS_DIR):
+            for proj in os.scandir(self._claude_projects_dir):
                 if not proj.is_dir():
                     continue
                 try:
@@ -394,9 +401,9 @@ console.log(JSON.stringify(data));
     # ------------------------------------------------------------------
 
     async def _spawn_proc(self, session: "Session") -> None:
-        from claude_bridge_v2 import send_event, _evt_error
-
         state = self._get_state(session)
+        if state.proc is not None and state.proc.returncode is None:
+            return  # already running
 
         cmd = [
             self._claude_bin,
@@ -438,12 +445,6 @@ console.log(JSON.stringify(data));
         log.info("[%s] Claude process started (pid=%d)", session.session_id, state.proc.pid)
 
     async def _stdout_reader(self, session: "Session") -> None:
-        from claude_bridge_v2 import (
-            send_event, stream_text, scan_for_media, notify_fcm,
-            _evt_text_chunk, _evt_tool_start, _evt_tool_result, _evt_tool_end,
-            _evt_done, _evt_error, _persist_session,
-        )
-
         state = self._get_state(session)
         assert state.proc is not None
 
@@ -494,13 +495,15 @@ console.log(JSON.stringify(data));
                 new_uuid = evt.get("session_id")
                 session.is_streaming = False
                 if subtype == "success":
-                    log.info("[%s] result success, claude_uuid=%s", session.session_id, new_uuid)
+                    usage = evt.get("usage", {})
+                    session.context_used = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+                    log.info("[%s] result success, claude_uuid=%s, context_used=%d", session.session_id, new_uuid, session.context_used)
                     if new_uuid:
                         first_uuid = session.resume_id is None
                         session.resume_id = new_uuid
-                        _persist_session(session)
+                        if self._persist_session_fn is not None:
+                            self._persist_session_fn(session)
                         if first_uuid:
-                            from claude_bridge_v2 import _msg_session_uuid
                             try:
                                 if session.ws_ref and session.ws_ref.open:
                                     await session.ws_ref.send(json.dumps(
@@ -508,7 +511,8 @@ console.log(JSON.stringify(data));
                                     ))
                             except Exception:
                                 pass
-                    asyncio.create_task(notify_fcm(session.name, session.accumulated_text, session.session_id))
+                    if self._notify_fcm_fn is not None:
+                        asyncio.create_task(self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id))
                     await send_event(session, _evt_done())
                     session.accumulated_text = ""
                     state.tool_blocks = {}
@@ -520,7 +524,12 @@ console.log(JSON.stringify(data));
                     state.tool_blocks = {}
 
             elif etype == "system":
-                log.debug("[%s] system subtype=%s", session.session_id, evt.get("subtype", ""))
+                subtype = evt.get("subtype", "")
+                log.debug("[%s] system subtype=%s", session.session_id, subtype)
+                if subtype == "init":
+                    model = evt.get("model", "")
+                    if model:
+                        session.model = model
 
             elif etype == "rate_limit_event":
                 log.debug("[%s] rate_limit_event", session.session_id)
@@ -536,10 +545,10 @@ console.log(JSON.stringify(data));
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if line:
                 log.warning("[%s] claude stderr: %s", session.session_id, line)
+                if "No conversation found" in line:
+                    state.bad_resume = True
 
     async def _watch_proc(self, session: "Session") -> None:
-        from claude_bridge_v2 import send_event, _evt_session_warning, _evt_session_died
-
         state = self._get_state(session)
         assert state.proc is not None
 
@@ -551,7 +560,16 @@ console.log(JSON.stringify(data));
         rc = state.proc.returncode
         log.warning("[%s] Claude proc exited unexpectedly (rc=%s)", session.session_id, rc)
 
-        if rc != 0 and state.restart_count < 3:
+        if state.bad_resume:
+            state.bad_resume = False
+            old_id = session.resume_id
+            session.resume_id = None
+            log.info("[%s] Resume ID %s not found, restarting fresh", session.session_id, old_id)
+            await send_event(session, _evt_session_warning(
+                "Resume session not found, starting fresh…"
+            ))
+            await self._spawn_proc(session)
+        elif rc != 0 and state.restart_count < 3:
             state.restart_count += 1
             log.info("[%s] Auto-restarting (attempt %d/3)", session.session_id, state.restart_count)
             await send_event(session, _evt_session_warning(
