@@ -7,3 +7,10 @@ serviceAccountKey.json
 saved_sessions.json
 *.log
 .env
+saved_sessions_codex.json
+session_meta.json
+read_cursors.json
+bridge.pid
+supervisor.pid
+.supervisor.lock/
+bridge_v2.log

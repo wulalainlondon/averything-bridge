@@ -38,8 +38,43 @@ echo $$ > "$LOCK_PID_FILE"
 
 echo "[supervisor] start, port=$PORT"
 BACKOFF=1
+MAX_RETRIES=10
+RETRY_COUNT=0
+
+# Wait until port $PORT is free (up to $1 seconds).
+wait_for_port_free() {
+  local max_wait="${1:-30}"
+  local waited=0
+  while lsof -ti :"$PORT" >/dev/null 2>&1; do
+    if (( waited >= max_wait )); then
+      echo "[supervisor] port $PORT still busy after ${max_wait}s — giving up wait"
+      return 1
+    fi
+    echo "[supervisor] port $PORT busy, waiting... (${waited}s)"
+    sleep 2
+    (( waited += 2 ))
+  done
+  return 0
+}
 
 while true; do
+  # Enforce maximum consecutive restart limit.
+  if (( RETRY_COUNT >= MAX_RETRIES )); then
+    echo "[supervisor] reached max restarts ($MAX_RETRIES), sleeping 60s before resetting counter"
+    sleep 60
+    RETRY_COUNT=0
+    BACKOFF=1
+  fi
+
+  # Wait for port to be free before spawning.
+  if ! wait_for_port_free 30; then
+    echo "[supervisor] cannot reclaim port $PORT, backing off ${BACKOFF}s"
+    sleep "$BACKOFF"
+    BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
+    (( RETRY_COUNT++ ))
+    continue
+  fi
+
   # clean stale pid owner if any
   if [[ -f "$PID_FILE" ]]; then
     OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
@@ -55,23 +90,38 @@ while true; do
   "$BRIDGE_DIR/run_bridge.sh" --port "$PORT" >>"$LOG_FILE" 2>>"$ERR_FILE" &
   CHILD_PID=$!
   echo "$CHILD_PID" > "$PID_FILE"
-  echo "[supervisor] spawned bridge pid=$CHILD_PID"
+  echo "[supervisor] spawned bridge pid=$CHILD_PID (attempt $((RETRY_COUNT+1))/$MAX_RETRIES)"
 
   # wait for healthy up to 25s
+  HEALTHY=0
   for _ in {1..50}; do
     if "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 0.5; then
       BACKOFF=1
+      RETRY_COUNT=0
+      HEALTHY=1
       break
     fi
     sleep 0.5
   done
+
+  if (( HEALTHY == 0 )); then
+    echo "[supervisor] bridge did not become healthy within 25s"
+    kill "$CHILD_PID" 2>/dev/null || true
+    sleep 1
+    kill -9 "$CHILD_PID" 2>/dev/null || true
+    sleep "$BACKOFF"
+    BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
+    (( RETRY_COUNT++ ))
+    continue
+  fi
 
   # monitor loop
   while true; do
     if ! kill -0 "$CHILD_PID" 2>/dev/null; then
       echo "[supervisor] bridge exited, restart in ${BACKOFF}s"
       sleep "$BACKOFF"
-      BACKOFF=$(( BACKOFF < 30 ? BACKOFF * 2 : 30 ))
+      BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
+      (( RETRY_COUNT++ ))
       break
     fi
 
@@ -81,7 +131,8 @@ while true; do
       sleep 1
       kill -9 "$CHILD_PID" 2>/dev/null || true
       sleep "$BACKOFF"
-      BACKOFF=$(( BACKOFF < 30 ? BACKOFF * 2 : 30 ))
+      BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
+      (( RETRY_COUNT++ ))
       break
     fi
 

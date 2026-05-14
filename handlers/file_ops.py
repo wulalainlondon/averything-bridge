@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
+
+log = logging.getLogger(__name__)
 
 _SESSIONS_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _SESSIONS_TTL_SEC = 3.0
@@ -27,8 +30,8 @@ async def preload_sessions_cache(backends: dict) -> None:
             for item in items:
                 item.setdefault("backend", bname)
             rows.extend(items)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("preload_sessions_cache: backend %r scan failed: %s", bname, exc)
     _ALL_SESSIONS = rows
     _ALL_SESSIONS_TIME = time.time()
 
@@ -51,10 +54,10 @@ def _list_entries(path: str) -> list[dict]:
                         "size": stat.st_size,
                         "modified": int(stat.st_mtime),
                     })
-                except Exception:
-                    pass
-        except PermissionError:
-            pass
+                except Exception as exc:
+                    log.debug("_list_entries: stat failed for %r: %s", entry.path, exc)
+        except PermissionError as exc:
+            log.warning("_list_entries: permission denied scanning %r: %s", path, exc)
     entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
     return entries
 
@@ -72,8 +75,8 @@ def _active_sessions_for_path(path: str, sessions: dict) -> list[dict]:
                     "backend": s.backend_name,
                     "is_active": True,
                 })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("_active_sessions_for_path: session %r skipped: %s", sid, exc)
     return items
 
 
@@ -108,7 +111,8 @@ async def _resumable_for_path(path: str, backends: dict, active_uuids: set[str])
             continue
         try:
             resumable = await backend.get_resumable_sessions()
-        except Exception:
+        except Exception as exc:
+            log.warning("_resumable_for_path: backend %r load failed: %s", bname, exc)
             continue
         for r in resumable:
             try:
@@ -121,8 +125,8 @@ async def _resumable_for_path(path: str, backends: dict, active_uuids: set[str])
                         "backend": bname,
                         "is_active": False,
                     })
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("_resumable_for_path: malformed session record skipped: %s", exc)
 
     _SESSIONS_CACHE[path] = (now + _SESSIONS_TTL_SEC, rows)
     return rows
@@ -139,7 +143,8 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         # Stage 1: return filesystem + active sessions quickly.
         try:
             await ws.send(json.dumps(ctx["msg_dir_listing"](path, entries, active_items)))
-        except Exception:
+        except Exception as exc:
+            log.warning("browse_dir: WS send (stage 1) failed: %s", exc)
             return True
 
         # Stage 2: enrich with resumable sessions (cached).
@@ -148,8 +153,8 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         merged = active_items + resumable
         try:
             await ws.send(json.dumps(ctx["msg_dir_listing"](path, entries, merged)))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("browse_dir: WS send (stage 2) failed: %s", exc)
         return True
 
     if mtype == "fcm_token":
