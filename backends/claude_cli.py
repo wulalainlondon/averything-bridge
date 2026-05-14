@@ -4,6 +4,7 @@ All Claude-specific state is managed here; Session only carries generic fields.
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -329,7 +330,14 @@ console.log(JSON.stringify(data));
                             text = "\n".join(p for p in parts if p)
                         if not text or text.startswith("<") or text.startswith("[Request interrupted"):
                             continue
-                        messages.append({"role": role, "content": text})
+                        ts_ms = 0
+                        ts_str = d.get("timestamp", "")
+                        if ts_str:
+                            try:
+                                ts_ms = int(datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp() * 1000)
+                            except Exception:
+                                pass
+                        messages.append({"role": role, "content": text, "timestamp": ts_ms})
                     except Exception:
                         pass
         except Exception as exc:
