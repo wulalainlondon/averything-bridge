@@ -1,52 +1,73 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-BRIDGE_DIR="/Users/wulala/Downloads/Helper/claude-bridge/bridge"
+SRC_DIR="/Users/wulala/Downloads/Helper/claude-bridge/bridge"
+RUNTIME_DIR="$HOME/.claude-bridge-runtime"
 PLIST_NAME="com.wulala.claude-bridge.plist"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+PLIST_PATH="$LAUNCH_AGENTS/$PLIST_NAME"
 
-echo "==> Setting up venv..."
-cd "$BRIDGE_DIR"
+echo "==> Sync runtime files"
+mkdir -p "$RUNTIME_DIR"
+rsync -a --delete --exclude '.git' --exclude '__pycache__' "$SRC_DIR/" "$RUNTIME_DIR/"
+cd "$RUNTIME_DIR"
+
+echo "==> Setup virtualenv and deps"
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip --quiet
-pip install websockets --quiet
-echo "    websockets installed: $(python -c 'import websockets; print(websockets.__version__)')"
+pip install -r requirements.txt --quiet
 
-echo "==> Installing launchd plist..."
+chmod +x run_bridge.sh bridge_supervisor.sh bridge_healthcheck.py bridge_launch.sh
+
+echo "==> Install launchd agent"
 mkdir -p "$LAUNCH_AGENTS"
-cp "$BRIDGE_DIR/$PLIST_NAME" "$LAUNCH_AGENTS/$PLIST_NAME"
 
-# Unload first in case it was already loaded (ignore error if not loaded)
-launchctl unload "$LAUNCH_AGENTS/$PLIST_NAME" 2>/dev/null || true
-launchctl load "$LAUNCH_AGENTS/$PLIST_NAME"
+cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.wulala.claude-bridge</string>
+  <key>Program</key><string>/bin/bash</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec $RUNTIME_DIR/bridge_launch.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>$RUNTIME_DIR</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/com.wulala.claude-bridge.stdout.log</string>
+  <key>StandardErrorPath</key><string>/tmp/com.wulala.claude-bridge.stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/wulala/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>BRIDGE_PORT</key><string>8766</string>
+    <key>BRIDGE_DISABLE_MDNS</key><string>1</string>
+  </dict>
+</dict>
+</plist>
+PLIST
 
-echo ""
-echo "Bridge plist installed at: $LAUNCH_AGENTS/$PLIST_NAME"
-echo "Log: $BRIDGE_DIR/bridge.log"
-echo "Err: $BRIDGE_DIR/bridge.err"
-echo ""
+launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+launchctl enable "gui/$(id -u)/com.wulala.claude-bridge" || true
+launchctl kickstart -k "gui/$(id -u)/com.wulala.claude-bridge"
 
-# Check if launchd started the bridge successfully
 sleep 2
-STATUS=$(launchctl list | grep "com.wulala.claude-bridge" | awk '{print $1}')
-if [ "$STATUS" = "-" ]; then
-    echo "NOTE: launchd loaded the plist but the bridge is not running (exit code 78)."
-    echo "      This is expected on macOS 26 (Tahoe) — third-party LaunchAgents require"
-    echo "      authorization via System Settings > General > Login Items & Extensions."
-    echo "      Alternatively, start the bridge manually with:"
-    echo "        cd $BRIDGE_DIR && source venv/bin/activate && python claude_bridge.py --port 8765"
-    echo ""
-    echo "Starting bridge manually for now..."
-    nohup "$BRIDGE_DIR/venv/bin/python" "$BRIDGE_DIR/claude_bridge.py" --port 8765 \
-        >> "$BRIDGE_DIR/bridge.log" 2>> "$BRIDGE_DIR/bridge.err" &
-    echo "Bridge PID: $!"
-    sleep 1
-    if lsof -iTCP:8765 -sTCP:LISTEN &>/dev/null; then
-        echo "Bridge is listening on port 8765"
-    else
-        echo "WARNING: bridge may not have started. Check bridge.log for details."
-    fi
+
+if lsof -nP -iTCP:8766 -sTCP:LISTEN >/dev/null; then
+  echo "Bridge is healthy on :8766"
 else
-    echo "Bridge installed and running (PID $STATUS)"
+  echo "Bridge not listening on :8766 yet."
+  echo "Check logs:"
+  echo "  /tmp/com.wulala.claude-bridge.stderr.log"
+  echo "  /tmp/com.wulala.claude-bridge.stdout.log"
+  echo "  $RUNTIME_DIR/bridge_v2.log"
 fi
+
+echo "Installed: $PLIST_PATH"
+echo "Runtime : $RUNTIME_DIR"

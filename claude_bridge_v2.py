@@ -49,7 +49,7 @@ from backends.events import (
 
 try:
     import firebase_admin
-    from firebase_admin import credentials, messaging as fb_messaging
+    from firebase_admin import credentials, messaging as fb_messaging, storage as fb_storage
     _FIREBASE_AVAILABLE = True
 except ImportError:
     _FIREBASE_AVAILABLE = False
@@ -68,7 +68,6 @@ SAVED_SESSIONS_FILE   = os.path.join(BRIDGE_DIR, "saved_sessions.json")
 SESSION_META_FILE     = os.path.join(BRIDGE_DIR, "session_meta.json")
 READ_CURSOR_FILE      = os.path.join(BRIDGE_DIR, "read_cursors.json")
 CLAUDE_PROJECTS_DIR   = os.path.expanduser("~/.claude/projects")
-LOCK_TTL_SECONDS      = 60
 
 def _find_claude_bin() -> str:
     env = os.environ.get("CLAUDE_PATH")
@@ -286,6 +285,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "get_processes", "kill_process",
     "fcm_token", "request_sessions_list", "browse_dir", "request_history",
     "set_effort", "hello", "set_session_meta", "switch_session_config",
+    "push_file", "file_push_ack",
 })
 
 def validate_client_msg(msg: object) -> str | None:
@@ -454,13 +454,10 @@ class Session:
     model: str = ""
     sandbox: str = "workspace-write"
     context_used: int = 0
+    context_max: int = 0
     backend_name: str = "claude"
     pinned: bool = False
     hidden: bool = False
-    lock_owner_device: str = ""
-    lock_owner_device_name: str = ""
-    lock_owner_client: str = ""
-    lock_until: float = 0.0
     queue: Deque[QueuedCommand] = field(default_factory=deque)
     processing: bool = False
     current_request_id: str = ""
@@ -513,21 +510,134 @@ def _build_handoff_prompt(history: list[dict], user_request: str = "") -> str:
 # Firebase Admin init
 # ---------------------------------------------------------------------------
 _firebase_app = None
+_firebase_storage_app = None  # separate app for Storage (may use different project)
+
+_PUSH_FILE_REGISTRY: dict[str, dict] = {}  # file_id → {blob_path, filename, url, size, mime_type}
+
+_STORAGE_KEY_FILE = os.environ.get(
+    "BRIDGE_STORAGE_KEY",
+    os.path.expanduser("~/.claude/line/ulala-helper-firebase-adminsdk-fbsvc-d4353102d1.json"),
+)
 
 def init_firebase() -> None:
-    global _firebase_app
+    global _firebase_app, _firebase_storage_app
     if not _FIREBASE_AVAILABLE:
         log.warning("firebase-admin not installed — FCM disabled. Run: pip install firebase-admin")
         return
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+
+    # FCM app (averthing project)
+    if os.path.exists(SERVICE_ACCOUNT_FILE):
+        try:
+            cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
+            _firebase_app = firebase_admin.initialize_app(cred)
+            log.info("Firebase FCM initialized")
+        except Exception as exc:
+            log.warning("Firebase FCM init failed: %s", exc)
+    else:
         log.warning("serviceAccountKey.json not found at %s — FCM disabled", SERVICE_ACCOUNT_FILE)
+
+    # Storage app — use ulala-helper key if available, otherwise fall back to FCM key
+    storage_key = _STORAGE_KEY_FILE if os.path.exists(_STORAGE_KEY_FILE) else SERVICE_ACCOUNT_FILE
+    if os.path.exists(storage_key):
+        try:
+            with open(storage_key) as f:
+                sk = json.load(f)
+            bucket_name = f"{sk['project_id']}.firebasestorage.app"
+            storage_cred = credentials.Certificate(storage_key)
+            _firebase_storage_app = firebase_admin.initialize_app(storage_cred, {"storageBucket": bucket_name}, name="storage")
+            log.info("Firebase Storage initialized (bucket: %s)", bucket_name)
+        except Exception as exc:
+            log.warning("Firebase Storage init failed: %s", exc)
+
+
+async def _handle_push_file(ws: Any, path: str) -> None:
+    if _firebase_storage_app is None:
+        try:
+            await ws.send(json.dumps({"type": "error", "message": "Firebase Storage not available — check storage key"}))
+        except Exception:
+            pass
         return
+
+    expanded = os.path.expanduser(path)
+    if not os.path.isfile(expanded):
+        try:
+            await ws.send(json.dumps({"type": "error", "message": f"File not found: {path}"}))
+        except Exception:
+            pass
+        return
+
+    filename = os.path.basename(expanded)
+    size = os.path.getsize(expanded)
+    file_id = f"push_{uuid.uuid4().hex[:12]}"
+    blob_path = f"bridge_pushes/{file_id}/{filename}"
+
+    import mimetypes
+    mime_type, _ = mimetypes.guess_type(filename)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
     try:
-        cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
-        _firebase_app = firebase_admin.initialize_app(cred)
-        log.info("Firebase Admin initialized")
+        loop = asyncio.get_event_loop()
+        bucket = fb_storage.bucket(app=_firebase_storage_app)
+
+        def _upload() -> str:
+            blob = bucket.blob(blob_path)
+            blob.upload_from_filename(expanded, content_type=mime_type)
+            import datetime
+            url = blob.generate_signed_url(
+                expiration=datetime.timedelta(hours=1),
+                method="GET",
+                version="v4",
+            )
+            return url
+
+        url = await loop.run_in_executor(None, _upload)
+        _PUSH_FILE_REGISTRY[file_id] = {
+            "blob_path": blob_path,
+            "filename": filename,
+            "url": url,
+            "size": size,
+            "mime_type": mime_type,
+        }
+        log.info("push_file uploaded: %s → %s", filename, blob_path)
+
+        await _broadcast_json({
+            "type": "file_push",
+            "file_id": file_id,
+            "filename": filename,
+            "url": url,
+            "size": size,
+            "mime_type": mime_type,
+        })
+        asyncio.create_task(notify_fcm("Bridge", f"📎 {filename}", ""))
     except Exception as exc:
-        log.warning("Firebase Admin init failed: %s", exc)
+        log.warning("push_file upload failed: %s", exc)
+        try:
+            await ws.send(json.dumps({"type": "error", "message": f"Upload failed: {exc}"}))
+        except Exception:
+            pass
+
+
+async def _handle_file_push_ack(file_id: str) -> None:
+    entry = _PUSH_FILE_REGISTRY.pop(file_id, None)
+    if not entry:
+        log.debug("file_push_ack: unknown file_id %s", file_id)
+        return
+    if _firebase_storage_app is None:
+        return
+    blob_path = entry["blob_path"]
+    try:
+        loop = asyncio.get_event_loop()
+        bucket = fb_storage.bucket(app=_firebase_storage_app)
+
+        def _delete() -> None:
+            blob = bucket.blob(blob_path)
+            blob.delete()
+
+        await loop.run_in_executor(None, _delete)
+        log.info("push_file deleted from storage: %s", blob_path)
+    except Exception as exc:
+        log.warning("push_file delete failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -773,62 +883,6 @@ async def _dispatch_event(payload: dict, session: "Session") -> bool:
     return True
 
 
-def _session_lock_payload(session: "Session") -> dict:
-    return {
-        "type": "session_lock",
-        "session_id": session.session_id,
-        "locked": bool(session.lock_owner_device and session.lock_until > time.time()),
-        "owner_device_id": session.lock_owner_device,
-        "owner_device_name": session.lock_owner_device_name,
-        "owner_client_id": session.lock_owner_client,
-        "lock_until": session.lock_until,
-        "queue_length": len(session.queue),
-        "current_request_id": session.current_request_id,
-    }
-
-
-def _is_session_locked_for(session: "Session", client: ClientConn) -> bool:
-    if session.lock_until <= time.time():
-        return False
-    if not session.lock_owner_client:
-        return False
-    return session.lock_owner_client != client.client_id
-
-
-def _acquire_session_lock(session: "Session", client: ClientConn) -> None:
-    session.lock_owner_device = client.device_id
-    session.lock_owner_device_name = client.device_name
-    session.lock_owner_client = client.client_id
-    session.lock_until = time.time() + LOCK_TTL_SECONDS
-
-
-def _refresh_session_lock(session: "Session", client_id: str) -> None:
-    if session.lock_owner_client == client_id:
-        session.lock_until = time.time() + LOCK_TTL_SECONDS
-
-
-def _release_session_lock(session: "Session") -> None:
-    session.lock_owner_device = ""
-    session.lock_owner_device_name = ""
-    session.lock_owner_client = ""
-    session.lock_until = 0.0
-    session.current_request_id = ""
-
-
-async def _emit_busy_locked(session: "Session", ws: Any) -> None:
-    msg = {
-        "type": "error",
-        "session_id": session.session_id,
-        "code": "busy_locked",
-        "message": "Session is locked by another device.",
-        "owner_device_id": session.lock_owner_device,
-        "owner_device_name": session.lock_owner_device_name,
-        "retry_after": max(0, int(session.lock_until - time.time())),
-    }
-    try:
-        await ws.send(json.dumps(msg))
-    except Exception:
-        pass
 
 
 
@@ -846,13 +900,11 @@ def build_sessions_list() -> dict:
             "cwd": s.cwd,
             "model": s.model,
             "context_used": s.context_used,
+            "context_max": s.context_max,
             "backend": s.backend_name,
             "sandbox": s.sandbox,
             "pinned": s.pinned,
             "hidden": s.hidden,
-            "lock_owner_device": s.lock_owner_device,
-            "lock_owner_device_name": s.lock_owner_device_name,
-            "lock_until": s.lock_until,
             "queue_length": len(s.queue),
         }
         for s in _SESSIONS.values()
@@ -894,7 +946,6 @@ async def _run_session_queue(session: Session) -> None:
             if client is None:
                 session.queue.popleft()
                 continue
-            _acquire_session_lock(session, client)
             session.current_request_id = cmd.request_id
             await _broadcast_json({
                 "type": "session_command_started",
@@ -903,7 +954,6 @@ async def _run_session_queue(session: Session) -> None:
                 "device_id": cmd.device_id,
                 "queue_length": len(session.queue),
             })
-            await _broadcast_json(_session_lock_payload(session))
 
             try:
                 await _session_backend(session).send(session, cmd.content, cmd.images, cmd.files)
@@ -913,6 +963,10 @@ async def _run_session_queue(session: Session) -> None:
                     "request_id": cmd.request_id,
                 })
             except Exception as exc:
+                log.error("[%s] backend exception in queue: %s", session.session_id, exc, exc_info=True)
+                session.is_streaming = False
+                # Notify the frontend so it stops the spinner
+                await send_event(session, _evt_error(str(exc)))
                 await _broadcast_json({
                     "type": "session_command_failed",
                     "session_id": session.session_id,
@@ -922,23 +976,10 @@ async def _run_session_queue(session: Session) -> None:
             finally:
                 if session.queue and session.queue[0].request_id == cmd.request_id:
                     session.queue.popleft()
-                _release_session_lock(session)
-                await _broadcast_json(_session_lock_payload(session))
+                session.current_request_id = ""
     finally:
         session.processing = False
 
-
-async def _lock_sweeper() -> None:
-    while True:
-        await asyncio.sleep(2)
-        now = time.time()
-        changed = False
-        for s in list(_SESSIONS.values()):
-            if s.lock_until and s.lock_until <= now and not s.processing:
-                _release_session_lock(s)
-                changed = True
-        if changed:
-            await _broadcast_json(build_sessions_list())
 
 
 async def _session_cache_refresher() -> None:
@@ -989,6 +1030,16 @@ async def handler(ws: ServerConnection) -> None:
         }))
         await ws.send(json.dumps(build_sessions_list()))
         await _send_unread_snapshot(ws, client)
+        # Re-deliver any file pushes that were broadcast before this client connected
+        for fid, entry in list(_PUSH_FILE_REGISTRY.items()):
+            await ws.send(json.dumps({
+                "type": "file_push",
+                "file_id": fid,
+                "filename": entry["filename"],
+                "url": entry["url"],
+                "size": entry["size"],
+                "mime_type": entry["mime_type"],
+            }))
     except Exception:
         pass
 
@@ -1056,11 +1107,6 @@ async def handler(ws: ServerConnection) -> None:
             # ------------------------------------------------------------------
             if mtype == "ping":
                 client.last_seen = time.time()
-                sid = msg.get("session_id")
-                if isinstance(sid, str):
-                    s = _SESSIONS.get(sid)
-                    if s:
-                        _refresh_session_lock(s, client.client_id)
                 try:
                     await ws.send(json.dumps(_msg_pong()))
                 except Exception:
@@ -1098,19 +1144,12 @@ async def handler(ws: ServerConnection) -> None:
                 sid     = msg["session_id"]
                 session = _SESSIONS.get(sid)
                 if session:
-                    if _is_session_locked_for(session, client):
-                        await _emit_busy_locked(session, ws)
-                        continue
-                    _acquire_session_lock(session, client)
-                    await _broadcast_json(_session_lock_payload(session))
                     _mark_read(sid, client.device_id, session.message_seq)
                     _persist_read_cursors()
                     await _send_unread_for_client_session(ws, client, session)
                 if session and session.resume_id:
                     backend = _session_backend(session)
                     if not backend.supports_resume():
-                        _release_session_lock(session)
-                        await _broadcast_json(_session_lock_payload(session))
                         continue
                     await _emit_resume_progress(session, "resume_started", 5, "Resume started")
                     await _emit_resume_progress(session, "resume_loading_history", 35, "Loading history")
@@ -1123,8 +1162,6 @@ async def handler(ws: ServerConnection) -> None:
                     # Pre-warm: spawn the claude process in background so first message is faster
                     asyncio.create_task(backend.spawn(session))
                     await _emit_resume_progress(session, "resume_ready", 100, "Resume ready")
-                    _release_session_lock(session)
-                    await _broadcast_json(_session_lock_payload(session))
 
             # ------------------------------------------------------------------
             elif mtype == "new_session":
@@ -1186,7 +1223,6 @@ async def handler(ws: ServerConnection) -> None:
                     await ws.send(json.dumps(_msg_session_created(
                         sid, name, session.created_at, cwd, session.backend_name, session.model, session.sandbox
                     )))
-                    await ws.send(json.dumps(_session_lock_payload(session)))
                 except Exception:
                     pass
 
@@ -1226,9 +1262,6 @@ async def handler(ws: ServerConnection) -> None:
                 if not content and not images and not files:
                     await send_event(session, _evt_error("Empty content"))
                     continue
-                if _is_session_locked_for(session, client):
-                    await _emit_busy_locked(session, ws)
-                    continue
                 request_id = str(msg.get("request_id") or f"r_{uuid.uuid4().hex[:10]}")
                 if any(cmd.request_id == request_id for cmd in session.queue) or session.current_request_id == request_id:
                     continue
@@ -1249,7 +1282,6 @@ async def handler(ws: ServerConnection) -> None:
                     "queue_position": len(session.queue),
                     "queue_length": len(session.queue),
                 })
-                await _broadcast_json(_session_lock_payload(session))
                 asyncio.create_task(_run_session_queue(session))
 
             # ------------------------------------------------------------------
@@ -1263,19 +1295,10 @@ async def handler(ws: ServerConnection) -> None:
                         pass
                     continue
                 session.ws_ref = ws
-                if _is_session_locked_for(session, client):
-                    await _emit_busy_locked(session, ws)
-                    continue
-                _acquire_session_lock(session, client)
-                await _broadcast_json(_session_lock_payload(session))
-                async def _do_stop(s: Session, requestor: ClientConn) -> None:
-                    try:
-                        await _session_backend(s).stop(s)
-                        s.queue.clear()
-                    finally:
-                        _release_session_lock(s)
-                        await _broadcast_json(_session_lock_payload(s))
-                asyncio.create_task(_do_stop(session, client))
+                async def _do_stop(s: Session) -> None:
+                    await _session_backend(s).stop(s)
+                    s.queue.clear()
+                asyncio.create_task(_do_stop(session))
 
             # ------------------------------------------------------------------
             elif mtype == "close_session":
@@ -1362,9 +1385,6 @@ async def handler(ws: ServerConnection) -> None:
                     except Exception:
                         pass
                     continue
-                if _is_session_locked_for(source, client):
-                    await _emit_busy_locked(source, ws)
-                    continue
                 if source.is_streaming or source.processing:
                     await send_event(source, _evt_error("Session is currently processing a request.", "session_busy"))
                     continue
@@ -1419,7 +1439,6 @@ async def handler(ws: ServerConnection) -> None:
                         new_session.model,
                         new_session.sandbox,
                     )))
-                    await ws.send(json.dumps(_session_lock_payload(new_session)))
                 except Exception:
                     pass
                 await _broadcast_json(build_sessions_list())
@@ -1443,7 +1462,6 @@ async def handler(ws: ServerConnection) -> None:
                         "queue_position": 1,
                         "queue_length": 1,
                     })
-                    await _broadcast_json(_session_lock_payload(new_session))
                     asyncio.create_task(_run_session_queue(new_session))
 
                 try:
@@ -1473,6 +1491,16 @@ async def handler(ws: ServerConnection) -> None:
                     "hidden": session.hidden,
                 })
                 await _broadcast_json(build_sessions_list())
+
+            # ------------------------------------------------------------------
+            elif mtype == "push_file":
+                path = msg.get("path", "")
+                asyncio.create_task(_handle_push_file(ws, path))
+
+            # ------------------------------------------------------------------
+            elif mtype == "file_push_ack":
+                file_id = msg.get("file_id", "")
+                asyncio.create_task(_handle_file_push_ack(file_id))
 
             else:
                 log.debug("No direct handler matched for type=%s", mtype)
@@ -1628,7 +1656,6 @@ async def main(port: int, tunnel: bool = False,
         log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
         if tunnel:
             asyncio.create_task(_start_cloudflared_tunnel(port))
-        asyncio.create_task(_lock_sweeper())
         asyncio.create_task(preload_sessions_cache(_BACKENDS))
         asyncio.create_task(_session_cache_refresher())
         try:

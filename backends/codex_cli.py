@@ -4,13 +4,17 @@ This backend keeps a simple in-memory text history per session.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import signal
+import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from shutil import which
 from typing import Optional, TYPE_CHECKING
 
 from .base import Backend
@@ -32,9 +36,17 @@ class _CodexState:
     read_task: Optional[asyncio.Task] = field(default=None, repr=False)
     history: list[dict] = field(default_factory=list)
     last_usage: dict = field(default_factory=dict)
+    last_rate_limits: dict = field(default_factory=dict)
+    usage_updated_at: float = 0.0
+    temp_image_paths: list[str] = field(default_factory=list)
 
 
 class CodexCliBackend(Backend):
+    # Codex can emit large single-line JSON events. With asyncio's default
+    # 64KiB StreamReader limit, readline() may raise:
+    # "Separator is not found, and chunk exceed the limit".
+    _STREAM_READER_LIMIT = 1024 * 1024  # 1 MiB
+
     def __init__(self, codex_bin: str):
         self._codex_bin = codex_bin
         self._states: dict[str, _CodexState] = {}
@@ -75,8 +87,9 @@ class CodexCliBackend(Backend):
             name = f.get("name", "file")
             body = f.get("content", "")
             user_text += f"\n\n[File: {name}]\n{body}"
-        if images:
-            user_text += "\n\n[Images attached but not forwarded to codex CLI in this backend.]"
+        image_notes = self._prepare_image_notes(images or [], state)
+        if image_notes:
+            user_text += "\n\n" + "\n\n".join(image_notes)
 
         state.history.append({"role": "user", "content": user_text})
         prompt = self._build_prompt(state.history)
@@ -112,6 +125,7 @@ class CodexCliBackend(Backend):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=self._STREAM_READER_LIMIT,
                 cwd=session.cwd if os.path.isdir(session.cwd) else os.path.expanduser("~"),
             )
         except Exception as exc:
@@ -217,20 +231,36 @@ class CodexCliBackend(Backend):
         return []
 
     async def fetch_usage(self, ws) -> None:
-
-        # Codex CLI doesn't expose Claude-style window utilization. We map latest usage
-        # into a single pseudo-window so the current UI can still show status.
-        latest = None
+        latest_state: _CodexState | None = None
         for state in self._states.values():
-            if state.last_usage:
-                latest = state.last_usage
-                break
-        if latest:
-            total = int(latest.get("input_tokens", 0)) + int(latest.get("cached_input_tokens", 0))
-            pseudo = {"utilization": total, "resets_at": None}
-            payload = _msg_usage_report(pseudo, None, None)
-        else:
-            payload = _msg_usage_report(None, None, None)
+            if latest_state is None:
+                latest_state = state
+                continue
+            if state.usage_updated_at > latest_state.usage_updated_at:
+                latest_state = state
+
+        five_hour = None
+        seven_day = None
+        if latest_state and latest_state.last_rate_limits:
+            primary = latest_state.last_rate_limits.get("primary", {}) or {}
+            secondary = latest_state.last_rate_limits.get("secondary", {}) or {}
+            if primary:
+                five_hour = {
+                    "utilization": float(primary.get("used_percent")) if primary.get("used_percent") is not None else None,
+                    "resets_at": self._to_iso8601(primary.get("resets_at")),
+                }
+            if secondary:
+                seven_day = {
+                    "utilization": float(secondary.get("used_percent")) if secondary.get("used_percent") is not None else None,
+                    "resets_at": self._to_iso8601(secondary.get("resets_at")),
+                }
+
+        # Fallback: if rate-limit windows are unavailable, at least show latest token usage.
+        if five_hour is None and latest_state and latest_state.last_usage:
+            total = int(latest_state.last_usage.get("input_tokens", 0)) + int(latest_state.last_usage.get("cached_input_tokens", 0))
+            five_hour = {"utilization": total, "resets_at": None}
+
+        payload = _msg_usage_report(five_hour, seven_day, None)
         try:
             await ws.send(json.dumps(payload))
         except Exception:
@@ -256,6 +286,9 @@ class CodexCliBackend(Backend):
                     continue
 
                 etype = evt.get("type", "")
+                payload = evt.get("payload", {}) if isinstance(evt.get("payload"), dict) else {}
+                if etype == "event_msg" and payload:
+                    etype = payload.get("type", "")
                 if etype == "thread.started":
                     thread_id = evt.get("thread_id")
                     if isinstance(thread_id, str) and thread_id:
@@ -285,7 +318,21 @@ class CodexCliBackend(Backend):
                         "output_tokens": int(usage.get("output_tokens") or 0),
                         "reasoning_output_tokens": int(usage.get("reasoning_output_tokens") or 0),
                     }
+                    state.usage_updated_at = time.time()
                     session.context_used = int(usage.get("input_tokens") or 0) + int(usage.get("cached_input_tokens") or 0)
+                elif etype == "token_count":
+                    info = payload.get("info", {}) if payload else {}
+                    last = info.get("last_token_usage", {}) or {}
+                    state.last_usage = {
+                        "input_tokens": int(last.get("input_tokens") or 0),
+                        "cached_input_tokens": int(last.get("cached_input_tokens") or 0),
+                        "output_tokens": int(last.get("output_tokens") or 0),
+                        "reasoning_output_tokens": int(last.get("reasoning_output_tokens") or 0),
+                    }
+                    state.last_rate_limits = payload.get("rate_limits", {}) or {}
+                    state.usage_updated_at = time.time()
+                    session.context_used = int(last.get("input_tokens") or 0) + int(last.get("cached_input_tokens") or 0)
+                    session.context_max = int(info.get("model_context_window") or 0)
 
             rc = await proc.wait()
             if rc == 0:
@@ -315,6 +362,16 @@ class CodexCliBackend(Backend):
         finally:
             session.is_streaming = False
             session.is_stopping = False
+            self._cleanup_temp_images(state)
+
+    @staticmethod
+    def _to_iso8601(ts: object) -> str | None:
+        if ts is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(ts), timezone.utc).isoformat()
+        except Exception:
+            return None
 
     @staticmethod
     def _build_prompt(history: list[dict]) -> str:
@@ -330,6 +387,98 @@ class CodexCliBackend(Backend):
             lines.append(str(content))
             lines.append("")
         return "\n".join(lines)
+
+    def _prepare_image_notes(self, images: list, state: _CodexState) -> list[str]:
+        notes: list[str] = []
+        for i, img in enumerate(images, start=1):
+            media_type = str(img.get("media_type", "image/jpeg"))
+            raw_b64 = str(img.get("data", "")).strip()
+            if not raw_b64:
+                notes.append(f"[Image {i}] (missing data)")
+                continue
+            if "," in raw_b64 and raw_b64.lower().startswith("data:"):
+                raw_b64 = raw_b64.split(",", 1)[1]
+            try:
+                blob = base64.b64decode(raw_b64, validate=False)
+            except Exception:
+                notes.append(f"[Image {i}] (invalid base64 data)")
+                continue
+
+            ext = self._ext_for_media_type(media_type)
+            tmp_path = self._write_temp_image(blob, ext)
+            if not tmp_path:
+                notes.append(f"[Image {i}] (failed to persist temp image)")
+                continue
+            state.temp_image_paths.append(tmp_path)
+
+            ocr_text = self._extract_image_text(tmp_path)
+            section = [
+                f"[Image {i}]",
+                "priority: inspect the original image file at saved_path first; use ocr_text only as fallback",
+                f"media_type: {media_type}",
+                f"saved_path: {tmp_path}",
+            ]
+            if ocr_text:
+                section.append("ocr_text:")
+                section.append(ocr_text)
+            else:
+                section.append("ocr_text: (none)")
+            notes.append("\n".join(section))
+        return notes
+
+    @staticmethod
+    def _ext_for_media_type(media_type: str) -> str:
+        mt = media_type.lower()
+        if "png" in mt:
+            return ".png"
+        if "webp" in mt:
+            return ".webp"
+        if "gif" in mt:
+            return ".gif"
+        return ".jpg"
+
+    @staticmethod
+    def _write_temp_image(blob: bytes, ext: str) -> str | None:
+        try:
+            fd, path = tempfile.mkstemp(prefix="cb_codex_img_", suffix=ext)
+            with os.fdopen(fd, "wb") as f:
+                f.write(blob)
+            return path
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_image_text(path: str) -> str:
+        if which("tesseract") is None:
+            return ""
+        try:
+            proc = subprocess.run(
+                ["tesseract", path, "stdout", "-l", "eng"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if proc.returncode != 0:
+                return ""
+            text = (proc.stdout or "").strip()
+            if not text:
+                return ""
+            if len(text) > 4000:
+                return text[:4000].rstrip() + "\n...(truncated)"
+            return text
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _cleanup_temp_images(state: _CodexState) -> None:
+        if not state.temp_image_paths:
+            return
+        for p in state.temp_image_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        state.temp_image_paths = []
 
     def _load_saved_sessions(self) -> dict:
         try:

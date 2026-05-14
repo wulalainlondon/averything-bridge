@@ -1,3 +1,4 @@
 websockets>=14.0
+zeroconf>=0.38       # mDNS discovery (claude-bridge.local)
 firebase-admin>=6.0  # optional: FCM push notifications
 aiohttp>=3.9         # optional: Ollama backend

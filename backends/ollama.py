@@ -14,6 +14,11 @@ except ImportError:
     _AIOHTTP_AVAILABLE = False
 
 from .base import Backend
+from .events import (
+    send_event,
+    _evt_text_chunk, _evt_done, _evt_error, _evt_stopped,
+    _evt_session_warning, _evt_session_closed,
+)
 
 log = logging.getLogger("bridge_v2")
 
@@ -31,7 +36,6 @@ class OllamaBackend(Backend):
 
     async def send(self, session, content: str,
                    images: list | None = None, files: list | None = None) -> None:
-        from claude_bridge_v2 import send_event, _evt_text_chunk, _evt_done, _evt_error
 
         if not _AIOHTTP_AVAILABLE:
             await send_event(session, _evt_error("aiohttp not installed. Run: pip install aiohttp", "backend_unavailable"))
@@ -80,23 +84,16 @@ class OllamaBackend(Backend):
             await send_event(session, _evt_error(f"Ollama error: {exc}"))
 
     async def stop(self, session) -> None:
-        from claude_bridge_v2 import send_event, _evt_stopped
-
         session.is_stopping = True
         session.is_streaming = False
         await send_event(session, _evt_stopped())
 
     async def clear(self, session) -> None:
-        from claude_bridge_v2 import send_event, _evt_session_warning
-
         self._histories[session.session_id] = []
         session.is_streaming = False
         await send_event(session, _evt_session_warning("History cleared."))
 
     async def close(self, session) -> None:
-        from claude_bridge_v2 import _SESSIONS, _SESSIONS_LOCK, send_event, _evt_session_closed
-
         self._histories.pop(session.session_id, None)
-        async with _SESSIONS_LOCK:
-            _SESSIONS.pop(session.session_id, None)
+        # Removal from _SESSIONS is the bridge handler's responsibility
         await send_event(session, _evt_session_closed())
