@@ -26,7 +26,7 @@ echo "==> Setup virtualenv and deps"
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip --quiet
-pip install -r requirements.txt --quiet
+pip install -r requirements.txt --quiet --force-reinstall
 
 chmod +x run_bridge.sh bridge_supervisor.sh bridge_healthcheck.py bridge_launch.sh
 

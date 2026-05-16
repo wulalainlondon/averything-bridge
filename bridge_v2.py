@@ -1038,8 +1038,271 @@ async def _dispatch_event(payload: dict, session: "Session") -> bool:
 
 
 # ---------------------------------------------------------------------------
-# sessions_list payload helper
+# JSONL recent-message helpers + live directory watcher
 # ---------------------------------------------------------------------------
+CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+_WATCHER_LAST_MAX_MTIME: float = 0.0
+
+
+def _read_recent_msgs(path: str, fmt: str, n: int = 2) -> list:
+    """Parse last n user+assistant messages from a JSONL file (claude or codex format)."""
+    messages: list = []
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                try:
+                    d = json.loads(raw)
+                    role = text = None
+                    if fmt == "claude":
+                        if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
+                            continue
+                        role = d["type"]
+                        content = d.get("message", {}).get("content", "")
+                        if isinstance(content, str):
+                            text = content
+                        elif isinstance(content, list):
+                            parts = [blk.get("text", "") for blk in content
+                                     if isinstance(blk, dict) and blk.get("type") == "text"]
+                            text = "\n".join(p for p in parts if p)
+                    elif fmt == "codex":
+                        if d.get("type") != "response_item":
+                            continue
+                        payload = d.get("payload", {})
+                        if not isinstance(payload, dict) or payload.get("type") != "message":
+                            continue
+                        role = payload.get("role")
+                        if role not in ("user", "assistant"):
+                            continue
+                        content = payload.get("content", "")
+                        if isinstance(content, str):
+                            text = content
+                        elif isinstance(content, list):
+                            parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+                            text = "\n".join(p for p in parts if p)
+                    if role and text and not text.startswith("<") and not text.startswith("[Request interrupted"):
+                        messages.append({"role": role, "text": text[:300]})
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return messages[-n:] if len(messages) > n else messages
+
+
+def _get_recent_messages_sync(session: "Session", n: int = 2) -> list:
+    try:
+        if not session.resume_id:
+            return []
+        backend = _session_backend(session)
+        if session.backend_name == "codex":
+            if not hasattr(backend, "_find_native_session_file"):
+                return []
+            path = backend._find_native_session_file(session.resume_id)
+            return _read_recent_msgs(path, "codex", n) if path else []
+        else:
+            if not hasattr(backend, "_find_session_file_sync"):
+                return []
+            path = backend._find_session_file_sync(session.resume_id)
+            return _read_recent_msgs(path, "claude", n) if path else []
+    except Exception:
+        return []
+
+
+def _register_jsonl_session(path: str) -> bool:
+    """Register a single JSONL file as a session in _SESSIONS if not already present.
+    Returns True if a new session was added."""
+    try:
+        fn = os.path.basename(path)
+        if not fn.endswith(".jsonl"):
+            return False
+        uuid = fn[:-6]
+        if len(uuid) < 8:
+            return False
+        existing_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
+        if uuid in existing_uuids:
+            return False
+
+        # Determine backend from path
+        if CODEX_SESSIONS_DIR and path.startswith(CODEX_SESSIONS_DIR):
+            backend_name = "codex"
+            sid = f"jl_x_{uuid[:12]}"
+        else:
+            backend_name = "claude"
+            sid = f"jl_c_{uuid[:12]}"
+
+        if sid in _SESSIONS:
+            return False
+
+        # Read name + cwd from the JSONL itself
+        name = ""
+        cwd = DEFAULT_CWD
+        fmt = "codex" if backend_name == "codex" else "claude"
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    try:
+                        d = json.loads(raw)
+                        if fmt == "claude":
+                            if not cwd or cwd == DEFAULT_CWD:
+                                raw_cwd = d.get("cwd")
+                                if isinstance(raw_cwd, str) and raw_cwd.strip():
+                                    cwd = raw_cwd.strip()
+                            if not name and d.get("type") == "user":
+                                content = d.get("message", {}).get("content", "")
+                                t = content if isinstance(content, str) else next(
+                                    (blk.get("text","") for blk in content
+                                     if isinstance(blk, dict) and blk.get("type") == "text"), "")
+                                if t and not t.startswith("<"):
+                                    name = t[:50].strip()
+                        elif fmt == "codex":
+                            if d.get("type") == "session_meta":
+                                pl = d.get("payload", {})
+                                if isinstance(pl, dict) and not cwd or cwd == DEFAULT_CWD:
+                                    c = pl.get("cwd") or pl.get("workingDirectory", "")
+                                    if c:
+                                        cwd = c
+                        if name and cwd != DEFAULT_CWD:
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if not name:
+            name = uuid[:8]
+
+        mtime = 0.0
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            pass
+
+        _SESSIONS[sid] = Session(
+            session_id=sid,
+            name=name,
+            created_at=mtime or time.time(),
+            cwd=os.path.expanduser(cwd),
+            backend_name=backend_name,
+            resume_id=uuid,
+        )
+        return True
+    except Exception as exc:
+        log.warning("_register_jsonl_session(%s) failed: %s", path, exc)
+        return False
+
+
+def _merge_jsonl_sessions_into_state() -> bool:
+    """Initial scan: register all JSONL sessions not yet in _SESSIONS."""
+    added = False
+    existing_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
+
+    for base, backend_name in ((CLAUDE_PROJECTS_DIR, "claude"), (CODEX_SESSIONS_DIR, "codex")):
+        if not os.path.isdir(base):
+            continue
+        try:
+            for root, _dirs, files in os.walk(base):
+                for fn in files:
+                    if not fn.endswith(".jsonl"):
+                        continue
+                    uuid = fn[:-6]
+                    if len(uuid) < 8 or uuid in existing_uuids:
+                        continue
+                    if _register_jsonl_session(os.path.join(root, fn)):
+                        existing_uuids.add(uuid)
+                        added = True
+        except Exception as exc:
+            log.warning("JSONL initial scan (%s) error: %s", backend_name, exc)
+
+    return added
+
+
+async def _jsonl_watcher_task() -> None:
+    """Use watchdog FSEvents to watch Claude + Codex JSONL dirs.
+    Falls back to 5-second polling if watchdog is unavailable."""
+    loop = asyncio.get_event_loop()
+    _merge_jsonl_sessions_into_state()
+
+    # Debounce: accumulate changed paths, flush after 0.8s of quiet
+    _pending: dict[str, float] = {}
+    _flush_handle: list = [None]
+
+    async def _flush_changes() -> None:
+        paths = list(_pending.keys())
+        _pending.clear()
+        newly_added = False
+        for p in paths:
+            if _register_jsonl_session(p):
+                newly_added = True
+        if _CLIENTS:
+            await _broadcast_json(build_sessions_list())
+
+    def _on_file_event(path: str) -> None:
+        if not path.endswith(".jsonl"):
+            return
+        _pending[path] = time.time()
+        if _flush_handle[0]:
+            _flush_handle[0].cancel()
+        _flush_handle[0] = loop.call_soon_threadsafe(
+            lambda: asyncio.ensure_future(_flush_changes())
+        )
+
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+
+        class _Handler(FileSystemEventHandler):
+            def on_modified(self, event):
+                if not event.is_directory:
+                    loop.call_soon_threadsafe(_on_file_event, event.src_path)
+            def on_created(self, event):
+                if not event.is_directory:
+                    loop.call_soon_threadsafe(_on_file_event, event.src_path)
+
+        observer = Observer()
+        handler = _Handler()
+        for d in (CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR):
+            if os.path.isdir(d):
+                observer.schedule(handler, d, recursive=True)
+        observer.start()
+        log.info("JSONL watcher: FSEvents observer started")
+        try:
+            await asyncio.Future()  # run forever alongside the observer thread
+        finally:
+            observer.stop()
+            observer.join()
+
+    except ImportError:
+        log.warning("watchdog not installed — falling back to 5s polling")
+        import hashlib
+
+        def _dir_fingerprint() -> str:
+            parts = []
+            for base in (CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR):
+                if not os.path.isdir(base):
+                    continue
+                for root, _dirs, files in os.walk(base):
+                    for fn in sorted(files):
+                        if fn.endswith(".jsonl"):
+                            try:
+                                parts.append(f"{fn}:{os.stat(os.path.join(root,fn)).st_mtime:.0f}")
+                            except OSError:
+                                pass
+            return hashlib.md5("|".join(parts).encode()).hexdigest()
+
+        last_fp = _dir_fingerprint()
+        while True:
+            await asyncio.sleep(5)
+            try:
+                fp = _dir_fingerprint()
+                if fp == last_fp:
+                    continue
+                last_fp = fp
+                _merge_jsonl_sessions_into_state()
+                if _CLIENTS:
+                    await _broadcast_json(build_sessions_list())
+            except Exception as exc:
+                log.warning("JSONL polling error: %s", exc)
+
+
 def build_sessions_list() -> dict:
     return _msg_sessions_list([
         {
@@ -1057,6 +1320,7 @@ def build_sessions_list() -> dict:
             "pinned": s.pinned,
             "hidden": s.hidden,
             "queue_length": len(s.queue),
+            "recent_messages": _get_recent_messages_sync(s, n=2),
         }
         for s in _SESSIONS.values()
     ])
@@ -1918,6 +2182,15 @@ async def main(port: int, tunnel: bool = False,
     _OLLAMA_HOST = ollama_host
 
     _get_or_create_backend(_DEFAULT_BACKEND_NAME)
+    # Pre-create both scan-capable backends so _merge_jsonl_sessions_into_state works at startup.
+    try:
+        _get_or_create_backend("claude")
+    except Exception:
+        pass
+    try:
+        _get_or_create_backend("codex")
+    except Exception:
+        pass
     init_firebase()
     _migrate_codex_saved_sessions()
     _restore_sessions_from_disk()
@@ -1964,6 +2237,7 @@ async def main(port: int, tunnel: bool = False,
         asyncio.create_task(preload_sessions_cache(_BACKENDS))
         asyncio.create_task(_session_cache_refresher())
         asyncio.create_task(_warmup_history_cache_background())
+        asyncio.create_task(_jsonl_watcher_task())
         try:
             await asyncio.Future()  # run forever
         finally:
