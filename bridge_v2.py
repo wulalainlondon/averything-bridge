@@ -1956,6 +1956,7 @@ async def main(port: int, tunnel: bool = False,
         ping_timeout=60,
         process_request=_media_request_handler,
         compression="deflate",
+        reuse_port=True,
     ):
         log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
         if tunnel:
