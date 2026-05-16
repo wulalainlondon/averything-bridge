@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from claude_bridge_v2 import Session
+    from bridge_v2 import Session
 
 
 class Backend(ABC):
@@ -41,6 +41,13 @@ class Backend(ABC):
         """回傳可恢復的 session 列表。預設回傳空列表。"""
         return []
 
-    async def load_session_history(self, resume_id: str, limit: int = 60) -> list[dict]:
+    async def load_session_history(
+        self,
+        resume_id: str,
+        limit: int = 120,
+        known_last_source_message_id: str = "",
+        mode: str = "snapshot",
+        before_source_message_id: str = "",
+    ) -> list[dict] | dict:
         """載入 session 歷史紀錄。預設回傳空列表。"""
         return []
