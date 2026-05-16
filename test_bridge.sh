@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test the Claude Bridge WebSocket server.
+# Test the Bridge WebSocket server.
 # Tries wscat first; falls back to the venv Python websockets client.
 
 BRIDGE_DIR="/Users/wulala/Downloads/Helper/claude-bridge/bridge"
@@ -15,7 +15,7 @@ else
     exit 1
 fi
 
-echo "==> Claude Bridge smoke-test"
+echo "==> Bridge smoke-test"
 echo "    Target: $WS_URL"
 echo "    Python: $PYTHON"
 echo ""
@@ -39,7 +39,7 @@ async def test():
     except ConnectionRefusedError:
         print("ERROR: Bridge is not running on port 8765.", file=sys.stderr)
         print("  Start with: cd /Users/wulala/Downloads/Helper/claude-bridge/bridge", file=sys.stderr)
-        print("              source venv/bin/activate && python claude_bridge.py --port 8765", file=sys.stderr)
+        print("              source venv/bin/activate && python bridge.py --port 8765", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -53,7 +53,7 @@ PYEOF
 if ! lsof -iTCP:8765 -sTCP:LISTEN &>/dev/null; then
     echo "Bridge is not running on port 8765."
     echo "Starting bridge in background for test..."
-    nohup "$BRIDGE_DIR/venv/bin/python" "$BRIDGE_DIR/claude_bridge.py" --port 8765 \
+    nohup "$BRIDGE_DIR/venv/bin/python" "$BRIDGE_DIR/bridge.py" --port 8765 \
         >> "$BRIDGE_DIR/bridge.log" 2>> "$BRIDGE_DIR/bridge.err" &
     STARTED_PID=$!
     sleep 2

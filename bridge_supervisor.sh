@@ -41,14 +41,16 @@ BACKOFF=1
 MAX_RETRIES=10
 RETRY_COUNT=0
 
-# Wait until port $PORT is free (up to $1 seconds).
+# Wait until port $PORT is free (up to $1 seconds), then force-kill if still busy.
 wait_for_port_free() {
   local max_wait="${1:-30}"
   local waited=0
   while lsof -ti :"$PORT" >/dev/null 2>&1; do
     if (( waited >= max_wait )); then
-      echo "[supervisor] port $PORT still busy after ${max_wait}s — giving up wait"
-      return 1
+      echo "[supervisor] port $PORT still busy after ${max_wait}s — force-killing"
+      lsof -ti :"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+      sleep 1
+      return 0
     fi
     echo "[supervisor] port $PORT busy, waiting... (${waited}s)"
     sleep 2
@@ -80,7 +82,7 @@ while true; do
     OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
     if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
       CMD="$(ps -p "$OLD_PID" -o command= || true)"
-      if [[ "$CMD" == *"claude_bridge_v2.py"* ]]; then
+      if [[ "$CMD" == *"bridge_v2.py"* ]]; then
         kill "$OLD_PID" 2>/dev/null || true
         sleep 1
       fi
@@ -136,6 +138,6 @@ while true; do
       break
     fi
 
-    sleep 10
+    sleep 3
   done
 done

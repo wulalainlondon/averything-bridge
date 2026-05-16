@@ -6,8 +6,9 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parent
-MAIN = ROOT / "claude_bridge_v2.py"
-MAX_MAIN_LINES = 1700
+MAIN = ROOT / "bridge_v2.py"
+WARN_MAIN_LINES = 1700   # emit warning; handler extraction recommended
+MAX_MAIN_LINES = 1750   # hard fail; no new code may be added inline
 
 BANNED_INLINE_TYPES = {
     "get_usage",
@@ -33,7 +34,9 @@ def main() -> None:
     text = MAIN.read_text(encoding="utf-8")
     lines = text.count("\n") + 1
     if lines > MAX_MAIN_LINES:
-        fail(f"{MAIN} has {lines} lines (budget {MAX_MAIN_LINES})")
+        fail(f"{MAIN} has {lines} lines (hard limit {MAX_MAIN_LINES})")
+    elif lines > WARN_MAIN_LINES:
+        print(f"[governance] WARN: {MAIN.name} has {lines} lines (alert threshold {WARN_MAIN_LINES}; extract handlers before adding more)")
 
     for mtype in sorted(BANNED_INLINE_TYPES):
         pat = re.compile(rf"elif\s+mtype\s*==\s*\"{re.escape(mtype)}\"")

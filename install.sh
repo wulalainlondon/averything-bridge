@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SRC_DIR="/Users/wulala/Downloads/Helper/claude-bridge/bridge"
-RUNTIME_DIR="$HOME/.claude-bridge-runtime"
-PLIST_NAME="com.wulala.claude-bridge.plist"
+RUNTIME_DIR="$HOME/.bridge-runtime"
+PLIST_NAME="com.wulala.bridge.plist"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 PLIST_PATH="$LAUNCH_AGENTS/$PLIST_NAME"
 
@@ -28,7 +28,7 @@ cat > "$PLIST_PATH" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.wulala.claude-bridge</string>
+  <key>Label</key><string>com.wulala.bridge</string>
   <key>Program</key><string>/bin/bash</string>
   <key>ProgramArguments</key>
   <array>
@@ -39,8 +39,8 @@ cat > "$PLIST_PATH" <<PLIST
   <key>WorkingDirectory</key><string>$RUNTIME_DIR</string>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/tmp/com.wulala.claude-bridge.stdout.log</string>
-  <key>StandardErrorPath</key><string>/tmp/com.wulala.claude-bridge.stderr.log</string>
+  <key>StandardOutPath</key><string>/tmp/com.wulala.bridge.stdout.log</string>
+  <key>StandardErrorPath</key><string>/tmp/com.wulala.bridge.stderr.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/Users/wulala/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
@@ -54,8 +54,8 @@ PLIST
 
 launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-launchctl enable "gui/$(id -u)/com.wulala.claude-bridge" || true
-launchctl kickstart -k "gui/$(id -u)/com.wulala.claude-bridge"
+launchctl enable "gui/$(id -u)/com.wulala.bridge" || true
+launchctl kickstart -k "gui/$(id -u)/com.wulala.bridge"
 
 sleep 2
 
@@ -64,8 +64,8 @@ if lsof -nP -iTCP:8766 -sTCP:LISTEN >/dev/null; then
 else
   echo "Bridge not listening on :8766 yet."
   echo "Check logs:"
-  echo "  /tmp/com.wulala.claude-bridge.stderr.log"
-  echo "  /tmp/com.wulala.claude-bridge.stdout.log"
+  echo "  /tmp/com.wulala.bridge.stderr.log"
+  echo "  /tmp/com.wulala.bridge.stdout.log"
   echo "  $RUNTIME_DIR/bridge_v2.log"
 fi
 

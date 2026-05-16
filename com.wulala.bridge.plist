@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.wulala.claude-bridge</string>
+  <key>Label</key><string>com.wulala.bridge</string>
   <key>Program</key><string>/bin/bash</string>
   <key>ProgramArguments</key>
   <array>
@@ -13,8 +13,8 @@
   <key>WorkingDirectory</key><string>/Users/wulala/Downloads/Helper/claude-bridge/bridge</string>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/tmp/com.wulala.claude-bridge.stdout.log</string>
-  <key>StandardErrorPath</key><string>/tmp/com.wulala.claude-bridge.stderr.log</string>
+  <key>StandardOutPath</key><string>/tmp/com.wulala.bridge.stdout.log</string>
+  <key>StandardErrorPath</key><string>/tmp/com.wulala.bridge.stderr.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/Users/wulala/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
