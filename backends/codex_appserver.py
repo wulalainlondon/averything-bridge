@@ -91,9 +91,12 @@ class CodexAppServerBackend(Backend):
         self._next_id += 1
         return rid
 
-    async def _send_rpc(self, method: str, params: dict, rid: int) -> None:
+    async def _send_rpc(self, method: str, params: dict | None, rid: int) -> None:
         assert self._proc and self._proc.stdin
-        msg = json.dumps({"id": rid, "method": method, "params": params})
+        payload = {"id": rid, "method": method}
+        if params is not None:
+            payload["params"] = params
+        msg = json.dumps(payload)
         self._proc.stdin.write((msg + "\n").encode())
         await self._proc.stdin.drain()
 
@@ -105,7 +108,7 @@ class CodexAppServerBackend(Backend):
         self._proc.stdin.write((json.dumps(msg) + "\n").encode())
         await self._proc.stdin.drain()
 
-    async def _rpc(self, method: str, params: dict, timeout: float = 30.0) -> dict:
+    async def _rpc(self, method: str, params: dict | None, timeout: float = 30.0) -> dict:
         rid = self._alloc_id()
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
@@ -253,19 +256,26 @@ class CodexAppServerBackend(Backend):
                 token_usage = params.get("tokenUsage", {}) or params.get("usage", {}) or {}
                 usage = token_usage.get("last", {}) if isinstance(token_usage, dict) else {}
                 state.last_usage = {
+                    "total_tokens": int(usage.get("totalTokens") or usage.get("total_tokens") or 0),
                     "input_tokens": int(usage.get("inputTokens") or usage.get("input_tokens") or 0),
                     "output_tokens": int(usage.get("outputTokens") or usage.get("output_tokens") or 0),
                     "cached_input_tokens": int(usage.get("cachedInputTokens") or usage.get("cached_input_tokens") or 0),
                     "reasoning_output_tokens": int(usage.get("reasoningOutputTokens") or usage.get("reasoning_output_tokens") or 0),
                 }
                 state.usage_updated_at = time.time()
-                session.context_used = state.last_usage["input_tokens"] + state.last_usage["cached_input_tokens"]
+                session.context_used = state.last_usage["total_tokens"]
                 context_window = token_usage.get("modelContextWindow") if isinstance(token_usage, dict) else None
                 if context_window is not None:
                     try:
                         session.context_max = int(context_window)
                     except Exception:
                         pass
+
+        elif method == "account/rateLimits/updated":
+            rate_limits = params.get("rateLimits", {})
+            if isinstance(rate_limits, dict):
+                for state in self._states.values():
+                    state.last_rate_limits = rate_limits
 
         elif method in ("warning", "error") and not session:
             log.debug("[codex-appserver] %s: %s", method, str(params)[:200])
@@ -582,18 +592,45 @@ class CodexAppServerBackend(Backend):
             log.info("codex-appserver warmup_history_cache: pre-built index for %d sessions", warmed)
 
     async def fetch_usage(self, ws) -> None:
+        try:
+            await self._ensure_server()
+            result = await self._rpc("account/rateLimits/read", None, timeout=10.0)
+            rate_limits = result.get("rateLimits") or result.get("rate_limits") or {}
+            if isinstance(rate_limits, dict):
+                for state in self._states.values():
+                    state.last_rate_limits = rate_limits
+        except Exception as exc:
+            log.debug("[codex-appserver] account/rateLimits/read failed: %s", exc)
+
         latest: _AppServerState | None = None
         for state in self._states.values():
             if latest is None or state.usage_updated_at > latest.usage_updated_at:
                 latest = state
 
-        five_hour = None
-        if latest and latest.last_usage:
-            total = latest.last_usage.get("input_tokens", 0)
+        def fmt_window(window: dict | None) -> dict | None:
+            if not isinstance(window, dict):
+                return None
+            utilization = window.get("usedPercent")
+            if utilization is None:
+                utilization = window.get("used_percent")
+            resets_at = window.get("resetsAt")
+            if resets_at is None:
+                resets_at = window.get("resets_at")
+            return {
+                "utilization": utilization,
+                "resets_at": str(resets_at) if resets_at is not None else None,
+            }
+
+        rate_limits = latest.last_rate_limits if latest else {}
+        five_hour = fmt_window(rate_limits.get("primary") if isinstance(rate_limits, dict) else None)
+        seven_day = fmt_window(rate_limits.get("secondary") if isinstance(rate_limits, dict) else None)
+
+        if five_hour is None and latest and latest.last_usage:
+            total = latest.last_usage.get("total_tokens", 0)
             if total:
                 five_hour = {"utilization": total, "resets_at": None}
 
-        payload = _msg_usage_report(five_hour, None, None)
+        payload = _msg_usage_report(five_hour, seven_day, None)
         try:
             await ws.send(json.dumps(payload))
         except Exception:
