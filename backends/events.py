@@ -17,6 +17,19 @@ if TYPE_CHECKING:
 
 OFFLINE_BUFFER_MAX = 10000
 _MEDIA_BASE_URL: str = ""
+HTTP_PORT = 9090
+_http_server_proc: "asyncio.subprocess.Process | None" = None
+
+
+async def ensure_http_server() -> None:
+    global _http_server_proc
+    if _http_server_proc is not None and _http_server_proc.returncode is None:
+        return
+    _http_server_proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "http.server", str(HTTP_PORT), "--directory", "/",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
 
 
 def set_media_base_url(url: str) -> None:
@@ -318,7 +331,11 @@ async def scan_for_media(text: str, session: "Session") -> None:
             media_type = "video"
         elif ext in DOC_EXTS:
             encoded = urlquote(path)
-            url = f"{_MEDIA_BASE_URL}/media{encoded}"
+            if _MEDIA_BASE_URL:
+                url = f"{_MEDIA_BASE_URL}/media{encoded}"
+            else:
+                await ensure_http_server()
+                url = f"http://127.0.0.1:{HTTP_PORT}{encoded}"
             title = _extract_html_title(path) if ext in {".html", ".htm"} else os.path.basename(path)
             if not title:
                 title = os.path.basename(path)
@@ -330,7 +347,11 @@ async def scan_for_media(text: str, session: "Session") -> None:
         else:
             continue
         encoded = urlquote(path)
-        url = f"{_MEDIA_BASE_URL}/media{encoded}"
+        if _MEDIA_BASE_URL:
+            url = f"{_MEDIA_BASE_URL}/media{encoded}"
+        else:
+            await ensure_http_server()
+            url = f"http://127.0.0.1:{HTTP_PORT}{encoded}"
         payload = _evt_media(media_type, path, url)
         log.info("Media detected: %s", payload)
         await send_event(session, payload)

@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("bridge_v2")
 
+TOOL_IDLE_TIMEOUT_SECS = 300  # kill claude if no stdout for this many seconds
+
 # Compact when context_used exceeds this fraction of the model's context window.
 _COMPACT_THRESHOLD = 0.80
 
@@ -48,6 +50,8 @@ class _ClaudeState:
     stdout_task: Optional[asyncio.Task] = field(default=None, repr=False)
     stderr_task: Optional[asyncio.Task] = field(default=None, repr=False)
     watch_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    timeout_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    timed_out: bool = False
     tool_blocks: dict = field(default_factory=dict)
     restart_count: int = 0
     pending_stop: bool = False
@@ -147,6 +151,11 @@ class ClaudeCliBackend(Backend):
             session.is_streaming = False
             log.error("[%s] Failed to write to stdin: %s", session.session_id, exc)
             await send_event(session, _evt_error(f"stdin write failed: {exc}"))
+            return
+
+        if state.timeout_task and not state.timeout_task.done():
+            state.timeout_task.cancel()
+        state.timeout_task = asyncio.create_task(self._idle_watchdog(session))
 
     async def stop(self, session: "Session") -> None:
         state = self._get_state(session)
@@ -156,6 +165,8 @@ class ClaudeCliBackend(Backend):
             return
 
         session.is_stopping = True
+        if state.timeout_task and not state.timeout_task.done():
+            state.timeout_task.cancel()
         log.info("[%s] Stopping session (pid=%d)", session.session_id, state.proc.pid)
 
         try:
@@ -181,6 +192,8 @@ class ClaudeCliBackend(Backend):
         state = self._get_state(session)
 
         log.info("[%s] Clearing session history", session.session_id)
+        if state.timeout_task and not state.timeout_task.done():
+            state.timeout_task.cancel()
         session.is_stopping = True
         session.resume_id = None
         session.accumulated_text = ""
@@ -208,6 +221,8 @@ class ClaudeCliBackend(Backend):
         state = self._get_state(session)
 
         session.is_stopping = True
+        if state.timeout_task and not state.timeout_task.done():
+            state.timeout_task.cancel()
         log.info("[%s] Closing session", session.session_id)
 
         if state.proc is not None and state.proc.returncode is None:
@@ -692,11 +707,36 @@ console.log(JSON.stringify(data));
         state.watch_task  = asyncio.create_task(self._watch_proc(session))
         log.info("[%s] Claude process started (pid=%d)", session.session_id, state.proc.pid)
 
+        if state.timed_out:
+            state.timed_out = False
+            context_msg = json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": [{
+                    "type": "text",
+                    "text": (
+                        "[系統自動注入] 你上一輪的工具執行超過5分鐘無回應，"
+                        "session 已被自動終止並以 --resume 重啟。"
+                        "請簡短說明你剛才在做什麼、最後執行的是什麼工具，以及可能的原因。"
+                        "不要自動重試任何操作，等待用戶指示。"
+                    ),
+                }]},
+            }) + "\n"
+            session.is_streaming = True
+            session.last_activity = asyncio.get_event_loop().time()
+            try:
+                state.proc.stdin.write(context_msg.encode("utf-8"))
+                await state.proc.stdin.drain()
+                log.info("[%s] Injected timeout context message", session.session_id)
+            except Exception as exc:
+                session.is_streaming = False
+                log.error("[%s] Failed to inject timeout context: %s", session.session_id, exc)
+
     async def _stdout_reader(self, session: "Session") -> None:
         state = self._get_state(session)
         assert state.proc is not None
 
         async for line_bytes in state.proc.stdout:
+            session.last_activity = asyncio.get_event_loop().time()
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -909,3 +949,38 @@ console.log(JSON.stringify(data));
             await send_event(session, _evt_session_died(
                 f"Claude process exited (rc={rc}) and will not restart."
             ))
+
+    async def _idle_watchdog(self, session: "Session") -> None:
+        state = self._get_state(session)
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(30)
+            if not session.is_streaming:
+                return
+            elapsed = loop.time() - session.last_activity
+            if elapsed < TOOL_IDLE_TIMEOUT_SECS:
+                continue
+            log.warning("[%s] Tool idle timeout (%.0fs) — killing claude (pid=%s)",
+                        session.session_id, elapsed,
+                        state.proc.pid if state.proc else "?")
+            await send_event(session, _evt_session_warning(
+                f"⚠️ 工具執行超過 {int(elapsed) // 60} 分 {int(elapsed) % 60} 秒無回應，"
+                "已自動終止並重新啟動 Claude…"
+            ))
+            session.is_stopping = True
+            session.is_streaming = False
+            session.accumulated_text = ""
+            state.tool_blocks = {}
+            state.timed_out = True
+            try:
+                state.proc.send_signal(signal.SIGTERM)
+            except (ProcessLookupError, AttributeError):
+                pass
+            await asyncio.sleep(1)
+            try:
+                if state.proc and state.proc.returncode is None:
+                    state.proc.kill()
+            except (ProcessLookupError, AttributeError):
+                pass
+            await self._spawn_proc(session)
+            return
