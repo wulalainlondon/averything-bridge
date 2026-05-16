@@ -52,6 +52,7 @@ class _ClaudeState:
     watch_task: Optional[asyncio.Task] = field(default=None, repr=False)
     timeout_task: Optional[asyncio.Task] = field(default=None, repr=False)
     timed_out: bool = False
+    spawning: bool = False
     tool_blocks: dict = field(default_factory=dict)
     restart_count: int = 0
     pending_stop: bool = False
@@ -100,8 +101,17 @@ class ClaudeCliBackend(Backend):
             return
 
         if state.proc is None or state.proc.returncode is not None:
-            await send_event(session, _evt_error("Claude process is not running.", "session_dead"))
-            return
+            # Trigger spawn if nothing is running yet
+            if not state.spawning:
+                asyncio.create_task(self._spawn_proc(session))
+            # Wait up to 30s for the process to become ready
+            for _ in range(60):
+                await asyncio.sleep(0.5)
+                if state.proc is not None and state.proc.returncode is None:
+                    break
+            else:
+                await send_event(session, _evt_error("Claude process failed to start.", "session_dead"))
+                return
 
         session.accumulated_text = ""
         state.tool_blocks = {}
@@ -667,6 +677,9 @@ console.log(JSON.stringify(data));
         state = self._get_state(session)
         if state.proc is not None and state.proc.returncode is None:
             return  # already running
+        if state.spawning:
+            return  # spawn already in progress, caller should wait
+        state.spawning = True
 
         cmd = [
             self._claude_bin,
@@ -694,8 +707,10 @@ console.log(JSON.stringify(data));
         except Exception as exc:
             log.error("[%s] Failed to spawn claude: %s", session.session_id, exc)
             await send_event(session, _evt_error(f"Failed to spawn claude: {exc}"))
+            state.spawning = False
             return
 
+        state.spawning = False
         session.is_stopping = False
 
         for task in (state.stdout_task, state.stderr_task, state.watch_task):
