@@ -16,12 +16,39 @@ import json
 import logging
 import mimetypes
 import os
+from pathlib import Path
 import re
+import resource
 import shutil
 import subprocess
 import time
 import sys
 import uuid
+
+# Raise file descriptor limit before any subsystem opens files (search ingest +
+# watchdog kqueue observer can consume thousands of fds).
+# macOS launchd default is 256; plist HardResourceLimits may cap at 8192.
+# Strategy: always attempt to raise to _WANT_FDS; try relaxing hard limit too.
+_WANT_FDS = 65536
+_TURN_ABORTED_RE = re.compile(r"<turn_aborted>.*?</turn_aborted>", re.IGNORECASE | re.DOTALL)
+try:
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    # Determine the new hard: prefer _WANT_FDS; if the kernel hard is lower and
+    # > 0 (i.e. not RLIM_INFINITY) we must stay at or below it — but on macOS
+    # non-root processes can raise the hard up to the system kern.maxfilesperproc
+    # limit even if launchd set a lower hard, so try _WANT_FDS unconditionally.
+    _new_hard = _WANT_FDS if (_hard <= 0 or _hard < _WANT_FDS) else _hard
+    _new_soft = _WANT_FDS
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_new_soft, _new_hard))
+except (ValueError, OSError):
+    # Couldn't raise hard limit; try raising soft only up to existing hard.
+    try:
+        _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        _cap = _hard if _hard > 0 else _WANT_FDS
+        if _soft < _cap:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (_cap, _hard))
+    except (ValueError, OSError):
+        pass
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Literal, NotRequired, Optional, TYPE_CHECKING, TypedDict
 
@@ -32,6 +59,12 @@ from handlers.file_ops import handle_file_msg, preload_sessions_cache, invalidat
 from handlers.perf import PerfTracker
 from handlers.runtime_ops import handle_runtime_msg
 from handlers.system_ops import handle_system_msg
+from handlers.webrtc_signaling import (
+    WEBRTC_MESSAGE_TYPES,
+    cleanup_for_ws as _webrtc_cleanup_for_ws,
+    handle_webrtc_message,
+)
+from utils.uuid_helper import is_valid_uuid
 
 try:
     import socket
@@ -39,6 +72,17 @@ try:
     _ZEROCONF_AVAILABLE = True
 except ImportError:
     _ZEROCONF_AVAILABLE = False
+
+try:
+    from config import get_config
+    from search.ingest import start_worker, stop_worker, get_worker
+    from search.query import ConnectionPool
+    from handlers.search_ws import handle_search_message
+    _SEARCH_AVAILABLE = True
+    _SEARCH_IMPORT_ERR: "str | None" = None
+except ImportError as _ie:
+    _SEARCH_AVAILABLE = False
+    _SEARCH_IMPORT_ERR = str(_ie)
 from backends.events import (
     send_event, stream_text, scan_for_media, set_media_base_url,
     _evt_error, _evt_done, _evt_stopped, _evt_session_warning, _evt_session_died, _evt_session_closed,
@@ -64,7 +108,7 @@ LOG_FILE             = os.path.join(BRIDGE_DIR, "bridge_v2.log")
 CLAUDE_BIN           = ""
 CODEX_BIN            = ""
 BUN_BIN              = ""
-DEFAULT_CWD          = os.path.expanduser("~")
+DEFAULT_CWD          = os.path.expanduser(os.environ.get("BRIDGE_DEFAULT_CWD", "") or "~")
 MAX_SESSIONS         = 0
 MAX_SHELLS           = 5
 FCM_TOKEN_FILE        = os.path.join(BRIDGE_DIR, "fcm_token.txt")
@@ -158,6 +202,71 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("bridge_v2")
+
+if not _SEARCH_AVAILABLE:
+    log.warning("[search] module unavailable: %s; search disabled", _SEARCH_IMPORT_ERR)
+
+# ---------------------------------------------------------------------------
+# Search subsystem state
+# ---------------------------------------------------------------------------
+_search_pool: Optional[ConnectionPool] = None
+_search_enabled: bool = False
+
+SEARCH_MESSAGE_TYPES: frozenset[str] = frozenset({
+    "request_search",
+    "request_search_health",
+    "request_session_list",
+    "request_search_context",
+})
+
+
+async def _init_search() -> None:
+    global _search_pool, _search_enabled
+    if not _SEARCH_AVAILABLE:
+        _search_enabled = False
+        return
+    cfg = get_config()
+    if not cfg.search.enabled:
+        log.info("[search] disabled via config")
+        _search_enabled = False
+        return
+    try:
+        await start_worker(cfg)
+        _search_pool = ConnectionPool(cfg.search.index_path, max_size=4)
+        _search_enabled = True
+        log.info("[search] worker started; index at %s", cfg.search.index_path)
+    except Exception as e:
+        log.error("[search] failed to start (%r); bridge will run without search", e)
+        _search_enabled = False
+
+
+async def _shutdown_search() -> None:
+    global _search_pool, _search_enabled
+    _search_enabled = False
+    if _search_pool is not None:
+        await _search_pool.close_all()
+        _search_pool = None
+    if _SEARCH_AVAILABLE:
+        await stop_worker()
+
+
+async def _dispatch_ws_message(ws, msg: dict) -> bool:
+    """Returns True if handled by search layer."""
+    if not _search_enabled or _search_pool is None:
+        return False
+    t = msg.get("type")
+    if t not in SEARCH_MESSAGE_TYPES:
+        return False
+    try:
+        await handle_search_message(ws, msg, pool=_search_pool)
+    except Exception as e:
+        log.exception("[search] handler raised on %s", t)
+        try:
+            await ws.send(json.dumps({"type": f"{t}_error", "message": str(e)}))
+        except Exception:
+            pass
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Inbound message schema (TypedDict = IDE hints; validate_client_msg = runtime)
@@ -294,6 +403,12 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "fcm_token", "request_sessions_list", "browse_dir", "request_history",
     "set_effort", "hello", "set_session_meta", "switch_session_config",
     "push_file", "file_push_ack",
+    "get_all_sessions",
+    # search subsystem
+    "request_search", "request_search_health", "request_session_list",
+    "request_search_context",
+    # WebRTC P2P signaling (handled by handlers.webrtc_signaling)
+    "webrtc_offer", "webrtc_answer", "webrtc_ice",
 })
 
 def validate_client_msg(msg: object) -> str | None:
@@ -474,6 +589,8 @@ class Session:
     ws_ref: Optional[Any] = field(default=None, repr=False)
     offline_buffer: list = field(default_factory=list)
     recent_request_ids: set[str] = field(default_factory=set)
+    # BUG-07: set to True after first user message is indexed into FTS5 search.db
+    _fts_first_msg_indexed: bool = False
 
 
 # Legacy alias — keeps any remaining references working during transition
@@ -515,9 +632,13 @@ async def _send_session_history_response(
     before_source_message_id: str = "",
 ) -> None:
     if not session.resume_id:
+        runtime = _history_runtime_payload(session)
+        await ws.send(json.dumps(_msg_session_history(session.session_id, [], source_count=0, has_more_before=False, runtime=runtime)))
         return
     backend = _session_backend(session)
     if not backend.supports_resume():
+        runtime = _history_runtime_payload(session)
+        await ws.send(json.dumps(_msg_session_history(session.session_id, [], source_count=0, has_more_before=False, runtime=runtime)))
         return
     n = clamp_history_limit(limit or DEFAULT_HISTORY_LIMIT)
     history = await backend.load_session_history(
@@ -553,8 +674,8 @@ async def _send_session_history_response(
             )
         await ws.send(json.dumps(payload))
         return
-    if history:
-        await ws.send(json.dumps(_msg_session_history(session.session_id, history, runtime=runtime)))
+    messages = history if isinstance(history, list) else []
+    await ws.send(json.dumps(_msg_session_history(session.session_id, messages, runtime=runtime)))
 
 
 def _build_handoff_prompt(history: list[dict], user_request: str = "") -> str:
@@ -829,7 +950,7 @@ def _migrate_codex_saved_sessions() -> None:
             **current,
             "name": current.get("name") or entry.get("name") or str(sid)[:8],
             "claude_uuid": current.get("claude_uuid") or entry.get("resume_id") or entry.get("claude_uuid") or "",
-            "last_used": int(current.get("last_used") or entry.get("last_used") or 0),
+            "last_used": int(current.get("last_used") or entry.get("last_used") or time.time()),
             "cwd": current.get("cwd") or entry.get("cwd") or DEFAULT_CWD,
             "backend": "codex",
             "model": current.get("model") or entry.get("model") or "",
@@ -848,7 +969,10 @@ def _persist_session(session: "Session") -> None:
     saved = _load_saved_sessions()
     saved[session.session_id] = {
         "name": session.name,
-        "claude_uuid": session.resume_id,  # None when bad_resume cleared it
+        # Both keys written for human-readability and forward/backward compat.
+        # Authoritative field is resume_id; claude_uuid is legacy alias.
+        "resume_id": session.resume_id,
+        "claude_uuid": session.resume_id,
         "last_used": int(time.time()),
         "cwd": session.cwd,
         "backend": session.backend_name,
@@ -873,23 +997,55 @@ def _persist_session(session: "Session") -> None:
 
 def _restore_sessions_from_disk() -> None:
     """Load saved_sessions.json into _SESSIONS so sessions survive bridge restarts."""
+    # Prune stale entries before loading so _SESSIONS never contains sessions
+    # older than 30 days.  This eliminates the bulk-resume thundering-herd that
+    # occurs when auto_register accumulates thousands of old entries.
+    from auto_register import prune_old_saved_sessions
+    prune_old_saved_sessions(Path(SAVED_SESSIONS_FILE), days=30)
+
     saved = _load_saved_sessions()
+
+    # Drop entries whose resume ID is not a valid UUID so bridge never tries
+    # to spawn claude --resume with a bad ID (which causes 3 auto-retry cycles
+    # and a supervisor kill loop).  Accept both "resume_id" (new) and the
+    # legacy "claude_uuid" key for backward compat.
+    dropped: list[str] = []
+    for sid, data in list(saved.items()):
+        backend = data.get("backend", "claude")
+        claude_uuid = data.get("resume_id") or data.get("claude_uuid", "") or ""
+        if backend in ("claude", "codex") and claude_uuid and not is_valid_uuid(claude_uuid):
+            dropped.append(sid)
+            del saved[sid]
+            log.info("dropping saved session %s: invalid UUID %r", sid, claude_uuid)
+    if dropped:
+        try:
+            with open(SAVED_SESSIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump(saved, f, indent=2, ensure_ascii=False)
+            log.info("saved_sessions.json: dropped %d invalid session(s): %s", len(dropped), dropped)
+        except Exception as exc:
+            log.warning("Failed to rewrite saved_sessions.json after dropping invalid UUIDs: %s", exc)
+
     count = 0
     for sid, data in saved.items():
         if sid in _SESSIONS:
             continue
         try:
+            saved_last_used = float(data.get("last_used") or time.time())
             session = Session(
                 session_id=sid,
                 name=data.get("name", sid[:8]),
-                created_at=float(data.get("last_used", time.time())),
+                created_at=saved_last_used,
                 cwd=os.path.expanduser(data.get("cwd") or DEFAULT_CWD),
                 backend_name=_normalize_backend_name(data.get("backend")),
                 model=str(data.get("model") or ""),
                 sandbox=str(data.get("sandbox") or "danger-full-access"),
                 image_dir=str(data.get("image_dir") or ""),
             )
-            session.resume_id = data.get("claude_uuid") or None
+            # Accept both "resume_id" (new canonical) and "claude_uuid" (legacy) keys.
+            session.resume_id = data.get("resume_id") or data.get("claude_uuid") or None
+            # last_activity is set from saved last_used which auto_register writes
+            # as jsonl mtime — so sort order reflects real conversation activity.
+            session.last_activity = saved_last_used
             _SESSIONS[sid] = session
             count += 1
         except Exception as exc:
@@ -1004,8 +1160,14 @@ async def _send_unread_for_session(session: "Session") -> None:
 
 
 async def _send_unread_snapshot(ws: Any, client: ClientConn) -> None:
+    # Push unread for EVERY session, including count=0. Client persists unread
+    # to AsyncStorage; if we skip the zeros, stale unread badges from previous
+    # sessions stay forever and break the dashboard sort (unread > 0 sessions
+    # get sticky-pinned at the top by sortSessions). Must explicitly send 0
+    # so client setUnread resets the badge.
     for s in list(_SESSIONS.values()):
-        payload = {"type": "session_unread", "session_id": s.session_id, "unread": _unread_for(s, client.device_id)}
+        count = _unread_for(s, client.device_id)
+        payload = {"type": "session_unread", "session_id": s.session_id, "unread": count}
         try:
             await ws.send(json.dumps(payload))
         except Exception:
@@ -1030,6 +1192,15 @@ async def _dispatch_event(payload: dict, session: "Session") -> bool:
     await _broadcast_json(payload)
     if et in {"done", "stopped", "error"}:
         await _send_unread_for_session(session)
+        # Broadcast hub: signal clients to pull a delta so they can persist the
+        # completed turn into local SQLite.  Cheap: no message body transmitted,
+        # just the cursor hint.  App ignores this if it already has the messages.
+        if session.resume_id:
+            await _broadcast_json({
+                "type": "history_sync_hint",
+                "session_id": session.session_id,
+                "reason": et,   # "done" | "stopped" | "error"
+            })
     return True
 
 
@@ -1044,48 +1215,109 @@ CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 _WATCHER_LAST_MAX_MTIME: float = 0.0
 
 
+_recent_msgs_cache: dict[str, tuple[float, list]] = {}
+
+def _codex_session_id_from_stem(stem: str) -> str:
+    """Codex JSONL files are named rollout-<timestamp>-<uuid>.jsonl.
+
+    The native Codex history loader indexes files by the trailing UUID, not by
+    the full rollout filename stem.
+    """
+    candidate = stem[-36:]
+    return candidate if is_valid_uuid(candidate) else stem
+
+
+def _extract_codex_text(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _is_session_title_noise(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        not stripped
+        or stripped.startswith("<turn_aborted>")
+        or stripped.startswith("# AGENTS.md instructions")
+        or stripped.startswith("<permissions instructions>")
+        or stripped.startswith("<environment_context>")
+    )
+
+
+def _strip_turn_aborted_notice(text: str) -> str:
+    cleaned = _TURN_ABORTED_RE.sub("", text or "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _read_recent_msgs(path: str, fmt: str, n: int = 2) -> list:
-    """Parse last n user+assistant messages from a JSONL file (claude or codex format)."""
-    messages: list = []
+    """Parse last n user+assistant messages — reads only the final 32KB of the file."""
     try:
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                try:
-                    d = json.loads(raw)
-                    role = text = None
-                    if fmt == "claude":
-                        if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
-                            continue
-                        role = d["type"]
-                        content = d.get("message", {}).get("content", "")
-                        if isinstance(content, str):
-                            text = content
-                        elif isinstance(content, list):
-                            parts = [blk.get("text", "") for blk in content
-                                     if isinstance(blk, dict) and blk.get("type") == "text"]
-                            text = "\n".join(p for p in parts if p)
-                    elif fmt == "codex":
-                        if d.get("type") != "response_item":
-                            continue
-                        payload = d.get("payload", {})
-                        if not isinstance(payload, dict) or payload.get("type") != "message":
-                            continue
-                        role = payload.get("role")
-                        if role not in ("user", "assistant"):
-                            continue
-                        content = payload.get("content", "")
-                        if isinstance(content, str):
-                            text = content
-                        elif isinstance(content, list):
-                            parts = [item.get("text", "") for item in content if isinstance(item, dict)]
-                            text = "\n".join(p for p in parts if p)
-                    if role and text and not text.startswith("<") and not text.startswith("[Request interrupted"):
-                        messages.append({"role": role, "text": text[:300]})
-                except Exception:
-                    pass
+        mtime = os.path.getmtime(path)
+        cache_key = f"{path}:{fmt}:{n}"
+        if cache_key in _recent_msgs_cache:
+            cached_mtime, cached_msgs = _recent_msgs_cache[cache_key]
+            if cached_mtime == mtime:
+                return cached_msgs
     except Exception:
         pass
-    return messages[-n:] if len(messages) > n else messages
+    messages: list = []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 32768))
+            chunk = f.read()
+        nl = chunk.find(b"\n")
+        lines = chunk[nl + 1:].decode("utf-8", errors="ignore").splitlines()
+        for raw in lines:
+            try:
+                d = json.loads(raw)
+                role = text = None
+                if fmt == "claude":
+                    if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
+                        continue
+                    role = d["type"]
+                    content = d.get("message", {}).get("content", "")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        parts = [blk.get("text", "") for blk in content
+                                 if isinstance(blk, dict) and blk.get("type") == "text"]
+                        text = "\n".join(p for p in parts if p)
+                elif fmt == "codex":
+                    if d.get("type") != "response_item":
+                        continue
+                    payload = d.get("payload", {})
+                    if not isinstance(payload, dict) or payload.get("type") != "message":
+                        continue
+                    role = payload.get("role")
+                    if role not in ("user", "assistant"):
+                        continue
+                    content = payload.get("content", "")
+                    text = _extract_codex_text(content)
+                if role and text and not text.startswith("<") and not text.startswith("[Request interrupted"):
+                    messages.append({"role": role, "text": text[:80]})
+            except Exception:
+                pass
+    except Exception:
+        pass
+    result = messages[-n:] if len(messages) > n else messages
+    try:
+        mtime = os.path.getmtime(path)
+        cache_key = f"{path}:{fmt}:{n}"
+        _recent_msgs_cache[cache_key] = (mtime, result)
+    except Exception:
+        pass
+    return result
 
 
 def _get_recent_messages_sync(session: "Session", n: int = 2) -> list:
@@ -1114,20 +1346,25 @@ def _register_jsonl_session(path: str) -> bool:
         fn = os.path.basename(path)
         if not fn.endswith(".jsonl"):
             return False
-        uuid = fn[:-6]
-        if len(uuid) < 8:
-            return False
-        existing_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
-        if uuid in existing_uuids:
-            return False
+        stem = fn[:-6]
 
         # Determine backend from path
         if CODEX_SESSIONS_DIR and path.startswith(CODEX_SESSIONS_DIR):
             backend_name = "codex"
-            sid = f"jl_x_{uuid[:12]}"
+            resume_id = _codex_session_id_from_stem(stem)
+            if not is_valid_uuid(resume_id):
+                return False
+            sid = f"jl_x_{resume_id[:12]}"
         else:
             backend_name = "claude"
-            sid = f"jl_c_{uuid[:12]}"
+            resume_id = stem
+            if len(resume_id) < 8:
+                return False
+            sid = f"jl_c_{resume_id[:12]}"
+
+        existing_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
+        if resume_id in existing_uuids:
+            return False
 
         if sid in _SESSIONS:
             return False
@@ -1156,10 +1393,20 @@ def _register_jsonl_session(path: str) -> bool:
                         elif fmt == "codex":
                             if d.get("type") == "session_meta":
                                 pl = d.get("payload", {})
-                                if isinstance(pl, dict) and not cwd or cwd == DEFAULT_CWD:
+                                if isinstance(pl, dict) and (not cwd or cwd == DEFAULT_CWD):
                                     c = pl.get("cwd") or pl.get("workingDirectory", "")
                                     if c:
                                         cwd = c
+                            if not name and d.get("type") == "response_item":
+                                payload = d.get("payload", {})
+                                if (
+                                    isinstance(payload, dict)
+                                    and payload.get("type") == "message"
+                                    and payload.get("role") == "user"
+                                ):
+                                    t = _extract_codex_text(payload.get("content"))
+                                    if t and not _is_session_title_noise(t):
+                                        name = t[:50].strip()
                         if name and cwd != DEFAULT_CWD:
                             break
                     except Exception:
@@ -1168,7 +1415,7 @@ def _register_jsonl_session(path: str) -> bool:
             pass
 
         if not name:
-            name = uuid[:8]
+            name = resume_id[:8]
 
         mtime = 0.0
         try:
@@ -1180,14 +1427,30 @@ def _register_jsonl_session(path: str) -> bool:
             session_id=sid,
             name=name,
             created_at=mtime or time.time(),
+            last_activity=mtime or time.time(),
             cwd=os.path.expanduser(cwd),
             backend_name=backend_name,
-            resume_id=uuid,
+            resume_id=resume_id,
         )
         return True
     except Exception as exc:
         log.warning("_register_jsonl_session(%s) failed: %s", path, exc)
         return False
+
+
+def _session_for_jsonl_path(path: str) -> "Session | None":
+    fn = os.path.basename(path)
+    if not fn.endswith(".jsonl"):
+        return None
+    stem = fn[:-6]
+    if CODEX_SESSIONS_DIR and path.startswith(CODEX_SESSIONS_DIR):
+        resume_id = _codex_session_id_from_stem(stem)
+    else:
+        resume_id = stem
+    for session in _SESSIONS.values():
+        if session.resume_id == resume_id:
+            return session
+    return None
 
 
 def _merge_jsonl_sessions_into_state() -> bool:
@@ -1215,6 +1478,61 @@ def _merge_jsonl_sessions_into_state() -> bool:
     return added
 
 
+_JSONL_TURN_END_STOP_REASONS: frozenset[str] = frozenset(
+    {"end_turn", "max_tokens", "stop_sequence"}
+)
+
+
+def _read_new_jsonl_lines(path: str, from_offset: int) -> tuple[list[dict], int]:
+    """Read lines appended to a JSONL file since `from_offset` bytes.
+
+    Returns (parsed_lines, new_offset).  Skips malformed JSON silently.
+    """
+    try:
+        size = os.path.getsize(path)
+        if size <= from_offset:
+            return [], from_offset
+        with open(path, "rb") as fh:
+            fh.seek(from_offset)
+            raw = fh.read(size - from_offset)
+        lines = raw.decode("utf-8", errors="ignore").splitlines()
+        parsed: list[dict] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed.append(json.loads(line))
+            except Exception:
+                pass
+        return parsed, size
+    except OSError:
+        return [], from_offset
+
+
+def _jsonl_lines_contain_turn_end(lines: list[dict], fmt: str) -> bool:
+    """Return True if any line signals that an assistant turn has completed."""
+    if fmt == "claude":
+        for d in lines:
+            if (
+                d.get("type") == "assistant"
+                and not d.get("isSidechain")
+                and d.get("message", {}).get("stop_reason") in _JSONL_TURN_END_STOP_REASONS
+            ):
+                return True
+    # Codex format: response_item with role=assistant and stop_reason
+    elif fmt == "codex":
+        for d in lines:
+            if d.get("type") != "response_item":
+                continue
+            payload = d.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("role") == "assistant" and payload.get("stop_reason") in _JSONL_TURN_END_STOP_REASONS:
+                return True
+    return False
+
+
 async def _jsonl_watcher_task() -> None:
     """Use watchdog FSEvents to watch Claude + Codex JSONL dirs.
     Falls back to 5-second polling if watchdog is unavailable."""
@@ -1225,15 +1543,78 @@ async def _jsonl_watcher_task() -> None:
     _pending: dict[str, float] = {}
     _flush_handle: list = [None]
 
+    # Track last-known file size per JSONL path so we only inspect new bytes.
+    # Seeded at current size on first encounter so historical lines are skipped.
+    _jsonl_known_size: dict[str, int] = {}
+
+    def _seed_known_size(path: str) -> None:
+        """Record current file size so the next flush only sees new appends."""
+        if path not in _jsonl_known_size:
+            try:
+                _jsonl_known_size[path] = os.path.getsize(path)
+            except OSError:
+                _jsonl_known_size[path] = 0
+
     async def _flush_changes() -> None:
         paths = list(_pending.keys())
         _pending.clear()
-        newly_added = False
+        changed_sessions: dict[str, Session] = {}
         for p in paths:
-            if _register_jsonl_session(p):
-                newly_added = True
+            _seed_known_size(p)  # no-op if already seeded; seeds before register
+            _register_jsonl_session(p)
+            session = _session_for_jsonl_path(p)
+            if session is None:
+                continue
+            try:
+                mtime = os.stat(p).st_mtime
+                session.last_activity = max(session.last_activity, mtime)
+            except OSError:
+                pass
+            changed_sessions[session.session_id] = session
+
+            # --- External-session done detection ---
+            # Only check when the session is marked as streaming (meaning the app
+            # is waiting for a done signal) but has no live bridge-spawned process
+            # managing it.  Bridge-spawned sessions emit done themselves via
+            # claude_cli.py; we must not double-emit.
+            if not session.is_streaming:
+                # Advance the known-size cursor even when not streaming, so that
+                # if the session later becomes streaming we don't re-scan old lines.
+                try:
+                    _jsonl_known_size[p] = os.path.getsize(p)
+                except OSError:
+                    pass
+                continue
+
+            fmt = "codex" if session.backend_name == "codex" else "claude"
+            prior_offset = _jsonl_known_size.get(p, 0)
+            new_lines, new_size = _read_new_jsonl_lines(p, prior_offset)
+            _jsonl_known_size[p] = new_size
+
+            if not new_lines:
+                continue
+
+            if _jsonl_lines_contain_turn_end(new_lines, fmt):
+                log.info(
+                    "emit external done for session %s (jsonl=%s, new_lines=%d)",
+                    session.session_id, os.path.basename(p), len(new_lines),
+                )
+                session.is_streaming = False
+                # Reuse _dispatch_event so unread + history_sync_hint are handled
+                # identically to bridge-spawned sessions.
+                await _dispatch_event(
+                    {**_evt_done(), "session_id": session.session_id, "request_id": session.current_request_id or "external"},
+                    session,
+                )
+
         if _CLIENTS:
             await _broadcast_json(build_sessions_list())
+            for session in changed_sessions.values():
+                await _broadcast_json({
+                    "type": "history_sync_hint",
+                    "session_id": session.session_id,
+                    "reason": "file_changed",
+                })
 
     def _on_file_event(path: str) -> None:
         if not path.endswith(".jsonl"):
@@ -1241,9 +1622,7 @@ async def _jsonl_watcher_task() -> None:
         _pending[path] = time.time()
         if _flush_handle[0]:
             _flush_handle[0].cancel()
-        _flush_handle[0] = loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(_flush_changes())
-        )
+        _flush_handle[0] = loop.call_later(0.8, lambda: asyncio.ensure_future(_flush_changes()))
 
     try:
         from watchdog.observers import Observer
@@ -1303,27 +1682,71 @@ async def _jsonl_watcher_task() -> None:
                 log.warning("JSONL polling error: %s", exc)
 
 
+def _session_has_valid_resume(s: "Session") -> bool:
+    """Return False only when the session has a resume_id that is provably invalid.
+
+    Sessions with no resume_id (new sessions) are always included.
+    """
+    if not s.resume_id:
+        return True
+    backend = getattr(s, "backend_name", "claude")
+    if backend in ("claude", "codex"):
+        return is_valid_uuid(s.resume_id)
+    return True
+
+
 def build_sessions_list() -> dict:
-    return _msg_sessions_list([
-        {
-            "id": s.session_id,
-            "name": s.name,
-            "is_streaming": s.is_streaming,
-            "created_at": s.created_at,
-            "cwd": s.cwd,
-            "model": s.model,
-            "context_used": s.context_used,
-            "context_max": s.context_max,
-            "backend": s.backend_name,
-            "sandbox": s.sandbox,
-            "image_dir": s.image_dir,
-            "pinned": s.pinned,
-            "hidden": s.hidden,
-            "queue_length": len(s.queue),
-            "recent_messages": _get_recent_messages_sync(s, n=2),
+    sessions = sorted(
+        (s for s in _SESSIONS.values() if _session_has_valid_resume(s)),
+        key=lambda s: s.last_activity or s.created_at,
+        reverse=True,
+    )[:50]
+    return _msg_sessions_list([_session_to_summary(s) for s in sessions])
+
+def _session_to_summary(s: "Session") -> dict:
+    return {
+        "id": s.session_id,
+        "name": s.name,
+        "is_streaming": s.is_streaming,
+        "created_at": s.created_at,
+        "cwd": s.cwd,
+        "model": s.model,
+        "context_used": s.context_used,
+        "context_max": s.context_max,
+        "backend": s.backend_name,
+        "sandbox": s.sandbox,
+        "image_dir": s.image_dir,
+        "pinned": s.pinned,
+        "hidden": s.hidden,
+        "queue_length": len(s.queue),
+        "recent_messages": _get_recent_messages_sync(s, n=2),
+    }
+
+
+async def _send_all_sessions(ws: Any, batch_size: int = 50) -> None:
+    """Stream all sessions to a single client in batches, yielding between each."""
+    all_sessions = sorted(
+        (s for s in _SESSIONS.values() if _session_has_valid_resume(s)),
+        key=lambda s: s.last_activity or s.created_at,
+        reverse=True,
+    )
+    total = len(all_sessions)
+    for offset in range(0, total, batch_size):
+        batch = all_sessions[offset: offset + batch_size]
+        done = (offset + batch_size) >= total
+        payload = {
+            "type": "sessions_list_append",
+            "sessions": [_session_to_summary(s) for s in batch],
+            "offset": offset,
+            "total": total,
+            "done": done,
         }
-        for s in _SESSIONS.values()
-    ])
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            return
+        if not done:
+            await asyncio.sleep(0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -1413,6 +1836,28 @@ async def _session_cache_refresher() -> None:
 
 async def handler(ws: ServerConnection) -> None:
     global _AUTO_TUNNEL_TASK
+
+    # Liveness probe short-circuit.  The supervisor's bridge_healthcheck.py
+    # opens a WS every 3s, sends a control PING, then closes.  Without this
+    # gate the handler would (a) register the probe in _CLIENTS, (b) reassign
+    # session.ws_ref on every existing session to this dying socket — causing
+    # the next broadcast event to be sent to a closed socket and dropped from
+    # the real app — and (c) serialize+send a 29KB sessions_list and replay
+    # offline buffers into a socket that closes 12ms later.  Probes only need
+    # the TCP/WS handshake to succeed and their control PING to be ponged
+    # (websockets library handles control PING automatically); we just need to
+    # keep the connection open until the probe closes it.
+    try:
+        ua = ws.request.headers.get("User-Agent", "") if ws.request else ""
+    except Exception:
+        ua = ""
+    if ua.startswith("bridge-healthcheck/"):
+        try:
+            async for _ in ws:
+                pass  # discard any frames; probe normally sends none
+        except Exception:
+            pass
+        return
 
     # Cancel pending auto-tunnel — client is back
     if _AUTO_TUNNEL_TASK and not _AUTO_TUNNEL_TASK.done():
@@ -1526,6 +1971,10 @@ async def handler(ws: ServerConnection) -> None:
             mtype = msg["type"]  # safe after validation
             op_started = time.perf_counter()
 
+            if await _dispatch_ws_message(ws, msg):
+                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                continue
+
             if await handle_system_msg(mtype, msg, ws, system_ctx):
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
@@ -1535,6 +1984,19 @@ async def handler(ws: ServerConnection) -> None:
             if await handle_file_msg(mtype, msg, ws, file_ctx):
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
+
+            # WebRTC signaling — once the DataChannel opens we re-enter
+            # handler() on the WebRTCChannel adapter so the entire dispatch
+            # stack (including this very loop) runs unmodified over P2P.
+            if mtype in WEBRTC_MESSAGE_TYPES:
+                async def _on_channel_ready(adapter):
+                    try:
+                        await handler(adapter)
+                    except Exception:
+                        log.exception("[webrtc] handler raised on adapter")
+                if await handle_webrtc_message(mtype, msg, ws, _on_channel_ready):
+                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                    continue
 
             # ------------------------------------------------------------------
             if mtype == "ping":
@@ -1591,14 +2053,17 @@ async def handler(ws: ServerConnection) -> None:
             elif mtype == "request_history":
                 sid     = msg["session_id"]
                 session = _SESSIONS.get(sid)
-                if session:
-                    _mark_read(sid, client.device_id, session.message_seq)
-                    _persist_read_cursors()
-                    await _send_unread_for_client_session(ws, client, session)
-                if session and session.resume_id:
+                if not session:
+                    try:
+                        await ws.send(json.dumps(_msg_session_history(sid, [], source_count=0, has_more_before=False, runtime=None)))
+                    except Exception:
+                        pass
+                    continue
+                _mark_read(sid, client.device_id, session.message_seq)
+                _persist_read_cursors()
+                await _send_unread_for_client_session(ws, client, session)
+                if session.resume_id:
                     backend = _session_backend(session)
-                    if not backend.supports_resume():
-                        continue
                     await _emit_resume_progress(session, "resume_started", 5, "Resume started")
                     await _emit_resume_progress(session, "resume_loading_history", 35, "Loading history")
                     try:
@@ -1610,10 +2075,18 @@ async def handler(ws: ServerConnection) -> None:
                             mode=str(msg.get("mode") or "auto"),
                             before_source_message_id=str(msg.get("before_source_message_id") or ""),
                         )
-                    except Exception:
-                        pass
-                    # Pre-warm: spawn the claude process in background so first message is faster
-                    asyncio.create_task(backend.spawn(session))
+                    except Exception as exc:
+                        log.warning("history response error sid=%s: %s", sid, exc)
+                        try:
+                            runtime = _history_runtime_payload(session)
+                            await ws.send(json.dumps(_msg_session_history(sid, [], source_count=0, has_more_before=False, runtime=runtime)))
+                        except Exception:
+                            pass
+                    # Lazy spawn: do NOT pre-warm here.  Spawning claude for every
+                    # request_history caused a thundering-herd when 2,000+ saved
+                    # sessions were loaded and the dashboard pre-fetched history for
+                    # all visible sessions on connect.  Claude will be spawned on
+                    # demand when the user actually sends the first message.
                     await _emit_resume_progress(session, "resume_ready", 100, "Resume ready")
                 elif session:
                     # Keep client state deterministic even when this session has no resumable backend id.
@@ -1682,6 +2155,21 @@ async def handler(ws: ServerConnection) -> None:
                     invalidate_sessions_cache()
                     asyncio.create_task(preload_sessions_cache(_BACKENDS))
 
+                # BUG-07: immediately upsert session into FTS5 index so search
+                # finds it without waiting for the file-watcher to trigger ingest.
+                if _search_enabled:
+                    try:
+                        _sw = get_worker()
+                        if _sw is not None:
+                            _sw.upsert_session_metadata(
+                                session_id=sid,
+                                source=backend_name if backend_name in ("claude", "codex", "ollama") else "claude",
+                                cwd=cwd,
+                                display_name=name,
+                            )
+                    except Exception as _e:
+                        log.debug("FTS5 early upsert failed (non-fatal): %s", _e)
+
                 backend = _session_backend(session)
                 if resume_claude_id:
                     # Resume path: spawn must complete before loading history.
@@ -1709,11 +2197,12 @@ async def handler(ws: ServerConnection) -> None:
 
                 log.info("Session created: %s (%s)", sid, name)
                 _persist_session_meta()
+                await _broadcast_json(build_sessions_list())
 
             # ------------------------------------------------------------------
             elif mtype == "message":
                 sid     = msg["session_id"]
-                content = msg.get("content", "")
+                content = _strip_turn_aborted_notice(msg.get("content", ""))
                 session = _SESSIONS.get(sid)
 
                 if not session:
@@ -1777,6 +2266,33 @@ async def handler(ws: ServerConnection) -> None:
                     "queue_length": len(session.queue),
                 })
                 asyncio.create_task(_run_session_queue(session))
+
+                # BUG-07: index first user message into FTS5 immediately so it is
+                # searchable without waiting for the file-watcher ingest cycle.
+                if _search_enabled and not session._fts_first_msg_indexed and content:
+                    session._fts_first_msg_indexed = True
+                    _fts_msg_uuid = f"live_{uuid.uuid4().hex}"
+                    _fts_ts = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    _fts_content_snap = content
+                    _fts_sid = sid
+                    async def _index_first_msg(
+                        _sid=_fts_sid,
+                        _muuid=_fts_msg_uuid,
+                        _ts=_fts_ts,
+                        _text=_fts_content_snap,
+                    ) -> None:
+                        try:
+                            _sw = get_worker()
+                            if _sw is not None:
+                                _sw.upsert_first_user_message(
+                                    session_id=_sid,
+                                    content=_text,
+                                    msg_uuid=_muuid,
+                                    ts=_ts,
+                                )
+                        except Exception as _e:
+                            log.debug("FTS5 first-msg index failed (non-fatal): %s", _e)
+                    asyncio.create_task(_index_first_msg())
 
             # ------------------------------------------------------------------
             elif mtype == "stop":
@@ -2012,6 +2528,9 @@ async def handler(ws: ServerConnection) -> None:
                 file_id = msg.get("file_id", "")
                 asyncio.create_task(_handle_file_push_ack(file_id, client.device_id))
 
+            elif mtype == "get_all_sessions":
+                asyncio.create_task(_send_all_sessions(ws))
+
             else:
                 log.debug("No direct handler matched for type=%s", mtype)
 
@@ -2031,6 +2550,9 @@ async def handler(ws: ServerConnection) -> None:
         for shell in list(_SHELL_SESSIONS.values()):
             if shell.ws_ref is ws:
                 shell.ws_ref = None
+        # Tear down any pending WebRTC PC anchored on this signaling socket
+        # (the DC adapter, if promoted, has its own lifecycle).
+        _webrtc_cleanup_for_ws(ws)
         log.info("Client gone: %s (%s)", remote, client.client_id)
 
         if (
@@ -2220,6 +2742,7 @@ async def main(port: int, tunnel: bool = False,
     global _BRIDGE_PORT
     _BRIDGE_PORT = port
     log.info("Bridge v2 starting on port %d (default_backend=%s)", port, _DEFAULT_BACKEND_NAME)
+    await _init_search()
     zc = _start_mdns(port)
     async with serve(
         handler,
@@ -2241,6 +2764,7 @@ async def main(port: int, tunnel: bool = False,
         try:
             await asyncio.Future()  # run forever
         finally:
+            await _shutdown_search()
             if zc:
                 zc.unregister_all_services()
                 zc.close()

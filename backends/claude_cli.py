@@ -9,10 +9,12 @@ import json
 import logging
 import os
 import signal
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional, TYPE_CHECKING
 
 from .base import Backend
+from utils.uuid_helper import is_valid_uuid
 from .events import (
     send_event, stream_text, scan_for_media,
     _evt_error, _evt_stopped, _evt_done,
@@ -31,7 +33,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("bridge_v2")
 
-TOOL_IDLE_TIMEOUT_SECS = 300  # kill claude if no stdout for this many seconds
+TOOL_IDLE_TIMEOUT_SECS = 900  # kill claude if no stdout for this many seconds (was 300)
 
 # Compact when context_used exceeds this fraction of the model's context window.
 _COMPACT_THRESHOLD = 0.80
@@ -39,9 +41,13 @@ _COMPACT_THRESHOLD = 0.80
 # All current Claude models share a 200k input context window.
 # Unknown / non-Claude models return 0 (auto-compact disabled).
 def _get_context_limit(model: str) -> int:
-    if "claude" in (model or "").lower():
-        return 200_000
-    return 0
+    m = (model or "").lower()
+    if "claude" not in m:
+        return 0
+    # [1m] suffix or 1m-context variants → 1,000,000 tokens
+    if "[1m]" in m or "-1m" in m or "1000000" in m:
+        return 1_000_000
+    return 200_000
 
 
 @dataclass
@@ -116,7 +122,7 @@ class ClaudeCliBackend(Backend):
         session.accumulated_text = ""
         state.tool_blocks = {}
         session.is_streaming = True
-        session.last_activity = asyncio.get_event_loop().time()
+        session.last_activity = time.time()
 
         content_blocks: list = []
         for img in (images or []):
@@ -434,8 +440,12 @@ console.log(JSON.stringify(data));
         # Pass 2: build message list with blocks
         messages = []
         try:
+            file_mtime_ms = int(os.path.getmtime(path) * 1000)
+        except Exception:
+            file_mtime_ms = int(time.time() * 1000)
+        try:
             with open(path, encoding="utf-8", errors="ignore") as f:
-                for raw in f:
+                for line_no, raw in enumerate(f, start=1):
                     try:
                         d = json.loads(raw)
                         if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
@@ -483,13 +493,15 @@ console.log(JSON.stringify(data));
                                 ts_ms = int(datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp() * 1000)
                             except Exception:
                                 pass
+                        if not ts_ms:
+                            ts_ms = file_mtime_ms
                         messages.append(complete_history_message(
                             source="claude",
                             source_session_id=resume_id,
                             source_message_id=f"claude:{resume_id}:line:{line_no}",
                             role=role,
                             content=text,
-                            timestamp=ts_ms or None,
+                            timestamp=ts_ms,
                             blocks=blocks,
                         ))
                     except Exception:
@@ -599,7 +611,12 @@ console.log(JSON.stringify(data));
         sessions = []
         saved_names: dict = {}
         if self._load_saved_sessions_fn is not None:
-            saved_names = {v["claude_uuid"]: v["name"] for v in self._load_saved_sessions_fn().values()}
+            # Accept both "resume_id" (new canonical) and legacy "claude_uuid" key.
+            saved_names = {
+                (v.get("resume_id") or v.get("claude_uuid", "")): v["name"]
+                for v in self._load_saved_sessions_fn().values()
+                if v.get("resume_id") or v.get("claude_uuid")
+            }
         path_overrides = self._load_path_overrides()
         try:
             for proj in os.scandir(self._claude_projects_dir):
@@ -673,13 +690,79 @@ console.log(JSON.stringify(data));
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _spawn_proc(self, session: "Session") -> None:
+    def _find_newest_jsonl_uuid(self, cwd: str, exclude: "str | None" = None) -> "str | None":
+        """Scan ~/.claude/projects/<mangled-cwd>/ for the newest .jsonl and return
+        its stem (UUID) if it differs from *exclude* and is a valid UUID.
+
+        cwd mangling rule: replace '/' with '-' and prepend '-'.
+        Example: /Users/wulala/foo → -Users-wulala-foo
+        """
+        if not cwd:
+            return None
+        try:
+            mangled = "-" + cwd.lstrip("/").replace("/", "-")
+            proj_dir = os.path.join(self._claude_projects_dir, mangled)
+            if not os.path.isdir(proj_dir):
+                return None
+            best_mtime = -1.0
+            best_uuid: "str | None" = None
+            for entry in os.scandir(proj_dir):
+                if not entry.name.endswith(".jsonl") or not entry.is_file():
+                    continue
+                stem = entry.name[:-6]
+                if not is_valid_uuid(stem):
+                    continue
+                if stem == exclude:
+                    continue
+                mtime = entry.stat().st_mtime
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best_uuid = stem
+            return best_uuid
+        except Exception as exc:
+            log.warning("_find_newest_jsonl_uuid failed for cwd=%s: %s", cwd, exc)
+            return None
+
+    async def _spawn_proc(self, session: "Session", allow_resume_fallback: bool = False) -> None:
         state = self._get_state(session)
         if state.proc is not None and state.proc.returncode is None:
             return  # already running
         if state.spawning:
             return  # spawn already in progress, caller should wait
         state.spawning = True
+
+        # Guard: reject non-UUID resume IDs before touching the subprocess.
+        # Claude CLI requires a canonical UUID; anything else causes immediate
+        # failure followed by 3 auto-restart cycles and a supervisor kill loop.
+        if session.resume_id and not is_valid_uuid(session.resume_id):
+            log.warning(
+                "[%s] refused spawn: resume_id %r is not a valid UUID — dropping",
+                session.session_id, session.resume_id,
+            )
+            # Clear the bad resume_id so the session can still start fresh.
+            session.resume_id = None
+            if self._persist_session_fn is not None:
+                self._persist_session_fn(session)
+            await send_event(session, _evt_session_warning(
+                f"Invalid claude_uuid (not a UUID format) — starting fresh session."
+            ))
+
+        # BUG-00d fallback: if we have no resume_id yet (e.g. idle-timeout killed
+        # the proc before the first `init` event arrived) but we know the cwd,
+        # scan ~/.claude/projects/<mangled-cwd>/ for the newest .jsonl and use
+        # its stem as a candidate resume_id so context is not lost.
+        # Only active when allow_resume_fallback=True (idle-timeout respawn path).
+        # Must NOT fire on user-initiated new sessions to prevent self-loop.
+        if allow_resume_fallback and session.resume_id is None and session.cwd:
+            candidate = self._find_newest_jsonl_uuid(session.cwd)
+            if candidate:
+                log.info(
+                    "[%s] Spawning claude with fallback resume_id=%s (cwd=%s)",
+                    session.session_id, candidate, session.cwd,
+                )
+                session.resume_id = candidate
+                if self._persist_session_fn is not None:
+                    self._persist_session_fn(session)
 
         cmd = [
             self._claude_bin,
@@ -737,7 +820,7 @@ console.log(JSON.stringify(data));
                 }]},
             }) + "\n"
             session.is_streaming = True
-            session.last_activity = asyncio.get_event_loop().time()
+            session.last_activity = time.time()
             try:
                 state.proc.stdin.write(context_msg.encode("utf-8"))
                 await state.proc.stdin.drain()
@@ -751,7 +834,7 @@ console.log(JSON.stringify(data));
         assert state.proc is not None
 
         async for line_bytes in state.proc.stdout:
-            session.last_activity = asyncio.get_event_loop().time()
+            session.last_activity = time.time()
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -803,10 +886,20 @@ console.log(JSON.stringify(data));
                 session.is_streaming = False
                 if subtype == "success":
                     usage = evt.get("usage", {})
-                    session.context_used = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+                    # context_used = actual context window occupied = new input + cache creation.
+                    # Do NOT include cache_read_input_tokens — that accumulates with each tool round
+                    # and inflates to many times the true context size, falsely triggering compact.
+                    session.context_used = (
+                        usage.get("input_tokens", 0)
+                        + usage.get("cache_creation_input_tokens", 0)
+                    )
                     context_limit = _get_context_limit(session.model)
                     if context_limit > 0:
                         session.context_max = context_limit
+                    if session.context_used > session.context_max * 1.5:
+                        log.error("[%s] context_used=%d > context_max=%d * 1.5 — formula likely wrong, skipping compact",
+                                  session.session_id, session.context_used, session.context_max)
+                        session.context_used = min(session.context_used, session.context_max)
                     log.info("[%s] result success, claude_uuid=%s, context_used=%d/%d", session.session_id, new_uuid, session.context_used, session.context_max)
                     if new_uuid:
                         first_uuid = session.resume_id is None
@@ -897,6 +990,23 @@ console.log(JSON.stringify(data));
                     model = evt.get("model", "")
                     if model:
                         session.model = model
+                    # Capture claude session_id at init so we can --resume even if
+                    # the first turn is killed by the idle watchdog before result.
+                    init_uuid = evt.get("session_id")
+                    if init_uuid and init_uuid != session.resume_id:
+                        first_uuid = session.resume_id is None
+                        session.resume_id = init_uuid
+                        if self._persist_session_fn is not None:
+                            self._persist_session_fn(session)
+                        log.info("[%s] captured claude_uuid=%s at init", session.session_id, init_uuid)
+                        if first_uuid:
+                            try:
+                                if session.ws_ref and session.ws_ref.open:
+                                    await session.ws_ref.send(json.dumps(
+                                        _msg_session_uuid(session.session_id, init_uuid)
+                                    ))
+                            except Exception:
+                                pass
 
             elif etype == "rate_limit_event":
                 log.debug("[%s] rate_limit_event", session.session_id)
@@ -942,16 +1052,35 @@ console.log(JSON.stringify(data));
         if state.bad_resume:
             state.bad_resume = False
             old_id = session.resume_id
-            session.resume_id = None
-            log.info("[%s] Resume ID %s not found, restarting fresh", session.session_id, old_id)
-            # Persist the cleared resume_id immediately so a subsequent bridge
-            # restart does not retry the same dead uuid.
-            from bridge_v2 import _persist_session as _ps
-            _ps(session)
-            await send_event(session, _evt_session_warning(
-                "Resume session not found, starting fresh…"
-            ))
-            await self._spawn_proc(session)
+
+            # --- BUG-00d fallback: try to recover a valid resume_id from disk ---
+            # Before discarding the session, scan ~/.claude/projects/<mangled-cwd>/
+            # for the newest .jsonl file.  If a candidate UUID differs from the
+            # dead one, retry with it (one attempt) instead of starting fresh.
+            candidate_id = self._find_newest_jsonl_uuid(session.cwd, exclude=old_id)
+            if candidate_id:
+                log.info(
+                    "[%s] bad_resume: trying candidate resume_id %s (was %s)",
+                    session.session_id, candidate_id, old_id,
+                )
+                session.resume_id = candidate_id
+                from bridge_v2 import _persist_session as _ps
+                _ps(session)
+                await send_event(session, _evt_session_warning(
+                    f"Resume session not found; retrying with nearest candidate…"
+                ))
+                await self._spawn_proc(session)
+            else:
+                session.resume_id = None
+                log.info("[%s] Resume ID %s not found, restarting fresh", session.session_id, old_id)
+                # Persist the cleared resume_id immediately so a subsequent bridge
+                # restart does not retry the same dead uuid.
+                from bridge_v2 import _persist_session as _ps
+                _ps(session)
+                await send_event(session, _evt_session_warning(
+                    "Resume session not found, starting fresh…"
+                ))
+                await self._spawn_proc(session)
         elif rc != 0 and state.restart_count < 3:
             state.restart_count += 1
             log.info("[%s] Auto-restarting (attempt %d/3)", session.session_id, state.restart_count)
@@ -967,12 +1096,11 @@ console.log(JSON.stringify(data));
 
     async def _idle_watchdog(self, session: "Session") -> None:
         state = self._get_state(session)
-        loop = asyncio.get_event_loop()
         while True:
             await asyncio.sleep(30)
             if not session.is_streaming:
                 return
-            elapsed = loop.time() - session.last_activity
+            elapsed = time.time() - session.last_activity
             if elapsed < TOOL_IDLE_TIMEOUT_SECS:
                 continue
             log.warning("[%s] Tool idle timeout (%.0fs) — killing claude (pid=%s)",
@@ -997,5 +1125,5 @@ console.log(JSON.stringify(data));
                     state.proc.kill()
             except (ProcessLookupError, AttributeError):
                 pass
-            await self._spawn_proc(session)
+            await self._spawn_proc(session, allow_resume_fallback=True)
             return
