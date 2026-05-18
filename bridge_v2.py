@@ -95,6 +95,7 @@ from backends.events import (
     set_event_dispatcher,
 )
 from backends.history import DEFAULT_HISTORY_LIMIT, clamp_history_limit
+from backends.history_sqlite import init_cache_db
 
 try:
     import firebase_admin
@@ -2757,6 +2758,7 @@ async def main(port: int, tunnel: bool = False,
         log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
         if tunnel:
             asyncio.create_task(_start_cloudflared_tunnel(port))
+        init_cache_db()
         asyncio.create_task(preload_sessions_cache(_BACKENDS))
         asyncio.create_task(_session_cache_refresher())
         asyncio.create_task(_warmup_history_cache_background())

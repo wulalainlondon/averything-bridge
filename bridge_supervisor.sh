@@ -30,6 +30,14 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     exit 0
   else
     echo "[supervisor] stale lock (pid=${OLD_LOCK_PID:-?} dead), clearing"
+    # Kill any orphaned bridge_v2.py the dead supervisor left behind before clearing lock.
+    ORPHAN_PIDS="$(pgrep -f "${BRIDGE_DIR}/bridge_v2\.py" 2>/dev/null || true)"
+    if [[ -n "$ORPHAN_PIDS" ]]; then
+      echo "[supervisor] killing orphan bridge_v2.py pids: $ORPHAN_PIDS"
+      kill $ORPHAN_PIDS 2>/dev/null || true
+      sleep 1
+      kill -9 $ORPHAN_PIDS 2>/dev/null || true
+    fi
     rm -rf "$LOCK_DIR"
     mkdir "$LOCK_DIR"
   fi
@@ -117,7 +125,9 @@ while true; do
     continue
   fi
 
-  # monitor loop
+  # monitor loop — require 3 consecutive failures before killing
+  # (prevents bulk_ingest file-read spikes from triggering false restarts)
+  CONSEC_FAIL=0
   while true; do
     if ! kill -0 "$CHILD_PID" 2>/dev/null; then
       echo "[supervisor] bridge exited, restart in ${BACKOFF}s"
@@ -127,17 +137,23 @@ while true; do
       break
     fi
 
-    if ! "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 1.5; then
-      echo "[supervisor] healthcheck failed, restarting bridge"
-      kill "$CHILD_PID" 2>/dev/null || true
-      sleep 1
-      kill -9 "$CHILD_PID" 2>/dev/null || true
-      sleep "$BACKOFF"
-      BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
-      (( RETRY_COUNT++ ))
-      break
+    if ! "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 8; then
+      CONSEC_FAIL=$(( CONSEC_FAIL + 1 ))
+      echo "[supervisor] healthcheck failed (${CONSEC_FAIL}/3)"
+      if (( CONSEC_FAIL >= 3 )); then
+        echo "[supervisor] 3 consecutive failures, restarting bridge"
+        kill "$CHILD_PID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$CHILD_PID" 2>/dev/null || true
+        sleep "$BACKOFF"
+        BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
+        (( RETRY_COUNT++ ))
+        break
+      fi
+    else
+      CONSEC_FAIL=0
     fi
 
-    sleep 3
+    sleep 5
   done
 done

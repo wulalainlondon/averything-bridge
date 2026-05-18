@@ -27,6 +27,7 @@ from .history import (
     _JSONL_HISTORY_CACHE, _file_cache_key, HistoryIndex,
     HISTORY_INDEX_TTL_SECONDS, DEFAULT_HISTORY_LIMIT,
 )
+from .history_sqlite import sqlite_load, sqlite_save_background
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
@@ -396,6 +397,34 @@ console.log(JSON.stringify(data));
         except Exception:
             cache_key = None
 
+        # SQLite persistent cache — survives bridge restarts / Mac sleep-wake.
+        # Only reached on memory miss; key (mtime_ns, size) guards staleness.
+        if cache_key is not None:
+            try:
+                cached_messages = sqlite_load(cache_name, cache_key)
+                if cached_messages is not None:
+                    import time as _time
+                    idx = HistoryIndex(
+                        key=cache_key,
+                        built_at=_time.time(),
+                        messages=cached_messages,
+                        by_source_id={
+                            str(m.get("source_message_id")): i
+                            for i, m in enumerate(cached_messages)
+                            if m.get("source_message_id")
+                        },
+                    )
+                    _JSONL_HISTORY_CACHE[cache_name] = idx
+                    return slice_history(
+                        cached_messages,
+                        limit=clamp_history_limit(limit),
+                        known_last_source_message_id=known_last_source_message_id,
+                        mode=mode,
+                        before_source_message_id=before_source_message_id,
+                    )
+            except Exception:
+                pass
+
         _MAX_OUTPUT = 64 * 1024
 
         def _flatten_tool_result_content(c) -> str:
@@ -521,6 +550,7 @@ console.log(JSON.stringify(data));
                     if m.get("source_message_id")
                 },
             )
+            sqlite_save_background(cache_name, cache_key, messages)
 
         return slice_history(
             messages,
