@@ -1,0 +1,87 @@
+# claude-bridge
+
+Control Claude, Codex, or Ollama on your Mac from your phone.
+
+This is the server-side bridge. It runs on your Mac and connects your mobile app to local AI runtimes via WebSocket. I built this because I wanted to use Claude from my phone while the actual computation runs on my Mac — and I use it every day.
+
+## How it works
+
+```
+Phone App  ──WebSocket──  bridge (your Mac)  ──subprocess──  Claude / Codex / Ollama
+```
+
+The bridge manages sessions, streams responses back to your phone in real time, and handles reconnects, offline buffering, and push notifications when a long task finishes.
+
+## Requirements
+
+- macOS (Linux works too, without the launchd auto-start)
+- Python 3.10+
+- At least one of:
+  - [Claude CLI](https://claude.ai/download) (`npm install -g @anthropic-ai/claude-code`)
+  - [Ollama](https://ollama.com) with a model pulled
+  - Codex CLI
+
+## Quick start
+
+```bash
+git clone https://github.com/your-username/claude-bridge
+cd claude-bridge
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+venv/bin/python bridge_v2.py --port 8766
+```
+
+Then open the companion app on your phone and point it at your Mac's IP.
+
+## Connection options
+
+| Method | URL format | Notes |
+|--------|-----------|-------|
+| Local network | `ws://192.168.x.x:8766` | Fastest |
+| Tailscale | `ws://100.x.x.x:8766` | Works across networks |
+| Cloudflare tunnel | `wss://xxx.trycloudflare.com` | Public, no setup needed |
+
+For Cloudflare tunnel, start with `--tunnel` flag. The URL will appear in the logs.
+
+## Backends
+
+```bash
+# Claude CLI (default)
+venv/bin/python bridge_v2.py --port 8766
+
+# Ollama
+venv/bin/python bridge_v2.py --port 8766 --backend ollama --model llama3.2
+
+# Codex
+venv/bin/python bridge_v2.py --port 8766 --backend codex
+```
+
+## Auto-start on macOS (launchd)
+
+```bash
+bash install.sh
+```
+
+This installs a launchd agent so the bridge starts automatically on login and restarts if it crashes.
+
+## Push notifications (optional)
+
+If you want push notifications when Claude finishes a long task, set up Firebase:
+
+```bash
+# Place your Firebase service account key at:
+~/.config/claude-bridge/serviceAccountKey.json
+
+# Or set the path via env:
+export SERVICE_ACCOUNT_FILE=/path/to/serviceAccountKey.json
+```
+
+See [docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md) for the full setup guide.
+
+## Companion app
+
+→ [claude-bridge-app](https://github.com/your-username/claude-bridge-app) — the Android/iOS app
+
+## License
+
+MIT
