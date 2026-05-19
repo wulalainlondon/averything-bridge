@@ -1,19 +1,17 @@
 """
 Gemini CLI backend — ACP (Agent Client Protocol) mode.
 Protocol: JSON-RPC 2.0 over stdio (newline-delimited).
+Spec:     https://agentclientprotocol.com/protocol/
 Spawn:    gemini --acp
-History:  ~/.gemini/tmp/<project_hash>/chats/*.json
-Resume:   gemini --acp --resume <session_id>
+History:  ~/.gemini/tmp/<project_hash>/chats/
 """
 
 import asyncio
 import glob
-import hashlib
 import json
 import logging
 import os
 import time
-import uuid
 from dataclasses import dataclass, field
 from shutil import which
 from typing import Optional, TYPE_CHECKING
@@ -37,6 +35,9 @@ _STREAM_READER_LIMIT = 128 * 1024 * 1024  # 128 MiB
 _GEMINI_HOME = os.path.expanduser("~/.gemini")
 _TURN_TIMEOUT_SECS = 600.0
 
+# ACP protocol version (per spec)
+_ACP_PROTOCOL_VERSION = 1
+
 
 @dataclass
 class _GeminiState:
@@ -44,12 +45,12 @@ class _GeminiState:
     read_task: Optional[asyncio.Task] = field(default=None, repr=False)
     next_id: int = 1
     rpc_futures: dict = field(default_factory=dict)
-    # Streaming state
-    turn_done_event: asyncio.Event = field(default_factory=asyncio.Event)
-    turn_error: Optional[str] = None
+    # ACP session identity (assigned by Gemini after session/new or session/load)
+    acp_session_id: Optional[str] = None
+    # Current turn state
     turn_active: bool = False
-    # Session identity from Gemini
-    gemini_session_id: Optional[str] = None
+    turn_stop_reason: Optional[str] = None  # "end_turn" | "cancelled" | etc.
+    turn_error: Optional[str] = None
     spawning: bool = False
 
 
@@ -65,43 +66,42 @@ class GeminiCliBackend(Backend):
             self._states[session.session_id] = _GeminiState()
         return self._states[session.session_id]
 
-    # ------------------------------------------------------------------ ACP helpers
+    # ------------------------------------------------------------------ JSON-RPC helpers
 
     def _alloc_id(self, state: _GeminiState) -> int:
         rid = state.next_id
         state.next_id += 1
         return rid
 
-    async def _send_rpc(self, state: _GeminiState, method: str,
-                        params: dict | None, rid: int) -> None:
+    async def _write(self, state: _GeminiState, obj: dict) -> None:
         assert state.proc and state.proc.stdin
-        payload: dict = {"jsonrpc": "2.0", "id": rid, "method": method}
-        if params is not None:
-            payload["params"] = params
-        state.proc.stdin.write((json.dumps(payload) + "\n").encode())
-        await state.proc.stdin.drain()
-
-    async def _send_notification(self, state: _GeminiState,
-                                  method: str, params: dict | None = None) -> None:
-        assert state.proc and state.proc.stdin
-        msg: dict = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            msg["params"] = params
-        state.proc.stdin.write((json.dumps(msg) + "\n").encode())
+        state.proc.stdin.write((json.dumps(obj) + "\n").encode())
         await state.proc.stdin.drain()
 
     async def _rpc(self, state: _GeminiState, method: str,
                    params: dict | None, timeout: float = 30.0) -> dict:
+        """Send a request and wait for the response."""
         rid = self._alloc_id(state)
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         state.rpc_futures[rid] = fut
-        await self._send_rpc(state, method, params, rid)
+        req: dict = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            req["params"] = params
+        await self._write(state, req)
         try:
             return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
         except asyncio.TimeoutError:
             state.rpc_futures.pop(rid, None)
-            raise TimeoutError(f"gemini ACP RPC '{method}' timed out after {timeout}s")
+            raise TimeoutError(f"gemini ACP '{method}' timed out after {timeout}s")
+
+    async def _notify(self, state: _GeminiState,
+                      method: str, params: dict | None = None) -> None:
+        """Send a notification (no id, no response expected)."""
+        msg: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        await self._write(state, msg)
 
     # ------------------------------------------------------------------ read loop
 
@@ -117,7 +117,7 @@ class GeminiCliBackend(Backend):
                 try:
                     msg = json.loads(line)
                 except Exception:
-                    log.debug("[gemini:%s] non-JSON line: %s", session.session_id[:8], line[:120])
+                    log.debug("[gemini:%s] non-JSON: %s", session.session_id[:8], line[:120])
                     continue
                 await self._dispatch(session, state, msg)
         except Exception as exc:
@@ -131,66 +131,46 @@ class GeminiCliBackend(Backend):
             state.rpc_futures.clear()
             if state.turn_active:
                 state.turn_error = "gemini process exited unexpectedly"
-                state.turn_done_event.set()
+                # Resolve the pending session/prompt future via turn_stop_reason
+                state.turn_stop_reason = "process_died"
+                _resolve_prompt_future(state)
             state.proc = None
 
     async def _dispatch(self, session: "Session", state: _GeminiState, msg: dict) -> None:
         rid = msg.get("id")
         method = msg.get("method", "")
 
-        # RPC response
+        # ── RPC response: {"id": N, "result": {...}} or {"id": N, "error": {...}}
         if rid is not None and "result" in msg:
             fut = state.rpc_futures.pop(rid, None)
             if fut and not fut.done():
                 fut.set_result(msg["result"])
             return
+
         if rid is not None and "error" in msg:
             fut = state.rpc_futures.pop(rid, None)
             if fut and not fut.done():
                 fut.set_exception(RuntimeError(str(msg["error"])))
             return
 
-        # Server-side tool_use request: Gemini asks bridge to run a tool
+        # ── Server-side RPC request: {"id": N, "method": "...", "params": {...}}
+        # (only session/request_permission per spec)
         if rid is not None and method:
-            await self._handle_tool_request(session, state, rid, method, msg.get("params", {}))
+            await self._handle_server_request(session, state, rid, method,
+                                               msg.get("params", {}) or {})
             return
 
-        # Notifications (no id)
+        # ── Notifications: {"method": "...", "params": {...}} (no id)
         params = msg.get("params", {}) or {}
 
-        if method in ("message/delta", "turn/delta", "content/delta"):
-            delta = params.get("delta") or params.get("text") or params.get("content") or ""
-            if isinstance(delta, str) and delta:
-                session.accumulated_text = (session.accumulated_text or "") + delta
-                try:
-                    await stream_text(delta, session)
-                except Exception:
-                    pass
+        if method == "session/update":
+            await self._handle_session_update(session, state, params)
 
-        elif method in ("turn/complete", "turn/completed", "message/complete"):
-            if state.turn_active:
-                err = params.get("error")
-                state.turn_error = err.get("message") if isinstance(err, dict) else (err or None)
-                state.turn_done_event.set()
-
-        elif method in ("session/created", "session/started"):
-            sid = params.get("sessionId") or params.get("id")
-            if sid:
-                state.gemini_session_id = str(sid)
-                session.resume_id = state.gemini_session_id
-                if session.ws_ref:
-                    try:
-                        await session.ws_ref.send(json.dumps(
-                            _msg_session_uuid(session.session_id, state.gemini_session_id)
-                        ))
-                    except Exception:
-                        pass
-
-        elif method == "error":
+        elif method in ("error", "session/error"):
             err = params.get("message") or str(params)
             if state.turn_active:
                 state.turn_error = err
-                state.turn_done_event.set()
+                _resolve_prompt_future(state)
             else:
                 log.warning("[gemini:%s] server error: %s", session.session_id[:8], err[:200])
 
@@ -198,29 +178,84 @@ class GeminiCliBackend(Backend):
             log.debug("[gemini:%s] unhandled notification: %s %s",
                       session.session_id[:8], method, str(params)[:120])
 
-    async def _handle_tool_request(self, session: "Session", state: _GeminiState,
-                                    rid: int, method: str, params: dict) -> None:
-        """Intercept Gemini's tool_use RPC and route to bridge native handlers."""
-        tool_name = method.split("/")[-1]
-        tool_input = params if isinstance(params, dict) else {}
-        tool_id = f"gemini_tool_{rid}"
+    async def _handle_session_update(self, session: "Session", state: _GeminiState,
+                                      params: dict) -> None:
+        """Handle session/update notifications (streaming, tool calls, etc.)."""
+        update = params.get("update", {}) or {}
+        kind = update.get("sessionUpdate", "")
 
-        await send_event(session, _evt_tool_start(tool_id, tool_name, tool_input))
+        if kind == "agent_message_chunk":
+            # Text streaming: content is ContentBlock[]
+            content = update.get("content") or []
+            delta = ""
+            if isinstance(content, list):
+                delta = "".join(
+                    block.get("text", "") for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            elif isinstance(content, str):
+                delta = content
+            if delta:
+                session.accumulated_text = (session.accumulated_text or "") + delta
+                try:
+                    await stream_text(delta, session)
+                except Exception:
+                    pass
 
-        try:
-            result = await _execute_bridge_tool(tool_name, tool_input, session)
-            await send_event(session, _evt_tool_result(tool_id, tool_name, str(result)))
-            response = {"jsonrpc": "2.0", "id": rid, "result": {"output": str(result)}}
-        except Exception as exc:
-            error_msg = str(exc)
-            await send_event(session, _evt_tool_result(tool_id, tool_name, f"Error: {error_msg}"))
-            response = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": error_msg}}
+        elif kind == "agent_thought_chunk":
+            # Extended reasoning / thinking — log but don't emit to frontend for now
+            pass
 
-        await send_event(session, _evt_tool_end(tool_id, tool_name))
+        elif kind == "tool_call":
+            # Agent is starting a tool call (informational; actual permission via request_permission)
+            tool_call = update.get("toolCall", {}) or {}
+            tool_name = tool_call.get("name") or tool_call.get("toolName") or "tool"
+            tool_input = tool_call.get("input") or tool_call.get("args") or {}
+            tool_id = tool_call.get("toolCallId") or tool_call.get("id") or "tc"
+            await send_event(session, _evt_tool_start(tool_id, tool_name, tool_input))
 
-        assert state.proc and state.proc.stdin
-        state.proc.stdin.write((json.dumps(response) + "\n").encode())
-        await state.proc.stdin.drain()
+        elif kind == "tool_call_update":
+            tool_call = update.get("toolCall", {}) or {}
+            tool_id = tool_call.get("toolCallId") or tool_call.get("id") or "tc"
+            tool_name = tool_call.get("name") or "tool"
+            status = update.get("status") or ""
+            if status in ("completed", "done", "success", "error"):
+                output = update.get("output") or update.get("result") or ""
+                await send_event(session, _evt_tool_result(tool_id, tool_name, str(output)))
+                await send_event(session, _evt_tool_end(tool_id, tool_name))
+
+        elif kind == "usage_update":
+            usage = update.get("usage") or {}
+            if isinstance(usage, dict):
+                total = usage.get("totalTokens") or usage.get("total_tokens") or 0
+                ctx_max = usage.get("contextWindow") or 0
+                if total:
+                    session.context_used = int(total)
+                if ctx_max:
+                    session.context_max = int(ctx_max)
+
+    async def _handle_server_request(self, session: "Session", state: _GeminiState,
+                                      rid: int, method: str, params: dict) -> None:
+        """Handle RPC requests FROM the agent (e.g. session/request_permission)."""
+        if method == "session/request_permission":
+            # Auto-grant: find an "allow_once" or "allow_always" option and select it
+            options: list = params.get("options") or []
+            selected_id: str | None = None
+            for opt in options:
+                if isinstance(opt, dict) and opt.get("kind") in ("allow_always", "allow_once"):
+                    selected_id = str(opt.get("optionId", ""))
+                    break
+            if selected_id:
+                result = {"outcome": "selected", "optionId": selected_id}
+            else:
+                result = {"outcome": "cancelled"}
+            await self._write(state, {"jsonrpc": "2.0", "id": rid, "result": result})
+        else:
+            # Unknown server request — return an error
+            await self._write(state, {
+                "jsonrpc": "2.0", "id": rid,
+                "error": {"code": -32601, "message": f"unknown method: {method}"},
+            })
 
     # ------------------------------------------------------------------ Backend API
 
@@ -238,17 +273,15 @@ class GeminiCliBackend(Backend):
 
     async def _spawn_proc(self, session: "Session", state: _GeminiState) -> None:
         if not self._gemini_bin:
-            raise RuntimeError("gemini binary not found — install with: npm install -g @google/gemini-cli")
-
-        cmd = [self._gemini_bin, "--acp"]
-        if session.resume_id:
-            cmd += ["--resume", session.resume_id]
+            raise RuntimeError(
+                "gemini binary not found — install: npm install -g @google/gemini-cli"
+            )
 
         cwd = session.cwd if os.path.isdir(session.cwd) else os.path.expanduser("~")
 
-        log.info("[gemini:%s] spawning: %s (cwd=%s)", session.session_id[:8], " ".join(cmd), cwd)
+        log.info("[gemini:%s] spawning %s (cwd=%s)", session.session_id[:8], self._gemini_bin, cwd)
         state.proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            self._gemini_bin, "--acp",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -260,18 +293,65 @@ class GeminiCliBackend(Backend):
             state.read_task.cancel()
         state.read_task = asyncio.create_task(self._read_loop(session, state))
 
-        # ACP handshake
+        # ── ACP handshake: initialize
         try:
             result = await self._rpc(state, "initialize", {
+                "protocolVersion": _ACP_PROTOCOL_VERSION,
                 "clientInfo": {"name": "claude-bridge", "version": "1.0"},
-                "capabilities": {},
+                "clientCapabilities": {
+                    "fs": {"readTextFile": True, "writeTextFile": True},
+                    "terminal": True,
+                },
             }, timeout=15.0)
-            await self._send_notification(state, "initialized")
-            log.info("[gemini:%s] ACP initialized: %s",
-                     session.session_id[:8], str(result)[:80])
+            await self._notify(state, "initialized")
+            log.info("[gemini:%s] ACP initialized (agent: %s)",
+                     session.session_id[:8],
+                     result.get("agentInfo", {}).get("name", "?"))
         except Exception as exc:
-            log.error("[gemini:%s] ACP initialize failed: %s", session.session_id[:8], exc)
+            log.error("[gemini:%s] initialize failed: %s", session.session_id[:8], exc)
             raise
+
+        # ── Create or resume ACP session
+        if session.resume_id:
+            try:
+                load_result = await self._rpc(state, "session/load", {
+                    "sessionId": session.resume_id,
+                    "cwd": cwd,
+                    "mcpServers": [],
+                }, timeout=15.0)
+                acp_sid = (load_result.get("sessionId") or
+                           load_result.get("session", {}).get("id") or
+                           session.resume_id)
+                state.acp_session_id = str(acp_sid)
+                log.info("[gemini:%s] ACP session resumed: %s",
+                         session.session_id[:8], state.acp_session_id[:8])
+            except Exception as exc:
+                log.warning("[gemini:%s] session/load failed (%s), creating new", session.session_id[:8], exc)
+                session.resume_id = None
+                state.acp_session_id = None
+
+        if state.acp_session_id is None:
+            new_result = await self._rpc(state, "session/new", {
+                "cwd": cwd,
+                "mcpServers": [],
+            }, timeout=15.0)
+            acp_sid = (new_result.get("sessionId") or
+                       new_result.get("session", {}).get("id") or "")
+            if not acp_sid:
+                raise RuntimeError("gemini session/new returned no sessionId")
+            state.acp_session_id = str(acp_sid)
+            log.info("[gemini:%s] ACP session created: %s",
+                     session.session_id[:8], state.acp_session_id[:8])
+
+        # Propagate to bridge session metadata
+        session.resume_id = state.acp_session_id
+        if session.ws_ref:
+            try:
+                await session.ws_ref.send(json.dumps(
+                    _msg_session_uuid(session.session_id, state.acp_session_id)
+                ))
+            except Exception:
+                pass
 
     async def send(self, session: "Session", content: str,
                    images: list | None = None, files: list | None = None) -> None:
@@ -293,16 +373,17 @@ class GeminiCliBackend(Backend):
         session.accumulated_text = ""
         session.last_activity = time.time()
 
-        # Build content list
+        # Build ACP ContentBlock[]
+        prompt_blocks: list[dict] = []
         user_text = content or ""
         for f in (files or []):
             name = f.get("name", "file")
             body = f.get("content", "")
             user_text += f"\n\n[File: {name}]\n{body}"
-
-        content_parts: list[dict] = [{"type": "text", "text": user_text}]
+        if user_text:
+            prompt_blocks.append({"type": "text", "text": user_text})
         for img in (images or []):
-            content_parts.append({
+            prompt_blocks.append({
                 "type": "image",
                 "source": {
                     "type": "base64",
@@ -311,33 +392,34 @@ class GeminiCliBackend(Backend):
                 },
             })
 
-        state.turn_done_event.clear()
-        state.turn_error = None
         state.turn_active = True
+        state.turn_stop_reason = None
+        state.turn_error = None
 
-        asyncio.create_task(self._run_turn(session, state, content_parts))
+        asyncio.create_task(self._run_turn(session, state, prompt_blocks))
 
     async def _run_turn(self, session: "Session", state: _GeminiState,
-                        content_parts: list[dict]) -> None:
+                        prompt_blocks: list[dict]) -> None:
         try:
-            await self._rpc(state, "message", {
-                "role": "user",
-                "content": content_parts,
-            }, timeout=30.0)
+            # session/prompt is a blocking RPC — response arrives when the turn is fully done.
+            # Streaming happens via session/update notifications in parallel.
+            result = await self._rpc(state, "session/prompt", {
+                "sessionId": state.acp_session_id,
+                "prompt": prompt_blocks,
+            }, timeout=_TURN_TIMEOUT_SECS)
 
-            try:
-                await asyncio.wait_for(state.turn_done_event.wait(), timeout=_TURN_TIMEOUT_SECS)
-            except asyncio.TimeoutError:
-                state.turn_error = f"Gemini turn timed out after {_TURN_TIMEOUT_SECS}s"
+            stop_reason = result.get("stopReason", "end_turn")
+            state.turn_stop_reason = stop_reason
 
-            if session.is_stopping:
+            if session.is_stopping or stop_reason == "cancelled":
                 await send_event(session, _evt_stopped())
-            elif state.turn_error:
-                log.warning("[gemini:%s] turn error: %s", session.session_id[:8], state.turn_error)
-                await send_event(session, _evt_error(state.turn_error, "turn_error"))
             else:
                 await send_event(session, _evt_done())
 
+        except asyncio.TimeoutError:
+            if not session.is_stopping:
+                await send_event(session, _evt_error(
+                    f"Gemini turn timed out after {_TURN_TIMEOUT_SECS}s", "timeout"))
         except Exception as exc:
             if not session.is_stopping:
                 await send_event(session, _evt_error(f"gemini turn failed: {exc}", "stream_error"))
@@ -350,23 +432,22 @@ class GeminiCliBackend(Backend):
         state = self._get_state(session)
         session.is_stopping = True
 
-        # Try graceful cancel via ACP
-        if state.proc and state.proc.returncode is None and state.turn_active:
+        if state.acp_session_id and state.proc and state.proc.returncode is None:
             try:
-                await self._send_notification(state, "cancel")
+                # session/cancel is a notification (no id, no response expected)
+                await self._notify(state, "session/cancel", {
+                    "sessionId": state.acp_session_id,
+                })
             except Exception:
                 pass
 
-        state.turn_error = "stopped"
-        state.turn_done_event.set()
         session.is_streaming = False
         await send_event(session, _evt_stopped())
 
     async def clear(self, session: "Session") -> None:
         await self.stop(session)
         state = self._get_state(session)
-
-        # Terminate process to clear in-memory history
+        # Terminate process; a new session/new will be issued on next send
         if state.proc and state.proc.returncode is None:
             try:
                 state.proc.terminate()
@@ -377,7 +458,7 @@ class GeminiCliBackend(Backend):
                 except Exception:
                     pass
         state.proc = None
-        state.gemini_session_id = None
+        state.acp_session_id = None
         session.resume_id = None
         await send_event(session, _evt_session_warning("Session history cleared."))
 
@@ -418,49 +499,19 @@ class GeminiCliBackend(Backend):
         )
 
 
-# ------------------------------------------------------------------ tool execution
+# ------------------------------------------------------------------ helpers
 
-async def _execute_bridge_tool(tool_name: str, params: dict, session: "Session") -> str:
-    """Route Gemini tool_use requests to bridge native handlers."""
-    if tool_name in ("execute_command", "run_shell", "shell"):
-        cmd = params.get("command") or params.get("cmd") or ""
-        if not cmd:
-            return "Error: no command provided"
-        cwd = params.get("cwd") or session.cwd or os.path.expanduser("~")
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=cwd,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-        return stdout.decode("utf-8", errors="replace")[:8000]
-
-    if tool_name in ("read_file",):
-        path = os.path.expanduser(params.get("path") or "")
-        if not path or not os.path.isfile(path):
-            return f"Error: file not found: {path}"
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read(32768)
-
-    if tool_name in ("write_file",):
-        path = os.path.expanduser(params.get("path") or "")
-        content = params.get("content") or ""
-        if not path:
-            return "Error: no path provided"
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"Written {len(content)} bytes to {path}"
-
-    if tool_name in ("list_directory", "list_dir"):
-        path = os.path.expanduser(params.get("path") or session.cwd or "~")
-        if not os.path.isdir(path):
-            return f"Error: not a directory: {path}"
-        entries = os.listdir(path)
-        return "\n".join(sorted(entries))
-
-    return f"Error: unknown tool '{tool_name}'"
+def _resolve_prompt_future(state: _GeminiState) -> None:
+    """Resolve the pending session/prompt future so _run_turn can unblock."""
+    # The session/prompt future is identified as the most recently allocated RPC
+    # with no result yet. We inject a synthetic result.
+    for fut in list(state.rpc_futures.values()):
+        if not fut.done():
+            if state.turn_error:
+                fut.set_exception(RuntimeError(state.turn_error))
+            else:
+                fut.set_result({"stopReason": state.turn_stop_reason or "cancelled"})
+            break
 
 
 # ------------------------------------------------------------------ history helpers
@@ -469,8 +520,10 @@ def _gemini_history_dirs() -> list[str]:
     tmp_root = os.path.join(_GEMINI_HOME, "tmp")
     if not os.path.isdir(tmp_root):
         return []
-    pattern = os.path.join(tmp_root, "*", "chats")
-    return [d for d in glob.glob(pattern) if os.path.isdir(d)]
+    return [
+        d for d in glob.glob(os.path.join(tmp_root, "*", "chats"))
+        if os.path.isdir(d)
+    ]
 
 
 def _load_gemini_sessions(limit: int = 100) -> list[dict]:
@@ -494,9 +547,7 @@ def _load_gemini_sessions(limit: int = 100) -> list[dict]:
                 "cwd": data.get("cwd") or os.path.expanduser("~"),
             })
             if len(out) >= limit:
-                break
-        if len(out) >= limit:
-            break
+                return out
     return out
 
 
@@ -531,7 +582,7 @@ def _load_gemini_history(
             text = "\n".join(
                 p.get("text", "") if isinstance(p, dict) else str(p)
                 for p in parts
-                if isinstance(p, dict) and p.get("text")
+                if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
             ).strip()
         else:
             continue
@@ -539,11 +590,10 @@ def _load_gemini_history(
             continue
         ts = item.get("timestamp") or item.get("created_at")
         ts_ms = int(ts * 1000) if isinstance(ts, (int, float)) else None
-        source_id = f"gemini:{resume_id}:msg:{i}"
         messages.append(complete_history_message(
             source="gemini",
             source_session_id=resume_id,
-            source_message_id=source_id,
+            source_message_id=f"gemini:{resume_id}:msg:{i}",
             role=role,
             content=text,
             timestamp=ts_ms,
@@ -561,11 +611,9 @@ def _load_gemini_history(
 
 def _find_gemini_chat_file(session_id: str) -> str:
     for chat_dir in _gemini_history_dirs():
-        # Exact match by file stem
         candidate = os.path.join(chat_dir, f"{session_id}.json")
         if os.path.isfile(candidate):
             return candidate
-        # Prefix match
         for f in glob.glob(os.path.join(chat_dir, "*.json")):
             stem = os.path.splitext(os.path.basename(f))[0]
             if stem.startswith(session_id) or session_id.startswith(stem):
@@ -579,15 +627,15 @@ def _infer_session_name(messages: list, fallback: str) -> str:
         if role != "user":
             continue
         parts = msg.get("parts") or msg.get("content") or []
+        text = ""
         if isinstance(parts, str):
             text = parts
         elif isinstance(parts, list):
             text = next(
-                (p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")),
+                (p.get("text", "") for p in parts
+                 if isinstance(p, dict) and p.get("type") == "text" and p.get("text")),
                 "",
             )
-        else:
-            continue
         text = text.strip()
         if text:
             return text[:60] + ("…" if len(text) > 60 else "")
