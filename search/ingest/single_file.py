@@ -558,7 +558,7 @@ async def ingest_file(
                 last_used=_last_used,
             )
             if added:
-                log.info(
+                log.debug(
                     'auto_register: added new session %s (%s)',
                     path.stem[:11], display_name[:40],
                 )
@@ -589,10 +589,11 @@ async def ingest_file(
         await asyncio.to_thread(_sync_checkpoint, conn)
 
     elapsed = time.monotonic() - t0
-    log.debug(
-        "ingest_file: %s — %d msgs added, %d errors, %.2fs",
-        path.name, messages_added, errors, elapsed,
-    )
+    if messages_added or errors or rotated:
+        log.debug(
+            "ingest_file: %s — %d msgs added, %d errors, rotated=%s, %.2fs",
+            path.name, messages_added, errors, rotated, elapsed,
+        )
 
     # Recompute bytes_read as total bytes processed this run.
     _prior_offset = 0 if (row is None or rotated) else start_offset_before

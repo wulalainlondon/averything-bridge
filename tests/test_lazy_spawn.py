@@ -1,0 +1,512 @@
+"""
+Tests for lazy spawn behaviour: bridge startup must not spawn any claude
+subprocess, and spawn must only happen on demand (send message / explicit
+resume via new_session with resume_claude_id).
+
+Run: ~/.claude-bridge-runtime/venv/bin/python -m pytest bridge/tests/test_lazy_spawn.py -v
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import time
+import uuid
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+# Ensure the project root and bridge package are importable.
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_BRIDGE_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_BRIDGE_ROOT))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _random_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _make_session(sid: str, resume_id: str | None = None, backend_name: str = "claude"):
+    """Return a bridge_v2.Session with minimal fields set."""
+    from bridge_v2 import Session
+    s = Session(
+        session_id=sid,
+        name=f"Test {sid}",
+        created_at=time.time(),
+        backend_name=backend_name,
+    )
+    s.resume_id = resume_id
+    return s
+
+
+def _fake_stdin():
+    stdin = MagicMock()
+    stdin.write = MagicMock()
+    stdin.drain = AsyncMock()
+    return stdin
+
+
+# ---------------------------------------------------------------------------
+# 1. _restore_sessions_from_disk must not spawn
+# ---------------------------------------------------------------------------
+
+class TestRestoreSessionsNoSpawn:
+    """_restore_sessions_from_disk loads metadata only — no subprocess."""
+
+    def test_restore_populates_sessions_without_spawn(self, tmp_path, monkeypatch):
+        """Five saved sessions load into _SESSIONS with proc=None."""
+        import bridge_v2 as bv2
+        from backends.claude_cli import ClaudeCliBackend
+
+        # Build a fake saved_sessions.json with 5 entries.
+        # Use distinct SIDs and UUIDs so none collide.
+        entries = {}
+        expected_sids = []
+        for i in range(5):
+            uid = _random_uuid()
+            sid = f"sid_{i:04d}_{uid[:8]}"
+            expected_sids.append(sid)
+            entries[sid] = {
+                "name": f"Session {i}",
+                "cwd": "/tmp",
+                "backend": "claude",
+                "claude_uuid": uid,
+                "last_used": time.time() - i * 3600,
+            }
+        saved_file = tmp_path / "saved_sessions.json"
+        saved_file.write_text(json.dumps(entries), encoding="utf-8")
+
+        spawn_calls: list = []
+
+        async def fake_spawn(self_b, session):
+            spawn_calls.append(session.session_id)
+
+        monkeypatch.setattr(ClaudeCliBackend, "_spawn_proc", fake_spawn)
+        monkeypatch.setattr(bv2, "SAVED_SESSIONS_FILE", str(saved_file))
+        monkeypatch.setattr(bv2, "_SESSIONS", {})
+
+        # Patch prune so it's a no-op (we control the file directly).
+        import auto_register as ar
+        monkeypatch.setattr(ar, "prune_old_saved_sessions", lambda path, days: 0)
+
+        bv2._restore_sessions_from_disk()
+
+        assert len(bv2._SESSIONS) == 5, f"Expected 5 sessions, got {len(bv2._SESSIONS)}"
+        assert spawn_calls == [], f"Expected 0 spawn calls, got {spawn_calls}"
+        for sid in expected_sids:
+            assert sid in bv2._SESSIONS, f"SID {sid} missing from _SESSIONS"
+
+    def test_restore_sessions_have_no_active_proc(self, tmp_path, monkeypatch):
+        """After restore, backend state for each session has proc=None."""
+        import bridge_v2 as bv2
+        from backends.claude_cli import ClaudeCliBackend
+
+        uid = _random_uuid()
+        sid = f"solo_{uid[:8]}"
+        entries = {
+            sid: {
+                "name": "Solo session",
+                "cwd": "/tmp",
+                "backend": "claude",
+                "claude_uuid": uid,
+                "last_used": time.time(),
+            }
+        }
+        saved_file = tmp_path / "saved_sessions.json"
+        saved_file.write_text(json.dumps(entries), encoding="utf-8")
+
+        monkeypatch.setattr(bv2, "SAVED_SESSIONS_FILE", str(saved_file))
+        monkeypatch.setattr(bv2, "_SESSIONS", {})
+        import auto_register as ar
+        monkeypatch.setattr(ar, "prune_old_saved_sessions", lambda path, days: 0)
+
+        bv2._restore_sessions_from_disk()
+
+        session = bv2._SESSIONS.get(sid)
+        assert session is not None, f"Session {sid} not in _SESSIONS after restore"
+        # The backend only allocates _ClaudeState on first send(); so either the
+        # state doesn't exist yet (fully lazy) or proc is explicitly None.
+        backend = bv2._get_or_create_backend("claude")
+        state = backend._states.get(sid)
+        if state is not None:
+            assert state.proc is None, "proc must be None before first send"
+
+
+# ---------------------------------------------------------------------------
+# 2. build_sessions_list must not spawn
+# ---------------------------------------------------------------------------
+
+class TestBuildSessionsListNoSpawn:
+    """build_sessions_list reads metadata only — no subprocess."""
+
+    def test_sessions_list_no_spawn_50_entries(self, monkeypatch):
+        """Calling build_sessions_list() with 50 sessions spawns nothing."""
+        import bridge_v2 as bv2
+        from backends.claude_cli import ClaudeCliBackend
+
+        spawn_calls: list = []
+
+        async def fake_spawn(self_b, session):
+            spawn_calls.append(session.session_id)
+
+        monkeypatch.setattr(ClaudeCliBackend, "_spawn_proc", fake_spawn)
+
+        # Populate _SESSIONS with 50 valid entries using distinct SIDs/UUIDs.
+        sessions: dict = {}
+        for i in range(50):
+            uid = _random_uuid()
+            sid = f"sess_{i:04d}_{uid[:8]}"
+            s = _make_session(sid, resume_id=uid)
+            sessions[sid] = s
+        monkeypatch.setattr(bv2, "_SESSIONS", sessions)
+
+        result = bv2.build_sessions_list()
+
+        assert spawn_calls == [], f"build_sessions_list triggered spawn: {spawn_calls}"
+        assert result["type"] == "sessions_list"
+        # Top-50 cap means we get all 50 entries.
+        assert len(result["sessions"]) == 50
+
+    def test_sessions_list_returns_metadata_fields(self, monkeypatch):
+        """Each summary dict contains the required metadata fields."""
+        import bridge_v2 as bv2
+
+        uid = _random_uuid()
+        sid = f"meta_{uid[:8]}"
+        s = _make_session(sid, resume_id=uid)
+        s.name = "My session"
+        s.cwd = "/tmp/project"
+        monkeypatch.setattr(bv2, "_SESSIONS", {sid: s})
+
+        result = bv2.build_sessions_list()
+
+        assert len(result["sessions"]) == 1
+        summary = result["sessions"][0]
+        assert summary["id"] == sid
+        assert summary["name"] == "My session"
+        assert summary["cwd"] == "/tmp/project"
+        assert summary["backend"] == "claude"
+
+    def test_codex_rollout_jsonl_registers_with_native_uuid(self, tmp_path, monkeypatch):
+        """Codex rollout filenames must register by trailing UUID, not full stem."""
+        import bridge_v2 as bv2
+
+        uid = _random_uuid()
+        root = tmp_path / "codex" / "sessions"
+        day = root / "2026" / "05" / "18"
+        day.mkdir(parents=True)
+        path = day / f"rollout-2026-05-18T01-27-37-{uid}.jsonl"
+        records = [
+            {
+                "timestamp": "2026-05-17T17:27:37.210Z",
+                "type": "session_meta",
+                "payload": {"id": uid, "cwd": "/tmp/lucky3"},
+            },
+            {
+                "timestamp": "2026-05-17T17:27:38.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /tmp/lucky3"}],
+                },
+            },
+            {
+                "timestamp": "2026-05-17T17:27:39.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "檢查 Lucky3 solver 狀態"}],
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        monkeypatch.setattr(bv2, "CODEX_SESSIONS_DIR", str(root))
+        monkeypatch.setattr(bv2, "_SESSIONS", {})
+
+        assert bv2._register_jsonl_session(str(path)) is True
+        result = bv2.build_sessions_list()
+
+        assert len(result["sessions"]) == 1
+        summary = result["sessions"][0]
+        assert summary["backend"] == "codex"
+        assert summary["cwd"] == "/tmp/lucky3"
+        assert summary["name"] == "檢查 Lucky3 solver 狀態"
+        session = bv2._SESSIONS[summary["id"]]
+        assert session.resume_id == uid
+
+    def test_codex_history_skips_commentary_phase(self, tmp_path):
+        """Codex history should expose final answers, not internal commentary messages."""
+        from backends.codex_appserver import CodexAppServerBackend
+
+        uid = _random_uuid()
+        day = tmp_path / "sessions" / "2026" / "05" / "18"
+        day.mkdir(parents=True)
+        path = day / f"rollout-2026-05-18T01-27-37-{uid}.jsonl"
+        records = [
+            {
+                "timestamp": "2026-05-17T17:27:37.210Z",
+                "type": "session_meta",
+                "payload": {"id": uid, "cwd": "/tmp/project"},
+            },
+            {
+                "timestamp": "2026-05-17T17:27:38.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "回報 cwd"}],
+                },
+            },
+            {
+                "timestamp": "2026-05-17T17:27:39.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "我先確認目前工作目錄。"}],
+                },
+            },
+            {
+                "timestamp": "2026-05-17T17:27:40.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "目前目錄是 `/tmp/project`。"}],
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        backend = CodexAppServerBackend("codex")
+        backend._native_sessions_root = str(tmp_path / "sessions")
+        history = backend._load_native_session_history(uid, limit=20, mode="snapshot")
+
+        assert history["kind"] == "snapshot"
+        assert [m["role"] for m in history["messages"]] == ["user", "assistant"]
+        assert history["messages"][-1]["content"] == "目前目錄是 `/tmp/project`。"
+        assert all("我先確認" not in m["content"] for m in history["messages"])
+
+    def test_codex_history_strips_turn_aborted_notice(self, tmp_path):
+        """Codex history should not render framework abort notices as user text."""
+        from backends.codex_appserver import CodexAppServerBackend
+
+        uid = _random_uuid()
+        day = tmp_path / "sessions" / "2026" / "05" / "18"
+        day.mkdir(parents=True)
+        path = day / f"rollout-2026-05-18T10-52-00-{uid}.jsonl"
+        records = [
+            {
+                "timestamp": "2026-05-18T02:52:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": uid, "cwd": "/tmp/project"},
+            },
+            {
+                "timestamp": "2026-05-18T02:52:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "打包taildrop給我\n"
+                                "<turn_aborted>\n"
+                                "The user interrupted the previous turn on purpose.\n"
+                                "</turn_aborted>\n"
+                                "我什麼都沒做 自動發出的"
+                            ),
+                        }
+                    ],
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        backend = CodexAppServerBackend("codex")
+        backend._native_sessions_root = str(tmp_path / "sessions")
+        history = backend._load_native_session_history(uid, limit=20, mode="snapshot")
+
+        assert history["kind"] == "snapshot"
+        assert len(history["messages"]) == 1
+        assert "打包taildrop給我" in history["messages"][0]["content"]
+        assert "我什麼都沒做" in history["messages"][0]["content"]
+        assert "turn_aborted" not in history["messages"][0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# 3. request_history handler must NOT spawn on load (static source check)
+# ---------------------------------------------------------------------------
+
+class TestRequestHistoryNoPrewarmSpawn:
+    """After the fix, request_history must not call backend.spawn() as pre-warm."""
+
+    def test_request_history_handler_does_not_spawn(self):
+        """
+        Verify that the routed request_history path does not pre-warm spawn.
+        """
+        router_src = Path(_BRIDGE_ROOT) / "message_router.py"
+        source = router_src.read_text(encoding="utf-8")
+
+        assert "Lazy spawn: do NOT pre-warm here" in source, (
+            "Expected lazy-spawn comment not found — "
+            "the pre-warm spawn guard was not preserved in request_history router"
+        )
+
+        import re
+        block_match = re.search(
+            r'mtype == "request_history"(.*?)(?=\n    if mtype ==)',
+            source,
+            re.DOTALL,
+        )
+        assert block_match, "Could not locate request_history router block"
+        block = block_match.group(1)
+
+        prewarm_pattern = re.compile(
+            r'(?:backend\.spawn|_spawn_task|spawn_task)\(',
+        )
+        assert not prewarm_pattern.search(block), (
+            "Pre-warm spawn still present in request_history router — "
+            "the thundering-herd fix was not applied correctly"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4. ClaudeCliBackend.send() triggers spawn when proc is None
+# ---------------------------------------------------------------------------
+
+class TestClaudeCliLazySpawnContract:
+    """The backend only spawns when send() is called with proc=None."""
+
+    def test_send_triggers_spawn_when_proc_is_none(self):
+        """send() detects proc is None and initiates _spawn_proc."""
+        from backends.claude_cli import ClaudeCliBackend, _ClaudeState
+
+        backend = ClaudeCliBackend.__new__(ClaudeCliBackend)
+        backend._states = {}
+        backend._claude_bin = "claude"
+        backend._persist_session_fn = None
+        backend._notify_fcm_fn = None
+        backend._broadcast_fn = None
+
+        uid = _random_uuid()
+        sid = f"send1_{uid[:8]}"
+        s = _make_session(sid, resume_id=uid)
+
+        state = _ClaudeState()
+        state.proc = None
+        state.spawning = False
+        backend._states[sid] = state
+
+        spawn_initiated = []
+
+        async def run():
+            async def fake_spawn(session):
+                state.proc = MagicMock()
+                state.proc.returncode = None
+                state.proc.stdin = _fake_stdin()
+                spawn_initiated.append(session.session_id)
+
+            with patch.object(backend, "_spawn_proc", side_effect=fake_spawn):
+                await backend.send(s, "hello world")
+
+        asyncio.run(run())
+        assert len(spawn_initiated) == 1, f"Expected 1 spawn, got {spawn_initiated}"
+
+    def test_send_does_not_respawn_when_proc_already_running(self):
+        """If proc is already running, send() skips _spawn_proc."""
+        from backends.claude_cli import ClaudeCliBackend, _ClaudeState
+
+        backend = ClaudeCliBackend.__new__(ClaudeCliBackend)
+        backend._states = {}
+        backend._claude_bin = "claude"
+        backend._persist_session_fn = None
+        backend._notify_fcm_fn = None
+        backend._broadcast_fn = None
+
+        uid = _random_uuid()
+        sid = f"send2_{uid[:8]}"
+        s = _make_session(sid, resume_id=uid)
+
+        proc_mock = MagicMock()
+        proc_mock.returncode = None
+        proc_mock.stdin = _fake_stdin()
+
+        state = _ClaudeState()
+        state.proc = proc_mock
+        state.spawning = False
+        backend._states[sid] = state
+
+        spawn_calls = []
+
+        async def run():
+            async def fake_spawn(session):
+                spawn_calls.append(session.session_id)
+
+            with patch.object(backend, "_spawn_proc", side_effect=fake_spawn):
+                await backend.send(s, "second message")
+
+        asyncio.run(run())
+        assert spawn_calls == [], f"Unexpected respawn: {spawn_calls}"
+
+
+# ---------------------------------------------------------------------------
+# 5. idle_watchdog only touches sessions that have an active proc
+# ---------------------------------------------------------------------------
+
+class TestIdleWatchdogOnlySpawnedSessions:
+    """Timeout tasks are only created inside send(), not at startup."""
+
+    def test_idle_watchdog_not_created_for_unspawned_sessions(self):
+        """
+        After restore_sessions_from_disk, unspawned sessions have no
+        timeout_task — so the watchdog never fires for them.
+        """
+        from backends.claude_cli import ClaudeCliBackend, _ClaudeState
+
+        backend = ClaudeCliBackend.__new__(ClaudeCliBackend)
+        backend._states = {}
+
+        # 47 sessions never sent a message (no proc, no watchdog).
+        for i in range(47):
+            sid = f"unspawned_{i:04d}"
+            state = _ClaudeState()  # proc=None, timeout_task=None
+            backend._states[sid] = state
+
+        # 3 sessions as-if they were spawned (proc set).
+        spawned_sids = []
+        for i in range(3):
+            sid = f"spawned_{i:04d}"
+            state = _ClaudeState()
+            state.proc = MagicMock()
+            state.proc.returncode = None
+            backend._states[sid] = state
+            spawned_sids.append(sid)
+
+        # Unspawned sessions must have no timeout_task.
+        for i in range(47):
+            sid = f"unspawned_{i:04d}"
+            state = backend._states[sid]
+            assert state.timeout_task is None, (
+                f"Session {sid} has a timeout_task before any send() call"
+            )
+
+        assert len(backend._states) == 50
+
+        spawned_with_proc = [
+            sid for sid, st in backend._states.items()
+            if st.proc is not None
+        ]
+        assert set(spawned_with_proc) == set(spawned_sids)

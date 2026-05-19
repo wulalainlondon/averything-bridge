@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -35,6 +36,10 @@ log = logging.getLogger("bridge_v2")
 
 _STREAM_READER_LIMIT = 128 * 1024 * 1024  # 128 MiB
 _COMPACT_THRESHOLD = 0.80
+_CODEX_WRAPPER_CLOSED_RE = re.compile(
+    r"<(turn_aborted)>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass
@@ -206,6 +211,9 @@ class CodexAppServerBackend(Backend):
                 state.current_turn_id = turn.get("id")
 
         elif method == "item/agentMessage/delta" and session:
+            phase = params.get("phase") or params.get("messagePhase") or params.get("item", {}).get("phase")
+            if phase == "commentary":
+                return
             delta = params.get("delta", "")
             if delta:
                 session.accumulated_text = (session.accumulated_text or "") + delta
@@ -346,7 +354,7 @@ class CodexAppServerBackend(Backend):
         session.is_streaming = True
         session.is_stopping = False
         session.accumulated_text = ""
-        session.last_activity = asyncio.get_event_loop().time()
+        session.last_activity = time.time()
 
         # Ensure we have an active thread. Also re-spawn if app-server died (proc gone).
         proc_alive = self._proc is not None and self._proc.returncode is None
@@ -779,17 +787,29 @@ class CodexAppServerBackend(Backend):
 
     def _extract_text_from_content(self, content: object) -> str:
         if isinstance(content, str):
-            return content
-        if not isinstance(content, list):
+            text = content
+        elif isinstance(content, list):
+            chunks: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                txt = item.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    chunks.append(txt)
+            text = "\n".join(chunks).strip()
+        else:
             return ""
-        chunks: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            txt = item.get("text")
-            if isinstance(txt, str) and txt.strip():
-                chunks.append(txt)
-        return "\n".join(chunks).strip()
+        text = _CODEX_WRAPPER_CLOSED_RE.sub("", text)
+        return text.strip()
+
+    @staticmethod
+    def _is_codex_bootstrap_text(text: str) -> bool:
+        stripped = text.lstrip()
+        return (
+            stripped.startswith("# AGENTS.md instructions")
+            and "<environment_context>" in stripped
+            and "<INSTRUCTIONS>" in stripped
+        )
 
     def _load_native_session_history(
         self,
@@ -811,8 +831,12 @@ class CodexAppServerBackend(Backend):
             role = payload.get("role")
             if role not in {"user", "assistant"}:
                 return None
+            if role == "assistant" and payload.get("phase") == "commentary":
+                return None
             text = self._extract_text_from_content(payload.get("content"))
             if not text:
+                return None
+            if role == "user" and self._is_codex_bootstrap_text(text):
                 return None
             ts = self._parse_iso_to_epoch(str(row.get("timestamp") or "")) * 1000
             return complete_history_message(

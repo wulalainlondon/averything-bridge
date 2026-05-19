@@ -53,11 +53,15 @@ RETRY_COUNT=0
 wait_for_port_free() {
   local max_wait="${1:-30}"
   local waited=0
-  while lsof -ti :"$PORT" >/dev/null 2>&1; do
+  while lsof -t -i :"$PORT" -sTCP:LISTEN >/dev/null 2>&1; do
     if (( waited >= max_wait )); then
       echo "[supervisor] port $PORT still busy after ${max_wait}s — force-killing"
-      lsof -ti :"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-      sleep 1
+      lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || true
+      sleep 2
+      # one more check — warn if still occupied
+      if lsof -t -i :"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "[supervisor] port $PORT still occupied after force-kill (TIME_WAIT or zombie)"
+      fi
       return 0
     fi
     echo "[supervisor] port $PORT busy, waiting... (${waited}s)"
@@ -102,14 +106,27 @@ while true; do
   echo "$CHILD_PID" > "$PID_FILE"
   echo "[supervisor] spawned bridge pid=$CHILD_PID (attempt $((RETRY_COUNT+1))/$MAX_RETRIES)"
 
-  # wait for healthy up to 25s
+  # wait for healthy up to 25s; also verify OUR PID owns the port
+  # (guards against a stale bridge answering the healthcheck while our bridge
+  # failed to bind — the root cause of the EADDRINUSE restart flood)
   HEALTHY=0
   for _ in {1..50}; do
-    if "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 0.5; then
-      BACKOFF=1
-      RETRY_COUNT=0
-      HEALTHY=1
+    if ! kill -0 "$CHILD_PID" 2>/dev/null; then
       break
+    fi
+    if "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 0.5; then
+      PORT_OWNER="$(lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+      if [[ "${PORT_OWNER:-}" == "$CHILD_PID" ]]; then
+        BACKOFF=1
+        RETRY_COUNT=0
+        HEALTHY=1
+        break
+      else
+        echo "[supervisor] stale bridge pid=${PORT_OWNER:-?} owns port (expected $CHILD_PID) — killing stale"
+        [[ -n "${PORT_OWNER:-}" ]] && { kill -9 "$PORT_OWNER" 2>/dev/null || true; sleep 1; }
+        kill "$CHILD_PID" 2>/dev/null || true
+        break
+      fi
     fi
     sleep 0.5
   done

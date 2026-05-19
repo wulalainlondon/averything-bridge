@@ -3,3 +3,7 @@ zeroconf>=0.38       # mDNS discovery (bridge.local)
 firebase-admin>=6.0  # optional: FCM push notifications
 aiohttp>=3.9         # optional: Ollama backend
 watchdog>=4.0        # FSEvents-based JSONL directory watcher
+pyyaml>=6.0          # config system: ~/.claude-bridge/config.yaml loader
+aiortc>=1.6          # WebRTC P2P DataChannel (NAT traversal fallback for Cloudflare Tunnel)
+# pysqlite3-binary is optional — install manually only when stdlib sqlite3 lacks FTS5
+# (Apple-shipped Python, some Homebrew builds). See TECH_RESEARCH.md Q1/Q2.

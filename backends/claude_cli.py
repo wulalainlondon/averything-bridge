@@ -36,6 +36,8 @@ log = logging.getLogger("bridge_v2")
 
 TOOL_IDLE_TIMEOUT_SECS = 900  # kill claude if no stdout for this many seconds (was 300)
 
+_STREAM_READER_LIMIT = 128 * 1024 * 1024  # 128 MiB — matches codex_appserver; prevents LimitOverrunError on large tool outputs
+
 # Compact when context_used exceeds this fraction of the model's context window.
 _COMPACT_THRESHOLD = 0.80
 
@@ -477,7 +479,12 @@ console.log(JSON.stringify(data));
                 for line_no, raw in enumerate(f, start=1):
                     try:
                         d = json.loads(raw)
-                        if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
+                        if (
+                            d.get("isSidechain")
+                            or d.get("type") not in ("user", "assistant")
+                            or d.get("isCompactSummary")
+                            or d.get("isVisibleInTranscriptOnly")
+                        ):
                             continue
                         role = d["type"]
                         content = d.get("message", {}).get("content", "")
@@ -725,7 +732,7 @@ console.log(JSON.stringify(data));
         its stem (UUID) if it differs from *exclude* and is a valid UUID.
 
         cwd mangling rule: replace '/' with '-' and prepend '-'.
-        Example: /Users/wulala/foo → -Users-wulala-foo
+        Example: /Users/alice/foo → -Users-alice-foo
         """
         if not cwd:
             return None
@@ -816,6 +823,7 @@ console.log(JSON.stringify(data));
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=_STREAM_READER_LIMIT,
             )
         except Exception as exc:
             log.error("[%s] Failed to spawn claude: %s", session.session_id, exc)
@@ -863,7 +871,16 @@ console.log(JSON.stringify(data));
         state = self._get_state(session)
         assert state.proc is not None
 
-        async for line_bytes in state.proc.stdout:
+        while True:
+            try:
+                line_bytes = await state.proc.stdout.readline()
+            except asyncio.LimitOverrunError as exc:
+                log.error("[%s] stdout line too long (%d bytes), discarding", session.session_id, exc.consumed)
+                await state.proc.stdout.read(exc.consumed)
+                continue
+            if not line_bytes:
+                break
+
             session.last_activity = time.time()
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if not line:

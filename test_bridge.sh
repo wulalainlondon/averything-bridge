@@ -2,7 +2,7 @@
 # Test the Bridge WebSocket server.
 # Tries wscat first; falls back to the venv Python websockets client.
 
-BRIDGE_DIR="/Users/wulala/Downloads/Helper/claude-bridge/bridge"
+BRIDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_URL="ws://127.0.0.1:8765"
 
 # Pick python: prefer venv, fall back to system python3
@@ -38,8 +38,8 @@ async def test():
             print("\nAll tests passed.")
     except ConnectionRefusedError:
         print("ERROR: Bridge is not running on port 8765.", file=sys.stderr)
-        print("  Start with: cd /Users/wulala/Downloads/Helper/claude-bridge/bridge", file=sys.stderr)
-        print("              source venv/bin/activate && python bridge.py --port 8765", file=sys.stderr)
+        print("  Start with: cd <bridge-directory>", file=sys.stderr)
+        print("              source venv/bin/activate && python bridge_v2.py --port 8765", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
