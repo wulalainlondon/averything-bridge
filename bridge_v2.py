@@ -514,7 +514,7 @@ _READ_CURSORS = session_registry.READ_CURSORS
 
 def _normalize_backend_name(raw: str | None) -> str:
     name = (raw or "").strip().lower()
-    return name if name in {"claude", "codex", "ollama"} else _DEFAULT_BACKEND_NAME
+    return name if name in {"claude", "codex", "ollama", "gemini"} else _DEFAULT_BACKEND_NAME
 
 
 def _get_or_create_backend(name: str) -> "Backend":
@@ -532,6 +532,9 @@ def _get_or_create_backend(name: str) -> "Backend":
     elif backend_name == "ollama":
         from backends.ollama import OllamaBackend
         backend = OllamaBackend(model=_DEFAULT_OLLAMA_MODEL, host=_OLLAMA_HOST)
+    elif backend_name == "gemini":
+        from backends.gemini_cli import GeminiCliBackend
+        backend = GeminiCliBackend()
     else:
         if not CLAUDE_BIN:
             CLAUDE_BIN = _find_claude_bin()
@@ -739,7 +742,7 @@ def init_firebase() -> None:
             log.warning("Firebase Storage init failed: %s", exc)
 
 
-_PUSH_INLINE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+_PUSH_INLINE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
 async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> None:
