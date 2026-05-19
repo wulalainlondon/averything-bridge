@@ -185,10 +185,12 @@ class GeminiCliBackend(Backend):
         kind = update.get("sessionUpdate", "")
 
         if kind == "agent_message_chunk":
-            # Text streaming: content is ContentBlock[]
+            # content may be a single ContentBlock dict OR a ContentBlock[]
             content = update.get("content") or []
             delta = ""
-            if isinstance(content, list):
+            if isinstance(content, dict):
+                delta = content.get("text", "") if content.get("type") == "text" else ""
+            elif isinstance(content, list):
                 delta = "".join(
                     block.get("text", "") for block in content
                     if isinstance(block, dict) and block.get("type") == "text"
