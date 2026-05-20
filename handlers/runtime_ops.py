@@ -106,6 +106,28 @@ def _shell_command() -> tuple[str, ...]:
 
 
 async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
+    permission_manager = ctx.get("permission_manager")
+    client = ctx.get("client")
+
+    if mtype == "permission_response":
+        if permission_manager is None:
+            return True
+        request_id = str(msg.get("request_id") or "")
+        decision = str(msg.get("decision") or "").strip().lower()
+        responder_device_id = getattr(client, "device_id", "") if client else ""
+        if decision not in {"approve", "deny"}:
+            try:
+                await ws.send(json.dumps(ctx["msg_error"]("Invalid permission decision")))
+            except Exception:
+                pass
+            return True
+        await permission_manager.resolve(
+            request_id=request_id,
+            decision="approve" if decision == "approve" else "deny",
+            responder_device_id=responder_device_id,
+        )
+        return True
+
     if mtype == "shell_create":
         if len(ctx["shell_sessions"]) >= ctx["max_shells"]:
             try:
@@ -136,6 +158,22 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
     if mtype == "shell_input":
         shell = ctx["shell_sessions"].get(msg["shell_id"])
         if shell and shell.proc.returncode is None:
+            if permission_manager is not None:
+                approved = await permission_manager.request(
+                    requester_device_id=getattr(client, "device_id", ""),
+                    action="shell_input",
+                    title="Allow shell command?",
+                    justification="Execute command in bridge shell session",
+                    command_preview=str(msg.get("data", ""))[:300],
+                    risk_level="high",
+                    session_id="",
+                )
+                if not approved:
+                    try:
+                        await ws.send(json.dumps(ctx["msg_error"]("Permission denied: shell_input")))
+                    except Exception:
+                        pass
+                    return True
             data = (msg["data"].rstrip("\n") + "\n").encode("utf-8")
             shell.proc.stdin.write(data)
             await shell.proc.stdin.drain()
@@ -213,6 +251,22 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         force = bool(msg.get("force", False))
         ok = False
         error_msg = ""
+        if permission_manager is not None:
+            approved = await permission_manager.request(
+                requester_device_id=getattr(client, "device_id", ""),
+                action="kill_process",
+                title="Allow process kill?",
+                justification="Terminate a local OS process",
+                command_preview=f"pid={pid} force={force}",
+                risk_level="high",
+                session_id="",
+            )
+            if not approved:
+                try:
+                    await ws.send(json.dumps(ctx["msg_process_killed"](pid, False, "permission_denied")))
+                except Exception:
+                    pass
+                return True
         try:
             if os.name == "nt":
                 os.kill(pid, signal.SIGTERM if not force else signal.SIGKILL)

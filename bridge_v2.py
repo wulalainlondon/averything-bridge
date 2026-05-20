@@ -78,6 +78,7 @@ from queue_runner import run_session_queue as _run_session_queue_impl
 from task_manager import cancel_all as _cancel_tasks
 from task_manager import spawn as _spawn_task
 from utils.uuid_helper import is_valid_uuid
+from permission_manager import PermissionManager
 
 try:
     import socket
@@ -441,6 +442,11 @@ class SwitchSessionConfigMsg(TypedDict):
     sandbox: NotRequired[str]
     image_dir: NotRequired[str]
 
+class PermissionResponseMsg(TypedDict):
+    type: Literal["permission_response"]
+    request_id: str
+    decision: str
+
 
 # Required fields (name → [(field, type), ...]) — checked at runtime
 _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
@@ -459,6 +465,7 @@ _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
     "set_effort":      [("session_id", str), ("effort", str)],
     "set_session_meta":[("session_id", str)],
     "switch_session_config":[("session_id", str)],
+    "permission_response":[("request_id", str), ("decision", str)],
 }
 
 _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
@@ -468,6 +475,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "get_processes", "kill_process",
     "fcm_token", "request_sessions_list", "browse_dir", "request_history",
     "set_effort", "hello", "set_session_meta", "switch_session_config",
+    "permission_response",
     "push_file", "file_push_ack",
     "get_all_sessions",
     # search subsystem
@@ -1631,6 +1639,7 @@ _AUTO_TUNNEL_TASK: "asyncio.Task | None" = None
 _CLOUDFLARED_PROC: "asyncio.subprocess.Process | None" = None
 _BRIDGE_PORT = 8766
 _PERF = PerfTracker(slow_threshold_ms=250.0, report_interval_s=60.0)
+_PERMISSION_MANAGER: "PermissionManager | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -1802,6 +1811,8 @@ async def handler(ws: ServerConnection) -> None:
             "msg_task_killed": _msg_task_killed,
             "msg_processes_list": _msg_processes_list,
             "msg_process_killed": _msg_process_killed,
+            "permission_manager": _PERMISSION_MANAGER,
+            "client": client,
         }
         file_ctx = {
             "sessions": _SESSIONS,
@@ -1885,6 +1896,7 @@ async def handler(ws: ServerConnection) -> None:
                 continue
 
             mtype = msg["type"]  # safe after validation
+            runtime_ctx["client"] = client
             if mtype == "hello":
                 if isinstance(msg.get("device_id"), str) and msg.get("device_id", "").strip():
                     client.device_id = msg["device_id"].strip()
@@ -2102,12 +2114,17 @@ async def _warmup_history_cache_background() -> None:
 async def main(port: int, tunnel: bool = False,
                backend_name: str = "claude", model: str = "",
                ollama_host: str = "http://localhost:11434") -> None:
-    global CLAUDE_BIN, CODEX_BIN, BUN_BIN, _DEFAULT_BACKEND_NAME, _DEFAULT_OLLAMA_MODEL, _OLLAMA_HOST
+    global CLAUDE_BIN, CODEX_BIN, BUN_BIN, _DEFAULT_BACKEND_NAME, _DEFAULT_OLLAMA_MODEL, _OLLAMA_HOST, _PERMISSION_MANAGER
 
     _DEFAULT_BACKEND_NAME = _normalize_backend_name(backend_name)
     _DEFAULT_OLLAMA_MODEL = model or "llama3.2"
     _OLLAMA_HOST = ollama_host
     _ensure_local_session_dirs()
+    _PERMISSION_MANAGER = PermissionManager(
+        _broadcast_json,
+        ttl_seconds=int(os.environ.get("BRIDGE_PERMISSION_TIMEOUT_SEC", "60")),
+        mode=os.environ.get("BRIDGE_PERMISSION_MODE", "enforce"),
+    )
 
     _get_or_create_backend(_DEFAULT_BACKEND_NAME)
     # Pre-create both scan-capable backends so _merge_jsonl_sessions_into_state works at startup.
