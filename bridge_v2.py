@@ -79,6 +79,7 @@ from task_manager import cancel_all as _cancel_tasks
 from task_manager import spawn as _spawn_task
 from utils.uuid_helper import is_valid_uuid
 from permission_manager import PermissionManager
+from discovery_broadcaster import DiscoveryBroadcaster
 
 try:
     import socket
@@ -1646,6 +1647,7 @@ _CLOUDFLARED_PROC: "asyncio.subprocess.Process | None" = None
 _BRIDGE_PORT = 8766
 _PERF = PerfTracker(slow_threshold_ms=250.0, report_interval_s=60.0)
 _PERMISSION_MANAGER: "PermissionManager | None" = None
+_INSTANCE_ID = "b_" + uuid.uuid4().hex[:8]
 
 
 # ---------------------------------------------------------------------------
@@ -2120,7 +2122,9 @@ async def _warmup_history_cache_background() -> None:
 # ---------------------------------------------------------------------------
 async def main(port: int, tunnel: bool = False,
                backend_name: str = "claude", model: str = "",
-               ollama_host: str = "http://localhost:11434") -> None:
+               ollama_host: str = "http://localhost:11434",
+               discovery_port: int = 8767,
+               no_discovery: bool = False) -> None:
     global CLAUDE_BIN, CODEX_BIN, BUN_BIN, _DEFAULT_BACKEND_NAME, _DEFAULT_OLLAMA_MODEL, _OLLAMA_HOST, _PERMISSION_MANAGER
 
     _DEFAULT_BACKEND_NAME = _normalize_backend_name(backend_name)
@@ -2175,6 +2179,15 @@ async def main(port: int, tunnel: bool = False,
     log.info("Bridge v2 starting on port %d (default_backend=%s)", port, _DEFAULT_BACKEND_NAME)
     await _init_search()
     zc = _start_mdns(port)
+    broadcaster: "DiscoveryBroadcaster | None" = None
+    if not no_discovery:
+        broadcaster = DiscoveryBroadcaster(
+            ws_port=port,
+            discovery_port=discovery_port,
+            instance_id=_INSTANCE_ID,
+            version="2.0",
+        )
+        await broadcaster.start()
     serve_kwargs = {
         "handler": handler,
         "host": ["0.0.0.0", "::"],
@@ -2202,6 +2215,8 @@ async def main(port: int, tunnel: bool = False,
         finally:
             await _cancel_tasks()
             await _shutdown_search()
+            if broadcaster:
+                await broadcaster.stop()
             if zc:
                 zc.unregister_all_services()
                 zc.close()
@@ -2216,6 +2231,10 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="", help="Model name (for ollama backend)")
     parser.add_argument("--ollama-host", default="http://localhost:11434",
                         help="Ollama server URL")
+    parser.add_argument("--discovery-port", type=int, default=8767,
+                        help="UDP port for LAN discovery broadcasts (default: 8767)")
+    parser.add_argument("--no-discovery", action="store_true",
+                        help="Disable UDP LAN discovery broadcasts")
     args = parser.parse_args()
     asyncio.run(main(
         args.port,
@@ -2223,4 +2242,6 @@ if __name__ == "__main__":
         backend_name=args.backend,
         model=args.model,
         ollama_host=args.ollama_host,
+        discovery_port=args.discovery_port,
+        no_discovery=args.no_discovery,
     ))
