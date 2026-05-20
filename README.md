@@ -2,6 +2,8 @@
 
 Control Claude, Codex, or Ollama on your Mac from your phone.
 
+For AI agents/Codex auto-setup instructions, see `AGENTS.md`.
+
 This is the server-side bridge. It runs on your Mac and connects your mobile app to local AI runtimes via WebSocket. I built this because I wanted to use Claude from my phone while the actual computation runs on my Mac — and I use it every day.
 
 ## How it works
