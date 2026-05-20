@@ -95,7 +95,17 @@ def _coerce_env_value(val: str) -> Any:
 
 
 _HOME = Path.home()
-_ALLOWED_INDEX_ROOTS = (_HOME, Path("/tmp").resolve())
+_TMP_ROOTS: tuple[Path, ...] = tuple(
+    Path(p).resolve()
+    for p in (
+        os.environ.get("TMPDIR"),
+        os.environ.get("TEMP"),
+        os.environ.get("TMP"),
+        "/tmp",
+    )
+    if p
+)
+_ALLOWED_INDEX_ROOTS = (_HOME, *_TMP_ROOTS)
 
 
 def _validate_index_path(raw: str, default: str) -> str:

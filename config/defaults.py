@@ -4,11 +4,13 @@ These cover all hardcoded paths identified in AUDIT_HARDCODED.md.
 """
 from pathlib import Path
 
+_RUNTIME_HOME = Path.home() / ".claude-bridge-runtime"
+
 DEFAULTS: dict = {
     "search": {
         "enabled": True,
         "tokenizer": "auto",
-        "index_path": str(Path("~/.claude-bridge-runtime/search.db").expanduser()),
+        "index_path": str((_RUNTIME_HOME / "search.db")),
         "max_index_size_mb": 1024,
         "ingest_on_startup": True,
         "ingest_startup_delay_sec": 2.0,

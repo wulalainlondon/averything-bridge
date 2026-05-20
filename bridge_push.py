@@ -23,7 +23,7 @@ async def push(path: str) -> None:
 
     print(f"Connecting to bridge at {url} ...")
     try:
-        async with websockets.connect(url, open_timeout=5) as ws:
+        async with websockets.connect(url, open_timeout=5, max_size=None) as ws:
             await ws.send(json.dumps({"type": "hello", "device_id": "cli_push", "device_name": "bridge_push CLI"}))
 
             # Wait for hello_ack
@@ -38,22 +38,18 @@ async def push(path: str) -> None:
             print(f"Uploading: {path}")
             await ws.send(json.dumps({"type": "push_file", "path": path}))
 
-            # Wait for file_push broadcast or error.
-            # Ignore re-delivered registry entries (different filename or no file_id match).
-            upload_acked = False
-            for _ in range(60):
-                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            # Wait for push_ack (direct ack from bridge) or file_push echo or error.
+            for _ in range(20):
+                raw = await asyncio.wait_for(ws.recv(), timeout=15)
                 msg = json.loads(raw)
                 t = msg.get("type")
-                if t == "file_push":
-                    if msg.get("filename") != target_filename:
-                        continue  # stale re-delivery for a different file
-                    if upload_acked:
-                        # First match was the confirmation; this is a duplicate broadcast
-                        continue
-                    upload_acked = True
+                if t == "push_ack":
                     print(f"✓ Pushed: {msg['filename']} ({msg['size']} bytes)")
-                    print(f"  Download URL: {msg['url']}")
+                    return
+                if t == "file_push" and msg.get("filename") == target_filename:
+                    print(f"✓ Pushed: {msg['filename']} ({msg['size']} bytes)")
+                    if msg.get('url'):
+                        print(f"  Download URL: {msg['url']}")
                     return
                 if t == "error":
                     print(f"✗ Error: {msg.get('message')}")

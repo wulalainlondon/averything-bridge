@@ -401,9 +401,9 @@ class CodexAppServerBackend(Backend):
 
             # Wait until turn completes or timeout.
             try:
-                await asyncio.wait_for(state.turn_done_event.wait(), timeout=300.0)
+                await asyncio.wait_for(state.turn_done_event.wait(), timeout=6000.0)
             except asyncio.TimeoutError:
-                state.turn_error = "Codex turn timed out after 300s"
+                state.turn_error = "Codex turn timed out after 6000s"
 
             if session.is_stopping:
                 await send_event(session, _evt_stopped())

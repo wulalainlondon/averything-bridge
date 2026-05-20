@@ -17,12 +17,15 @@ import mimetypes
 import os
 from pathlib import Path
 import re
-import resource
 import shutil
 import subprocess
 import time
 import sys
 import uuid
+try:
+    import resource
+except ImportError:
+    resource = None
 
 # Raise file descriptor limit before any subsystem opens files (search ingest +
 # watchdog kqueue observer can consume thousands of fds).
@@ -30,24 +33,25 @@ import uuid
 # Strategy: always attempt to raise to _WANT_FDS; try relaxing hard limit too.
 _WANT_FDS = 65536
 _TURN_ABORTED_RE = re.compile(r"<turn_aborted>.*?</turn_aborted>", re.IGNORECASE | re.DOTALL)
-try:
-    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    # Determine the new hard: prefer _WANT_FDS; if the kernel hard is lower and
-    # > 0 (i.e. not RLIM_INFINITY) we must stay at or below it — but on macOS
-    # non-root processes can raise the hard up to the system kern.maxfilesperproc
-    # limit even if launchd set a lower hard, so try _WANT_FDS unconditionally.
-    _new_hard = _WANT_FDS if (_hard <= 0 or _hard < _WANT_FDS) else _hard
-    _new_soft = _WANT_FDS
-    resource.setrlimit(resource.RLIMIT_NOFILE, (_new_soft, _new_hard))
-except (ValueError, OSError):
-    # Couldn't raise hard limit; try raising soft only up to existing hard.
+if resource is not None:
     try:
         _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        _cap = _hard if _hard > 0 else _WANT_FDS
-        if _soft < _cap:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (_cap, _hard))
+        # Determine the new hard: prefer _WANT_FDS; if the kernel hard is lower and
+        # > 0 (i.e. not RLIM_INFINITY) we must stay at or below it — but on macOS
+        # non-root processes can raise the hard up to the system kern.maxfilesperproc
+        # limit even if launchd set a lower hard, so try _WANT_FDS unconditionally.
+        _new_hard = _WANT_FDS if (_hard <= 0 or _hard < _WANT_FDS) else _hard
+        _new_soft = _WANT_FDS
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_new_soft, _new_hard))
     except (ValueError, OSError):
-        pass
+        # Couldn't raise hard limit; try raising soft only up to existing hard.
+        try:
+            _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            _cap = _hard if _hard > 0 else _WANT_FDS
+            if _soft < _cap:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (_cap, _hard))
+        except (ValueError, OSError):
+            pass
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, NotRequired, Optional, TYPE_CHECKING, TypedDict
 
@@ -127,7 +131,7 @@ SAVED_SESSIONS_FILE   = os.path.join(BRIDGE_DIR, "saved_sessions.json")
 CODEX_SAVED_SESSIONS_FILE = os.path.join(BRIDGE_DIR, "saved_sessions_codex.json")
 SESSION_META_FILE     = os.path.join(BRIDGE_DIR, "session_meta.json")
 READ_CURSOR_FILE      = os.path.join(BRIDGE_DIR, "read_cursors.json")
-CLAUDE_PROJECTS_DIR   = os.path.expanduser("~/.claude/projects")
+CLAUDE_PROJECTS_DIR   = str(Path.home() / ".claude" / "projects")
 
 def _find_claude_bin() -> str:
     env = os.environ.get("CLAUDE_PATH")
@@ -140,11 +144,15 @@ def _find_claude_bin() -> str:
         "~/.npm-global/bin/claude",
         "~/.local/bin/claude",
         "~/.bun/bin/claude",
+        r"%APPDATA%\npm\claude.cmd",
+        r"%APPDATA%\npm\claude.exe",
+        r"%USERPROFILE%\AppData\Roaming\npm\claude.cmd",
+        r"%USERPROFILE%\AppData\Roaming\npm\claude.exe",
         "/usr/local/bin/claude",
         "/opt/homebrew/bin/claude",
     ]
     for c in candidates:
-        p = os.path.expanduser(c)
+        p = os.path.expanduser(os.path.expandvars(c))
         if os.path.isfile(p):
             return p
     print("ERROR: claude binary not found. Set CLAUDE_PATH env var or ensure claude is on PATH.")
@@ -161,10 +169,11 @@ def _find_bun_bin() -> str:
     candidates = [
         "/opt/homebrew/bin/bun",
         "~/.bun/bin/bun",
+        r"%USERPROFILE%\.bun\bin\bun.exe",
         "/usr/local/bin/bun",
     ]
     for c in candidates:
-        p = os.path.expanduser(c)
+        p = os.path.expanduser(os.path.expandvars(c))
         if os.path.isfile(p):
             return p
     return "bun"
@@ -180,11 +189,15 @@ def _find_codex_bin() -> str:
     candidates = [
         "~/.npm-global/bin/codex",
         "~/.local/bin/codex",
+        r"%APPDATA%\npm\codex.cmd",
+        r"%APPDATA%\npm\codex.exe",
+        r"%USERPROFILE%\AppData\Roaming\npm\codex.cmd",
+        r"%USERPROFILE%\AppData\Roaming\npm\codex.exe",
         "/usr/local/bin/codex",
         "/opt/homebrew/bin/codex",
     ]
     for c in candidates:
-        p = os.path.expanduser(c)
+        p = os.path.expanduser(os.path.expandvars(c))
         if os.path.isfile(p):
             return p
     print("ERROR: codex binary not found. Set CODEX_PATH env var or ensure codex is on PATH.")
@@ -776,18 +789,30 @@ async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> N
                 "filename": filename,
                 "size": size,
                 "mime_type": mime_type,
+                "data": data_b64,
                 "target_device_ids": target_device_ids,
                 "acked_device_ids": [],
             }
             log.info("push_file inline: %s (%d bytes)", filename, size)
-            await _broadcast_json({
+            broadcast_payload = {
                 "type": "file_push",
                 "file_id": file_id,
                 "filename": filename,
                 "size": size,
                 "mime_type": mime_type,
                 "data": data_b64,
-            })
+            }
+            # Ack to pusher immediately before the slow broadcast
+            try:
+                await ws.send(json.dumps({
+                    "type": "push_ack",
+                    "file_id": file_id,
+                    "filename": filename,
+                    "size": size,
+                }))
+            except Exception:
+                pass
+            _spawn_task(f"broadcast-push:{file_id}", _broadcast_json(broadcast_payload))
             _spawn_task(f"notify-fcm:push-file:{file_id}", notify_fcm("Bridge", f"📎 {filename}", ""))
         except Exception as exc:
             log.warning("push_file inline failed: %s", exc)
@@ -1683,14 +1708,20 @@ async def handler(ws: ServerConnection) -> None:
         _spawn_task(f"unread-snapshot:connect:{client.client_id}", _send_unread_snapshot_deferred(ws, client))
         # Re-deliver any file pushes that were broadcast before this client connected
         for fid, entry in list(_PUSH_FILE_REGISTRY.items()):
-            await ws.send(json.dumps({
+            payload: dict = {
                 "type": "file_push",
                 "file_id": fid,
                 "filename": entry["filename"],
-                "url": entry["url"],
                 "size": entry["size"],
                 "mime_type": entry["mime_type"],
-            }))
+            }
+            if "data" in entry:
+                payload["data"] = entry["data"]
+            elif "url" in entry:
+                payload["url"] = entry["url"]
+            else:
+                continue
+            await ws.send(json.dumps(payload))
     except Exception:
         pass
 
@@ -2050,16 +2081,19 @@ async def main(port: int, tunnel: bool = False,
     log.info("Bridge v2 starting on port %d (default_backend=%s)", port, _DEFAULT_BACKEND_NAME)
     await _init_search()
     zc = _start_mdns(port)
-    async with serve(
-        handler,
-        ["0.0.0.0", "::"],
-        port,
-        ping_interval=30,
-        ping_timeout=60,
-        process_request=_media_request_handler,
-        compression="deflate",
-        reuse_port=True,
-    ):
+    serve_kwargs = {
+        "handler": handler,
+        "host": ["0.0.0.0", "::"],
+        "port": port,
+        "ping_interval": 30,
+        "ping_timeout": 60,
+        "process_request": _media_request_handler,
+        "compression": "deflate",
+    }
+    if os.name != "nt":
+        serve_kwargs["reuse_port"] = True
+
+    async with serve(**serve_kwargs):
         log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
         if tunnel:
             _spawn_task("cloudflared-start", _start_cloudflared_tunnel(port))

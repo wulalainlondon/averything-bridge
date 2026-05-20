@@ -1,6 +1,7 @@
 """WebSocket client registry and broadcast helpers."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
@@ -71,18 +72,27 @@ async def close_duplicate_device_clients(current_ws: Any, device_id: str) -> int
 
 
 async def broadcast_json(payload: dict) -> int:
-    dead: list[Any] = []
     raw = json.dumps(payload)
-    delivered = 0
-    for ws, client in list(CLIENTS.items()):
+    clients = list(CLIENTS.items())
+    if not clients:
+        return 0
+
+    async def _send_one(ws: Any, client: ClientConn) -> bool:
         try:
             await ws.send(raw)
             client.last_seen = time.time()
-            delivered += 1
+            return True
         except Exception:
-            dead.append(ws)
-    for ws in dead:
-        CLIENTS.pop(ws, None)
+            return False
+
+    results = await asyncio.gather(*[_send_one(ws, c) for ws, c in clients], return_exceptions=True)
+    delivered = sum(1 for r in results if r is True)
+
+    # clean up dead connections
+    for (ws, _), ok in zip(clients, results):
+        if ok is not True:
+            CLIENTS.pop(ws, None)
+
     return delivered
 
 

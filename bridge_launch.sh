@@ -9,6 +9,7 @@ export HOME="${HOME:-$(eval echo ~"$(id -un)")}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 export BRIDGE_PORT="${BRIDGE_PORT:-8766}"
 export BRIDGE_DISABLE_MDNS="${BRIDGE_DISABLE_MDNS:-1}"
+export GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 
 # Raise fd limit before spawning supervisor/python.  Plist HardResourceLimits
 # is set to 65536; this ulimit is a belt-and-suspenders guarantee that the bash

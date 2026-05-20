@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import os
+import shutil
+import signal
 
 
 async def _collect_processes_async(limit: int = 200) -> list[dict]:
+    if os.name == "nt":
+        return await _collect_processes_windows_async(limit=limit)
+    return await _collect_processes_posix_async(limit=limit)
+
+
+async def _collect_processes_posix_async(limit: int = 200) -> list[dict]:
     proc = await asyncio.create_subprocess_exec(
         "ps", "-axo", "pid=,pcpu=,rss=,user=,comm=,args=",
         stdout=asyncio.subprocess.PIPE,
@@ -44,6 +53,58 @@ async def _collect_processes_async(limit: int = 200) -> list[dict]:
     return processes[:limit]
 
 
+async def _collect_processes_windows_async(limit: int = 200) -> list[dict]:
+    proc = await asyncio.create_subprocess_exec(
+        "tasklist", "/FO", "CSV", "/NH",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+    processes: list[dict] = []
+    text = stdout.decode("utf-8", errors="replace")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            # Expected CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
+            cols = next(csv.reader([line]))
+        except Exception:
+            continue
+        if len(cols) < 5:
+            continue
+        try:
+            pid = int(cols[1])
+        except Exception:
+            continue
+        mem_kb = 0
+        try:
+            mem_digits = "".join(ch for ch in cols[4] if ch.isdigit())
+            mem_kb = int(mem_digits) if mem_digits else 0
+        except Exception:
+            mem_kb = 0
+        cmd = cols[0].strip()
+        processes.append({
+            "pid": pid,
+            "cpu_percent": 0.0,
+            "mem_rss_kb": mem_kb,
+            "user": "",
+            "command": cmd,
+            "args": cmd,
+        })
+    processes.sort(key=lambda p: p.get("mem_rss_kb", 0), reverse=True)
+    return processes[:limit]
+
+
+def _shell_command() -> tuple[str, ...]:
+    if os.name == "nt":
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if pwsh:
+            return (pwsh, "-NoLogo", "-NoProfile", "-Command", "-")
+        return ("cmd.exe", "/Q", "/K")
+    return ("/bin/bash", "-s")
+
+
 async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
     if mtype == "shell_create":
         if len(ctx["shell_sessions"]) >= ctx["max_shells"]:
@@ -56,7 +117,7 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         cwd = msg.get("cwd", os.path.expanduser("~"))
         shell_id = "sh_" + os.urandom(4).hex()
         proc = await asyncio.create_subprocess_exec(
-            "/bin/bash", "-s",
+            *_shell_command(),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -153,7 +214,10 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         ok = False
         error_msg = ""
         try:
-            os.kill(pid, 9 if force else 15)
+            if os.name == "nt":
+                os.kill(pid, signal.SIGTERM if not force else signal.SIGKILL)
+            else:
+                os.kill(pid, 9 if force else 15)
             ok = True
         except ProcessLookupError:
             error_msg = "process_not_found"

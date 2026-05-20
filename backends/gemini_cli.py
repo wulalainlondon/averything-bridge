@@ -537,7 +537,7 @@ def _load_gemini_sessions(limit: int = 100) -> list[dict]:
                     data = json.load(f)
             except Exception:
                 continue
-            sid = data.get("id") or os.path.splitext(os.path.basename(chat_file))[0]
+            sid = data.get("sessionId") or data.get("id") or os.path.splitext(os.path.basename(chat_file))[0]
             messages = data.get("messages") or data.get("turns") or []
             name = _infer_session_name(messages, sid[:8])
             mtime = int(os.path.getmtime(chat_file) * 1000)
@@ -572,8 +572,9 @@ def _load_gemini_history(
     raw_messages = data.get("messages") or data.get("turns") or []
     messages: list[dict] = []
     for i, item in enumerate(raw_messages):
-        role = item.get("role") or item.get("author", "")
-        if role == "model":
+        # Gemini CLI uses "type" field ("user"/"gemini"), not "role"
+        role = item.get("role") or item.get("type") or item.get("author", "")
+        if role in ("model", "gemini"):
             role = "assistant"
         if role not in ("user", "assistant"):
             continue
@@ -581,17 +582,28 @@ def _load_gemini_history(
         if isinstance(parts, str):
             text = parts
         elif isinstance(parts, list):
+            # Gemini CLI parts are {"text": "..."} without a "type" field
             text = "\n".join(
                 p.get("text", "") if isinstance(p, dict) else str(p)
                 for p in parts
-                if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
+                if isinstance(p, dict) and p.get("text")
             ).strip()
         else:
             continue
         if not text:
             continue
         ts = item.get("timestamp") or item.get("created_at")
-        ts_ms = int(ts * 1000) if isinstance(ts, (int, float)) else None
+        if isinstance(ts, (int, float)):
+            ts_ms = int(ts * 1000)
+        elif isinstance(ts, str):
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                ts_ms = int(dt.timestamp() * 1000)
+            except Exception:
+                ts_ms = None
+        else:
+            ts_ms = None
         messages.append(complete_history_message(
             source="gemini",
             source_session_id=resume_id,
@@ -620,12 +632,16 @@ def _find_gemini_chat_file(session_id: str) -> str:
             stem = os.path.splitext(os.path.basename(f))[0]
             if stem.startswith(session_id) or session_id.startswith(stem):
                 return f
+            # Gemini CLI embeds the first 8 chars of the session UUID in the filename
+            # e.g. "session-2026-04-28T00-31-612f8c5a.json" for UUID "612f8c5a-..."
+            if len(session_id) >= 8 and session_id[:8] in stem:
+                return f
     return ""
 
 
 def _infer_session_name(messages: list, fallback: str) -> str:
     for msg in messages:
-        role = msg.get("role") or msg.get("author", "")
+        role = msg.get("role") or msg.get("type") or msg.get("author", "")
         if role != "user":
             continue
         parts = msg.get("parts") or msg.get("content") or []
@@ -635,7 +651,7 @@ def _infer_session_name(messages: list, fallback: str) -> str:
         elif isinstance(parts, list):
             text = next(
                 (p.get("text", "") for p in parts
-                 if isinstance(p, dict) and p.get("type") == "text" and p.get("text")),
+                 if isinstance(p, dict) and p.get("text")),
                 "",
             )
         text = text.strip()

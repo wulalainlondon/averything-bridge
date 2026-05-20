@@ -14,7 +14,7 @@ The bridge manages sessions, streams responses back to your phone in real time, 
 
 ## Requirements
 
-- macOS (Linux works too, without the launchd auto-start)
+- macOS (Linux/Windows also supported; auto-start script is macOS-only)
 - Python 3.10+
 - At least one of:
   - [Claude CLI](https://claude.ai/download) (`npm install -g @anthropic-ai/claude-code`)
@@ -29,6 +29,14 @@ cd claude-bridge
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 venv/bin/python bridge_v2.py --port 8766
+```
+
+Windows (PowerShell):
+
+```powershell
+py -3 -m venv venv
+.\venv\Scripts\python -m pip install -r requirements.txt
+.\venv\Scripts\python bridge_v2.py --port 8766
 ```
 
 Then open the companion app on your phone and point it at your Mac's IP.

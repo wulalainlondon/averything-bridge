@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("bridge_v2")
 
-TOOL_IDLE_TIMEOUT_SECS = 900  # kill claude if no stdout for this many seconds (was 300)
+TOOL_IDLE_TIMEOUT_SECS = 6000  # kill claude if no stdout for this many seconds (was 300)
 
 _STREAM_READER_LIMIT = 128 * 1024 * 1024  # 128 MiB — matches codex_appserver; prevents LimitOverrunError on large tool outputs
 
@@ -225,7 +225,7 @@ class ClaudeCliBackend(Backend):
             except ProcessLookupError:
                 pass
             try:
-                await asyncio.wait_for(state.proc.wait(), timeout=2)
+                await asyncio.wait_for(state.proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 try:
                     state.proc.kill()
@@ -250,7 +250,7 @@ class ClaudeCliBackend(Backend):
             except ProcessLookupError:
                 pass
             try:
-                await asyncio.wait_for(state.proc.wait(), timeout=2)
+                await asyncio.wait_for(state.proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 try:
                     state.proc.kill()
@@ -427,7 +427,7 @@ console.log(JSON.stringify(data));
             except Exception:
                 pass
 
-        _MAX_OUTPUT = 64 * 1024
+        _MAX_OUTPUT = 256 * 1024
 
         def _flatten_tool_result_content(c) -> str:
             if isinstance(c, str):
