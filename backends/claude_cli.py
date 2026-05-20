@@ -1092,6 +1092,21 @@ console.log(JSON.stringify(data));
         rc = state.proc.returncode
         log.warning("[%s] Claude proc exited unexpectedly (rc=%s)", session.session_id, rc)
 
+        # A process exit while a turn is streaming means the current response
+        # cannot complete. Close that turn explicitly so queue_runner and the
+        # mobile UI do not stay in a stale "processing" state until the next
+        # process/session event arrives.
+        if session.is_streaming:
+            session.is_streaming = False
+            session.accumulated_text = ""
+            state.tool_blocks = {}
+            if state.timeout_task and not state.timeout_task.done():
+                state.timeout_task.cancel()
+            await send_event(session, _evt_error(
+                f"Claude process exited (rc={rc}); current response was stopped.",
+                "process_exited",
+            ))
+
         # If compact was in progress when the proc died, clear the flag and notify frontend.
         if state.compact_in_progress:
             state.compact_in_progress = False
@@ -1100,7 +1115,7 @@ console.log(JSON.stringify(data));
                     "type": "session_command_failed",
                     "session_id": session.session_id,
                     "request_id": f"compact_{session.session_id}",
-                    "error": "Process exited during compact",
+                    "message": "Process exited during compact",
                     "queue_length": 0,
                 }))
 

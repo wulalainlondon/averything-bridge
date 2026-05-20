@@ -138,6 +138,49 @@ class TestRestoreSessionsNoSpawn:
             assert state.proc is None, "proc must be None before first send"
 
 
+def test_claude_proc_exit_closes_active_stream_before_restart(monkeypatch):
+    """rc=185 or similar exits must not leave the prompt queue/UI streaming forever."""
+    from backends.claude_cli import ClaudeCliBackend
+
+    class DeadProc:
+        returncode = 185
+
+        async def wait(self):
+            return 185
+
+    async def run():
+        session = _make_session("s_rc185")
+        session.is_streaming = True
+        session.current_request_id = "r_rc185"
+        backend = ClaudeCliBackend()
+        state = backend._get_state(session)
+        state.proc = DeadProc()
+        sent_events: list[dict] = []
+        spawn_calls: list[str] = []
+
+        async def fake_send_event(session_arg, event: dict) -> None:
+            sent_events.append({**event, "session_id": session_arg.session_id})
+
+        async def fake_spawn(session_arg) -> None:
+            spawn_calls.append(session_arg.session_id)
+
+        monkeypatch.setattr("backends.claude_cli.send_event", fake_send_event)
+        monkeypatch.setattr(backend, "_spawn_proc", fake_spawn)
+
+        await backend._watch_proc(session)
+        return session, state, sent_events, spawn_calls
+
+    session, state, sent_events, spawn_calls = asyncio.run(run())
+
+    assert session.is_streaming is False
+    assert session.accumulated_text == ""
+    assert state.tool_blocks == {}
+    assert sent_events[0]["type"] == "error"
+    assert sent_events[0]["code"] == "process_exited"
+    assert "rc=185" in sent_events[0]["message"]
+    assert spawn_calls == ["s_rc185"]
+
+
 # ---------------------------------------------------------------------------
 # 2. build_sessions_list must not spawn
 # ---------------------------------------------------------------------------
