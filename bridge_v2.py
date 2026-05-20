@@ -1718,7 +1718,7 @@ async def _session_cache_refresher() -> None:
 
 
 async def handler(ws: ServerConnection) -> None:
-    global _AUTO_TUNNEL_TASK
+    global _AUTO_TUNNEL_TASK, _PAIRING
 
     # Liveness probe short-circuit.  The supervisor's bridge_healthcheck.py
     # opens a WS every 3s, sends a control PING, then closes.  Without this
@@ -1968,7 +1968,6 @@ async def handler(ws: ServerConnection) -> None:
             op_started = time.perf_counter()
 
             if mtype == "claim_bridge":
-                global _PAIRING
                 token = str(msg.get("auth_token") or "").strip()
                 device_id = str(msg.get("device_id") or "").strip()
                 if not token:
@@ -1988,7 +1987,6 @@ async def handler(ws: ServerConnection) -> None:
                 continue
 
             if mtype == "unclaim_bridge":
-                global _PAIRING
                 token = str(msg.get("auth_token") or "").strip()
                 paired = _PAIRING.get("paired_token", "").strip()
                 if paired and paired != token:

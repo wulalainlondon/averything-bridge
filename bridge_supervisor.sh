@@ -30,13 +30,23 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     exit 0
   else
     echo "[supervisor] stale lock (pid=${OLD_LOCK_PID:-?} dead), clearing"
-    # Kill any orphaned bridge_v2.py the dead supervisor left behind before clearing lock.
+    # If the orphan bridge is healthy, keep it alive and adopt it after taking the lock.
     ORPHAN_PIDS="$(pgrep -f "${BRIDGE_DIR}/bridge_v2\.py" 2>/dev/null || true)"
+    HEALTHY_ORPHAN=""
     if [[ -n "$ORPHAN_PIDS" ]]; then
-      echo "[supervisor] killing orphan bridge_v2.py pids: $ORPHAN_PIDS"
-      kill $ORPHAN_PIDS 2>/dev/null || true
-      sleep 1
-      kill -9 $ORPHAN_PIDS 2>/dev/null || true
+      for opid in $ORPHAN_PIDS; do
+        if "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 5 2>/dev/null; then
+          echo "[supervisor] orphan bridge pid=$opid is healthy — will adopt"
+          HEALTHY_ORPHAN="$opid"
+          break
+        fi
+      done
+      if [[ -z "$HEALTHY_ORPHAN" ]]; then
+        echo "[supervisor] killing orphan bridge_v2.py pids: $ORPHAN_PIDS"
+        kill $ORPHAN_PIDS 2>/dev/null || true
+        sleep 1
+        kill -9 $ORPHAN_PIDS 2>/dev/null || true
+      fi
     fi
     rm -rf "$LOCK_DIR"
     mkdir "$LOCK_DIR"
@@ -48,6 +58,40 @@ echo "[supervisor] start, port=$PORT"
 BACKOFF=1
 MAX_RETRIES=10
 RETRY_COUNT=0
+
+# On startup: if a healthy bridge is already running, adopt it instead of killing it.
+# This handles launchd restarting the supervisor while the bridge is still healthy.
+EXISTING_PID="${HEALTHY_ORPHAN:-$(lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)}"
+if [[ -n "$EXISTING_PID" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+  if [[ -n "${HEALTHY_ORPHAN:-}" ]] || "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 5 2>/dev/null; then
+    echo "[supervisor] adopting healthy bridge pid=$EXISTING_PID"
+    CHILD_PID="$EXISTING_PID"
+    echo "$CHILD_PID" > "$PID_FILE"
+    BACKOFF=1
+    RETRY_COUNT=0
+    # Jump directly into the monitor loop
+    CONSEC_FAIL=0
+    while true; do
+      if ! kill -0 "$CHILD_PID" 2>/dev/null; then
+        echo "[supervisor] adopted bridge exited, restarting"
+        break 1
+      fi
+      if ! "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 8; then
+        CONSEC_FAIL=$(( CONSEC_FAIL + 1 ))
+        echo "[supervisor] healthcheck failed (${CONSEC_FAIL}/3)"
+        if (( CONSEC_FAIL >= 3 )); then
+          echo "[supervisor] 3 consecutive failures, restarting bridge"
+          kill "$CHILD_PID" 2>/dev/null || true
+          sleep 1; kill -9 "$CHILD_PID" 2>/dev/null || true
+          break 1
+        fi
+      else
+        CONSEC_FAIL=0
+      fi
+      sleep 5
+    done
+  fi
+fi
 
 # Wait until port $PORT is free (up to $1 seconds), then force-kill if still busy.
 wait_for_port_free() {
