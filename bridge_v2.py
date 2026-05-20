@@ -134,6 +134,31 @@ CODEX_SAVED_SESSIONS_FILE = os.path.join(BRIDGE_DIR, "saved_sessions_codex.json"
 SESSION_META_FILE     = os.path.join(BRIDGE_DIR, "session_meta.json")
 READ_CURSOR_FILE      = os.path.join(BRIDGE_DIR, "read_cursors.json")
 CLAUDE_PROJECTS_DIR   = str(Path.home() / ".claude" / "projects")
+PAIRING_FILE          = os.path.join(BRIDGE_DIR, "pairing.json")
+
+
+def _load_pairing() -> dict:
+    try:
+        with open(PAIRING_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_pairing(data: dict) -> None:
+    with open(PAIRING_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def _clear_pairing() -> None:
+    try:
+        os.remove(PAIRING_FILE)
+    except FileNotFoundError:
+        pass
+
+
+_PAIRING: dict = _load_pairing()
+
 
 def _find_claude_bin() -> str:
     env = os.environ.get("CLAUDE_PATH")
@@ -472,6 +497,8 @@ _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
     "switch_session_config":[("session_id", str)],
     "permission_response":[("request_id", str), ("decision", str)],
     "request_status": [],
+    "claim_bridge":   [],   # auth_token validated at handler level
+    "unclaim_bridge": [],   # auth_token validated at handler level
 }
 
 _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
@@ -483,6 +510,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "set_effort", "hello", "set_session_meta", "switch_session_config",
     "permission_response",
     "request_status",
+    "claim_bridge", "unclaim_bridge",
     "push_file", "file_push_ack",
     "get_all_sessions",
     # search subsystem
@@ -511,11 +539,21 @@ def validate_client_msg(msg: object) -> str | None:
 
 
 def _is_auth_token_valid(msg: dict) -> bool:
+    # Environment variable takes priority (advanced users, manual override).
     expected = os.environ.get("BRIDGE_AUTH_TOKEN", "").strip()
-    if not expected:
-        return True
-    provided = str(msg.get("auth_token") or "").strip()
-    return bool(provided) and provided == expected
+    if expected:
+        provided = str(msg.get("auth_token") or "").strip()
+        return bool(provided) and provided == expected
+
+    # App-side pairing lock: if a device has claimed this bridge, only that
+    # device's token is accepted.
+    paired_token = _PAIRING.get("paired_token", "").strip()
+    if paired_token:
+        provided = str(msg.get("auth_token") or "").strip()
+        return bool(provided) and provided == paired_token
+
+    # Unlocked: allow all connections.
+    return True
 
 
 if TYPE_CHECKING:
@@ -1764,11 +1802,15 @@ async def handler(ws: ServerConnection) -> None:
         session.ws_ref = ws
 
     try:
+        _paired_token = _PAIRING.get("paired_token", "").strip()
+        _provided_token = str(first_msg.get("auth_token") or "").strip()
         await ws.send(json.dumps({
             "type": "hello_ack",
             "client_id": client.client_id,
             "device_id": client.device_id,
             "device_name": client.device_name,
+            "is_locked": bool(_paired_token),
+            "locked_to_me": bool(_paired_token) and _paired_token == _provided_token,
         }))
         await ws.send(json.dumps(build_sessions_list()))
 
@@ -1911,15 +1953,54 @@ async def handler(ws: ServerConnection) -> None:
                     client.device_id = msg["device_id"].strip()
                 if isinstance(msg.get("device_name"), str) and msg.get("device_name", "").strip():
                     client.device_name = msg["device_name"].strip()
+                _paired_token = _PAIRING.get("paired_token", "").strip()
+                _provided_token = str(msg.get("auth_token") or "").strip()
                 await ws.send(json.dumps({
                     "type": "hello_ack",
                     "client_id": client.client_id,
                     "device_id": client.device_id,
                     "device_name": client.device_name,
+                    "is_locked": bool(_paired_token),
+                    "locked_to_me": bool(_paired_token) and _paired_token == _provided_token,
                 }))
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
             op_started = time.perf_counter()
+
+            if mtype == "claim_bridge":
+                global _PAIRING
+                token = str(msg.get("auth_token") or "").strip()
+                device_id = str(msg.get("device_id") or "").strip()
+                if not token:
+                    await ws.send(json.dumps(_msg_error("auth_token required for claim_bridge")))
+                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                    continue
+                existing = _PAIRING.get("paired_token", "").strip()
+                if existing and existing != token:
+                    await ws.send(json.dumps(_msg_error("Bridge already claimed by another device")))
+                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                    continue
+                _PAIRING = {"paired_token": token, "paired_device_id": device_id, "paired_at": int(time.time())}
+                _save_pairing(_PAIRING)
+                log.info("Bridge claimed by device_id=%s", device_id)
+                await ws.send(json.dumps({"type": "claim_ack", "is_locked": True, "locked_to_me": True}))
+                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                continue
+
+            if mtype == "unclaim_bridge":
+                global _PAIRING
+                token = str(msg.get("auth_token") or "").strip()
+                paired = _PAIRING.get("paired_token", "").strip()
+                if paired and paired != token:
+                    await ws.send(json.dumps(_msg_error("Unauthorized: token mismatch")))
+                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                    continue
+                _PAIRING = {}
+                _clear_pairing()
+                log.info("Bridge unclaimed")
+                await ws.send(json.dumps({"type": "unclaim_ack", "is_locked": False}))
+                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                continue
 
             if await _dispatch_ws_message(ws, msg):
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
