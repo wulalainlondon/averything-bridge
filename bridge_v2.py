@@ -2157,7 +2157,7 @@ async def main(port: int, tunnel: bool = False,
         "port": port,
         "ping_interval": 30,
         "ping_timeout": 60,
-        "max_size": int(os.environ.get("BRIDGE_WS_MAX_SIZE_BYTES", str(4 * 1024 * 1024))),
+        "max_size": None,
         "process_request": _media_request_handler,
         "compression": "deflate",
     }
