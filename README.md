@@ -89,13 +89,28 @@ venv/bin/python bridge_v2.py --port 8766 --backend ollama --model llama3.2
 venv/bin/python bridge_v2.py --port 8766 --backend codex
 ```
 
-## Auto-start on macOS (launchd)
+## Auto-start
+
+macOS (launchd):
 
 ```bash
 bash install.sh
 ```
 
 This installs a launchd agent so the bridge starts automatically on login and restarts if it crashes.
+
+Windows (Task Scheduler):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1
+```
+
+Optional backend selection:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1 -Backend codex
+powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1 -Backend ollama -OllamaModel llama3.2
+```
 
 ## Push notifications (optional)
 
