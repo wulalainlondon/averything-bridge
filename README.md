@@ -41,6 +41,31 @@ py -3 -m venv venv
 
 Then open the companion app on your phone and point it at your Mac's IP.
 
+## One-click install
+
+macOS / Linux:
+
+```bash
+chmod +x install_oneclick.sh
+./install_oneclick.sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
+```
+
+Optional Windows flags:
+
+```powershell
+# Codex backend
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -Backend codex
+
+# Ollama backend
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -Backend ollama -OllamaModel llama3.2
+```
+
 ## Connection options
 
 | Method | URL format | Notes |
