@@ -1109,11 +1109,20 @@ async def _dispatch_event(payload: dict, session: "Session") -> bool:
 # ---------------------------------------------------------------------------
 # JSONL recent-message helpers + live directory watcher
 # ---------------------------------------------------------------------------
-CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+CODEX_SESSIONS_DIR = str(Path.home() / ".codex" / "sessions")
 _WATCHER_LAST_MAX_MTIME: float = 0.0
 
 
 _recent_msgs_cache: dict[str, tuple[float, list]] = {}
+
+
+def _ensure_local_session_dirs() -> None:
+    """Create expected local session source dirs (first-run friction reduction)."""
+    for p in (CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR):
+        try:
+            Path(p).mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            log.warning("Failed to create local session dir %s: %s", p, exc)
 
 def _codex_session_id_from_stem(stem: str) -> str:
     """Codex JSONL files are named rollout-<timestamp>-<uuid>.jsonl.
@@ -1358,6 +1367,7 @@ def _merge_jsonl_sessions_into_state() -> bool:
 
     for base, backend_name in ((CLAUDE_PROJECTS_DIR, "claude"), (CODEX_SESSIONS_DIR, "codex")):
         if not os.path.isdir(base):
+            log.info("JSONL initial scan (%s): source dir missing, skipped: %s", backend_name, base)
             continue
         try:
             for root, _dirs, files in os.walk(base):
@@ -1370,6 +1380,8 @@ def _merge_jsonl_sessions_into_state() -> bool:
                     if _register_jsonl_session(os.path.join(root, fn)):
                         existing_uuids.add(uuid)
                         added = True
+        except FileNotFoundError:
+            log.info("JSONL initial scan (%s): source dir disappeared during scan, skipped", backend_name)
         except Exception as exc:
             log.warning("JSONL initial scan (%s) error: %s", backend_name, exc)
 
@@ -2038,6 +2050,7 @@ async def main(port: int, tunnel: bool = False,
     _DEFAULT_BACKEND_NAME = _normalize_backend_name(backend_name)
     _DEFAULT_OLLAMA_MODEL = model or "llama3.2"
     _OLLAMA_HOST = ollama_host
+    _ensure_local_session_dirs()
 
     _get_or_create_backend(_DEFAULT_BACKEND_NAME)
     # Pre-create both scan-capable backends so _merge_jsonl_sessions_into_state works at startup.

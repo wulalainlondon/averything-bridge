@@ -32,6 +32,9 @@ echo "==> Installing Python dependencies"
 venv/bin/python -m pip install --upgrade pip
 venv/bin/python -m pip install -r requirements.txt
 
+echo "==> Preparing local session folders"
+mkdir -p "$HOME/.claude/projects" "$HOME/.codex/sessions"
+
 if [[ "${INSTALL_CLAUDE_CLI:-1}" == "1" ]]; then
   if command -v npm >/dev/null 2>&1; then
     if ! command -v claude >/dev/null 2>&1; then

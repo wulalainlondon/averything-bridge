@@ -31,6 +31,10 @@ Write-Host "==> Installing Python dependencies"
 .\venv\Scripts\python -m pip install --upgrade pip
 .\venv\Scripts\python -m pip install -r requirements.txt
 
+Write-Host "==> Preparing local session folders"
+New-Item -ItemType Directory -Force -Path "$HOME\.claude\projects" | Out-Null
+New-Item -ItemType Directory -Force -Path "$HOME\.codex\sessions" | Out-Null
+
 if (-not $SkipCliInstall) {
   if ($Backend -eq "claude") {
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {

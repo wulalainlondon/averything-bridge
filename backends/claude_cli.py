@@ -718,6 +718,14 @@ console.log(JSON.stringify(data));
                         "last_used": mtime,
                         "cwd": cwd,
                     })
+        except FileNotFoundError:
+            log.info("Local Claude sessions dir not found yet; skipping scan")
+        except OSError as exc:
+            # Windows first-run commonly raises WinError 3 (path not found).
+            if getattr(exc, "winerror", None) == 3:
+                log.info("Local Claude sessions path not found yet; skipping scan")
+            else:
+                log.warning("Failed to scan local sessions: %s", exc)
         except Exception as exc:
             log.warning("Failed to scan local sessions: %s", exc)
         sessions.sort(key=lambda x: x["last_used"], reverse=True)
