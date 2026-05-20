@@ -2029,7 +2029,7 @@ async def _media_request_handler(connection, request):
 # ---------------------------------------------------------------------------
 
 def _start_mdns(port: int) -> "Zeroconf | None":
-    if os.environ.get("BRIDGE_DISABLE_MDNS", "1") == "1":
+    if os.environ.get("BRIDGE_DISABLE_MDNS", "0") == "1":
         log.info("mDNS disabled by BRIDGE_DISABLE_MDNS=1")
         return None
     if not _ZEROCONF_AVAILABLE:

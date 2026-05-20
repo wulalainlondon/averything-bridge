@@ -24,7 +24,7 @@ if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
 
 Write-Host "==> Creating virtualenv (if needed)"
 if (-not (Test-Path ".\venv\Scripts\python.exe")) {
-  py -3 -m venv venv
+  py -m venv venv
 }
 
 Write-Host "==> Installing Python dependencies"
@@ -65,3 +65,4 @@ Write-Host "  $Cmd"
 Write-Host ""
 Write-Host "To start now, run:"
 Invoke-Expression $Cmd
+md
