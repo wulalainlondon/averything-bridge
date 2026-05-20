@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+import platform
 
 
 async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
@@ -31,6 +33,29 @@ async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         resumable = [r for r in resumable if r.get("claude_uuid") not in active_uuids]
         try:
             await ws.send(json.dumps(msg_resumable(resumable)))
+        except Exception:
+            pass
+        return True
+
+    if mtype == "request_status":
+        sessions = ctx["sessions"]
+        streaming = sum(1 for s in sessions.values() if getattr(s, "is_streaming", False))
+        queued = sum(len(getattr(s, "queue", [])) for s in sessions.values())
+        payload = {
+            "type": "status_result",
+            "session_id": str(msg.get("session_id") or ""),
+            "status": {
+                "server_time_ms": int(time.time() * 1000),
+                "platform": platform.platform(),
+                "python_version": platform.python_version(),
+                "sessions_total": len(sessions),
+                "sessions_streaming": streaming,
+                "queued_commands": queued,
+                "permission_mode": str(ctx.get("permission_mode", "enforce")),
+            },
+        }
+        try:
+            await ws.send(json.dumps(payload))
         except Exception:
             pass
         return True

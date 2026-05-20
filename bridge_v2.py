@@ -447,6 +447,10 @@ class PermissionResponseMsg(TypedDict):
     request_id: str
     decision: str
 
+class RequestStatusMsg(TypedDict):
+    type: Literal["request_status"]
+    session_id: NotRequired[str]
+
 
 # Required fields (name → [(field, type), ...]) — checked at runtime
 _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
@@ -466,6 +470,7 @@ _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
     "set_session_meta":[("session_id", str)],
     "switch_session_config":[("session_id", str)],
     "permission_response":[("request_id", str), ("decision", str)],
+    "request_status": [],
 }
 
 _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
@@ -476,6 +481,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "fcm_token", "request_sessions_list", "browse_dir", "request_history",
     "set_effort", "hello", "set_session_meta", "switch_session_config",
     "permission_response",
+    "request_status",
     "push_file", "file_push_ack",
     "get_all_sessions",
     # search subsystem
@@ -1797,6 +1803,7 @@ async def handler(ws: ServerConnection) -> None:
             "backends": _BACKENDS,
             "session_backend": _session_backend,
             "msg_resumable_sessions": _msg_resumable_sessions,
+            "permission_mode": _PERMISSION_MANAGER.mode() if _PERMISSION_MANAGER else "off",
         }
         runtime_ctx = {
             "sessions": _SESSIONS,
