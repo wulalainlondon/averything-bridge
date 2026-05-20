@@ -78,6 +78,24 @@ powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -Backend ollama -
 
 For Cloudflare tunnel, start with `--tunnel` flag. The URL will appear in the logs.
 
+## Basic security (recommended)
+
+Set a shared auth token before starting bridge:
+
+macOS/Linux:
+
+```bash
+export BRIDGE_AUTH_TOKEN="replace-with-a-long-random-string"
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:BRIDGE_AUTH_TOKEN="replace-with-a-long-random-string"
+```
+
+When set, the first client message (`hello`) must include `auth_token`, otherwise the connection is rejected.
+
 ## Backends
 
 ```bash

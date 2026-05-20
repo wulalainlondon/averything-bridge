@@ -424,6 +424,7 @@ class HelloMsg(TypedDict):
     type: Literal["hello"]
     device_id: NotRequired[str]
     device_name: NotRequired[str]
+    auth_token: NotRequired[str]
 
 class SetSessionMetaMsg(TypedDict):
     type: Literal["set_session_meta"]
@@ -492,6 +493,14 @@ def validate_client_msg(msg: object) -> str | None:
         if not isinstance(val, expected_type):
             return f"'{mtype}.{field_name}' must be {expected_type.__name__}, got {type(val).__name__}"
     return None
+
+
+def _is_auth_token_valid(msg: dict) -> bool:
+    expected = os.environ.get("BRIDGE_AUTH_TOKEN", "").strip()
+    if not expected:
+        return True
+    provided = str(msg.get("auth_token") or "").strip()
+    return bool(provided) and provided == expected
 
 
 if TYPE_CHECKING:
@@ -1692,8 +1701,43 @@ async def handler(ws: ServerConnection) -> None:
         connected_at=time.time(),
         last_seen=time.time(),
     )
+    try:
+        raw_first = await asyncio.wait_for(ws.recv(), timeout=20)
+        first_msg = json.loads(str(raw_first))
+    except asyncio.TimeoutError:
+        try:
+            await ws.send(json.dumps(_msg_error("Handshake timeout: expected hello")))
+        except Exception:
+            pass
+        return
+    except Exception:
+        try:
+            await ws.send(json.dumps(_msg_error("Handshake failed: invalid JSON")))
+        except Exception:
+            pass
+        return
+
+    first_err = validate_client_msg(first_msg)
+    if first_err or first_msg.get("type") != "hello":
+        try:
+            await ws.send(json.dumps(_msg_error("Protocol error: first message must be hello")))
+        except Exception:
+            pass
+        return
+    if not _is_auth_token_valid(first_msg):
+        try:
+            await ws.send(json.dumps(_msg_error("Unauthorized: invalid auth token")))
+        except Exception:
+            pass
+        return
+
+    if isinstance(first_msg.get("device_id"), str) and first_msg.get("device_id", "").strip():
+        client.device_id = first_msg["device_id"].strip()
+    if isinstance(first_msg.get("device_name"), str) and first_msg.get("device_name", "").strip():
+        client.device_name = first_msg["device_name"].strip()
+
     client_manager.register(ws, client)
-    log.info("Client connected: %s (%s)", remote, client.client_id)
+    log.info("Client connected: %s (%s) device=%s", remote, client.client_id, client.device_id)
     _mark_client_activity()
 
     # Inject this ws into all existing sessions (reconnect scenario).
@@ -1841,6 +1885,19 @@ async def handler(ws: ServerConnection) -> None:
                 continue
 
             mtype = msg["type"]  # safe after validation
+            if mtype == "hello":
+                if isinstance(msg.get("device_id"), str) and msg.get("device_id", "").strip():
+                    client.device_id = msg["device_id"].strip()
+                if isinstance(msg.get("device_name"), str) and msg.get("device_name", "").strip():
+                    client.device_name = msg["device_name"].strip()
+                await ws.send(json.dumps({
+                    "type": "hello_ack",
+                    "client_id": client.client_id,
+                    "device_id": client.device_id,
+                    "device_name": client.device_name,
+                }))
+                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                continue
             op_started = time.perf_counter()
 
             if await _dispatch_ws_message(ws, msg):
@@ -2100,6 +2157,7 @@ async def main(port: int, tunnel: bool = False,
         "port": port,
         "ping_interval": 30,
         "ping_timeout": 60,
+        "max_size": int(os.environ.get("BRIDGE_WS_MAX_SIZE_BYTES", str(4 * 1024 * 1024))),
         "process_request": _media_request_handler,
         "compression": "deflate",
     }
