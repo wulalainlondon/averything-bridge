@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import platform
 
@@ -58,6 +59,28 @@ async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
             await ws.send(json.dumps(payload))
         except Exception:
             pass
+        return True
+
+    if mtype == "restart_bridge":
+        trigger_path = ctx.get("restart_trigger_path", "")
+        if not trigger_path:
+            try:
+                await ws.send(json.dumps({"type": "error", "message": "Restart not configured on this bridge"}))
+            except Exception:
+                pass
+            return True
+        try:
+            with open(trigger_path, "w") as f:
+                f.write(str(time.time()))
+            try:
+                await ws.send(json.dumps({"type": "restart_ack"}))
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                await ws.send(json.dumps({"type": "error", "message": f"Failed to trigger restart: {exc}"}))
+            except Exception:
+                pass
         return True
 
     return False

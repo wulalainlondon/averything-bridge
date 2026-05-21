@@ -140,6 +140,13 @@ _DATA_DIR: str = ""  # set by _init_paths() in main()
 _ROOT_DIR: str = ""  # set in main(); "" means no jail
 _INSTANCE_NAME: str = ""  # set in main(); from --instance-name or BRIDGE_INSTANCE_NAME env
 
+# Restart-agent trigger file — bridge writes this to ask launchd's
+# restart-agent (a sibling service, NOT a bridge child) to kickstart us.
+_RESTART_TRIGGER_PATH: str = os.environ.get(
+    "BRIDGE_RESTART_TRIGGER",
+    str(Path.home() / ".claude-bridge-runtime" / ".restart-trigger"),
+)
+
 
 def _init_paths(data_dir: str) -> None:
     global LOG_FILE, FCM_TOKEN_FILE, SERVICE_ACCOUNT_FILE, \
@@ -525,6 +532,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "permission_response",
     "request_status",
     "claim_bridge", "unclaim_bridge",
+    "restart_bridge",
     "push_file", "file_push_ack",
     "get_all_sessions",
     # search subsystem
@@ -1883,6 +1891,7 @@ async def handler(ws: ServerConnection) -> None:
             "session_backend": _session_backend,
             "msg_resumable_sessions": _msg_resumable_sessions,
             "permission_mode": _PERMISSION_MANAGER.mode() if _PERMISSION_MANAGER else "off",
+            "restart_trigger_path": _RESTART_TRIGGER_PATH,
         }
         runtime_ctx = {
             "sessions": _SESSIONS,

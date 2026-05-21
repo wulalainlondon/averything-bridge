@@ -102,6 +102,9 @@ rsync -a --delete \
   "$SRC_DIR/" "$RUNTIME_DIR/"
 cd "$RUNTIME_DIR"
 
+# Record the active service label so restart_agent.sh can look it up.
+echo "$SERVICE_LABEL" > "$RUNTIME_DIR/.service-label"
+
 # ============================================================================
 # Bootstrap instances.json — create on first install/upgrade; never overwrite.
 # ============================================================================
@@ -158,7 +161,7 @@ else
   pip install -r requirements.txt --quiet
 fi
 
-chmod +x run_bridge.sh bridge_supervisor.sh supervisor_instance.sh bridge_healthcheck.py bridge_launch.sh
+chmod +x run_bridge.sh bridge_supervisor.sh supervisor_instance.sh bridge_healthcheck.py bridge_launch.sh restart_agent.sh
 
 # ============================================================================
 # Write plist into a temp path; only swap if content actually differs.
@@ -311,6 +314,66 @@ done <<< "$INSTANCES_LIST"
 
 if (( UNHEALTHY )); then
   exit 1
+fi
+
+# ============================================================================
+# Register the restart-agent launchd service.
+#
+# This is a separate launchd service whose parent is PID 1, NOT the bridge.
+# It watches .restart-trigger via WatchPaths; when bridge writes that file
+# (on a restart_bridge WS command), launchd fires restart_agent.sh which
+# does a kickstart of the bridge service without being in its process tree.
+# ============================================================================
+echo "==> Register restart-agent"
+RAGENT_LABEL="com.claude-bridge.restart-agent"
+RAGENT_PLIST_PATH="$LAUNCH_AGENTS/$RAGENT_LABEL.plist"
+RAGENT_TRIGGER="$RUNTIME_DIR/.restart-trigger"
+RAGENT_TARGET="gui/$(id -u)/$RAGENT_LABEL"
+
+RAGENT_TMP="$(mktemp -t claude-bridge-ragent.XXXXXX)"
+cat > "$RAGENT_TMP" <<RAGENT_PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$RAGENT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec $RUNTIME_DIR/restart_agent.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>$RUNTIME_DIR</string>
+  <key>WatchPaths</key>
+  <array>
+    <string>$RAGENT_TRIGGER</string>
+  </array>
+  <key>KeepAlive</key><false/>
+  <key>RunAtLoad</key><false/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/tmp/$RAGENT_LABEL.stdout.log</string>
+  <key>StandardErrorPath</key><string>/tmp/$RAGENT_LABEL.stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$HOME</string>
+  </dict>
+</dict>
+</plist>
+RAGENT_PLIST_EOF
+
+if [[ ! -f "$RAGENT_PLIST_PATH" ]] || ! cmp -s "$RAGENT_TMP" "$RAGENT_PLIST_PATH"; then
+  mv "$RAGENT_TMP" "$RAGENT_PLIST_PATH"
+  if launchctl print "$RAGENT_TARGET" >/dev/null 2>&1; then
+    launchctl bootout "$RAGENT_TARGET" 2>/dev/null || true
+    sleep 0.5
+  fi
+  launchctl bootstrap "$DOMAIN_TARGET" "$RAGENT_PLIST_PATH"
+  launchctl enable "$RAGENT_TARGET" 2>/dev/null || true
+  echo "    restart-agent registered"
+else
+  rm -f "$RAGENT_TMP"
+  echo "    restart-agent plist unchanged"
 fi
 
 echo "Installed: $PLIST_PATH"
