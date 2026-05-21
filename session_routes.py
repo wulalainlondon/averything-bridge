@@ -135,6 +135,8 @@ async def handle_session_message(
             except Exception as exc:
                 await ctx.emit_resume_progress(session, "resume_failed", 100, f"Resume failed: {exc}")
 
+        # Persist newly created sessions so bridge restart won't orphan `s_*` ids.
+        ctx.persist_session(session)
         ctx.persist_session_meta()
         await ctx.broadcast_json(ctx.build_sessions_list())
         return True

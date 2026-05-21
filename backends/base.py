@@ -1,8 +1,27 @@
 from abc import ABC, abstractmethod
+import time as _time
 from typing import Any, TYPE_CHECKING
+
+MSG_SESSION_BUSY = "Session is currently processing a request."
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
+
+
+class _StatesMixin:
+    """Generic per-session state registry. Each subclass provides _state_factory()."""
+    _states: dict  # populated lazily
+
+    def _get_state(self, session: "Session"):
+        if not hasattr(self, "_states"):
+            self._states = {}
+        sid = session.session_id
+        if sid not in self._states:
+            self._states[sid] = self._state_factory()
+        return self._states[sid]
+
+    def _state_factory(self):
+        raise NotImplementedError
 
 
 class Backend(ABC):
@@ -40,6 +59,32 @@ class Backend(ABC):
     async def get_resumable_sessions(self, limit: int = 100) -> list[dict]:
         """回傳可恢復的 session 列表。預設回傳空列表。"""
         return []
+
+    async def _begin_send(self, session: "Session") -> bool:
+        """Return True if ready to send; False (and emit error) if busy.
+        Sets is_streaming=True and resets accumulated_text/last_activity."""
+        from .events import send_event as _send_event, _evt_error
+        if session.is_streaming:
+            await _send_event(session, _evt_error(MSG_SESSION_BUSY, "session_busy"))
+            return False
+        session.is_streaming = True
+        session.accumulated_text = ""
+        session.last_activity = _time.time()
+        return True
+
+    def find_session_file(self, resume_id: str) -> "str | None":
+        """Return the local JSONL/session file path for resume_id, or None."""
+        return None
+
+    def detect_turn_end(self, lines: list) -> bool:
+        """Return True if any line in the recent diff signals assistant turn complete."""
+        return False
+
+    def get_pid(self, session: "Session") -> "int | None":
+        return None
+
+    def kill_session_proc(self, session: "Session") -> bool:
+        return False
 
     async def load_session_history(
         self,

@@ -45,12 +45,8 @@ class OllamaBackend(Backend):
             await send_event(session, _evt_error("aiohttp not installed. Run: pip install aiohttp", "backend_unavailable"))
             return
 
-        if session.is_streaming:
-            await send_event(session, _evt_error("Session is busy", "session_busy"))
+        if not await self._begin_send(session):
             return
-
-        session.is_streaming = True
-        session.accumulated_text = ""
 
         history = self._histories.setdefault(session.session_id, [])
         history.append({
@@ -117,7 +113,7 @@ class OllamaBackend(Backend):
         await send_event(session, _evt_session_closed())
 
     def supports_resume(self) -> bool:
-        return True
+        return False
 
     async def load_session_history(
         self,

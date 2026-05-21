@@ -208,8 +208,8 @@ def _msg_history_delta(
 def _msg_resumable_sessions(sessions: list[dict]) -> dict:
     return {"type": "resumable_sessions", "sessions": sessions}
 
-def _msg_session_uuid(session_id: str, claude_uuid: str) -> dict:
-    return {"type": "session_uuid", "session_id": session_id, "claude_uuid": claude_uuid}
+def _msg_session_uuid(session_id: str, resume_id: str) -> dict:
+    return {"type": "session_uuid", "session_id": session_id, "claude_uuid": resume_id}
 
 def _msg_shell_created(shell_id: str) -> dict:
     return {"type": "shell_created", "shell_id": shell_id}

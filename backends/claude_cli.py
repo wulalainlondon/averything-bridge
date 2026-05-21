@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional, TYPE_CHECKING
 
-from .base import Backend
+from .base import Backend, _StatesMixin
 from utils.uuid_helper import is_valid_uuid
 from .events import (
     send_event, stream_text, scan_for_media,
@@ -69,7 +69,7 @@ class _ClaudeState:
     compact_in_progress: bool = False
 
 
-class ClaudeCliBackend(Backend):
+class ClaudeCliBackend(Backend, _StatesMixin):
     def __init__(
         self,
         claude_bin: str = "",
@@ -89,10 +89,8 @@ class ClaudeCliBackend(Backend):
         self._broadcast_fn = broadcast_fn
         self._states: dict[str, _ClaudeState] = {}
 
-    def _get_state(self, session: "Session") -> _ClaudeState:
-        if session.session_id not in self._states:
-            self._states[session.session_id] = _ClaudeState()
-        return self._states[session.session_id]
+    def _state_factory(self) -> _ClaudeState:
+        return _ClaudeState()
 
     # ------------------------------------------------------------------
     # Public Backend interface
@@ -103,11 +101,10 @@ class ClaudeCliBackend(Backend):
 
     async def send(self, session: "Session", content: str,
                    images: list | None = None, files: list | None = None) -> None:
-        state = self._get_state(session)
-
-        if session.is_streaming:
-            await send_event(session, _evt_error("Session is currently processing a request.", "session_busy"))
+        if not await self._begin_send(session):
             return
+
+        state = self._get_state(session)
 
         if state.proc is None or state.proc.returncode is not None:
             # Trigger spawn if nothing is running yet
@@ -119,13 +116,11 @@ class ClaudeCliBackend(Backend):
                 if state.proc is not None and state.proc.returncode is None:
                     break
             else:
+                session.is_streaming = False
                 await send_event(session, _evt_error("Claude process failed to start.", "session_dead"))
                 return
 
-        session.accumulated_text = ""
         state.tool_blocks = {}
-        session.is_streaming = True
-        session.last_activity = time.time()
 
         content_blocks: list = []
         for img in (images or []):
@@ -284,6 +279,19 @@ class ClaudeCliBackend(Backend):
         if state and state.proc and state.proc.returncode is None:
             state.proc.terminate()
             return True
+        return False
+
+    def find_session_file(self, resume_id: str) -> "str | None":
+        return self._find_session_file_sync(resume_id)
+
+    _TURN_END_STOP_REASONS = frozenset({"end_turn", "max_tokens", "stop_sequence"})
+
+    def detect_turn_end(self, lines: list) -> bool:
+        for d in lines:
+            if (d.get("type") == "assistant"
+                    and not d.get("isSidechain")
+                    and d.get("message", {}).get("stop_reason") in self._TURN_END_STOP_REASONS):
+                return True
         return False
 
     # ------------------------------------------------------------------
@@ -715,6 +723,7 @@ console.log(JSON.stringify(data));
                         "id": uuid,
                         "name": name,
                         "claude_uuid": uuid,
+                        "resume_id": uuid,
                         "last_used": mtime,
                         "cwd": cwd,
                     })

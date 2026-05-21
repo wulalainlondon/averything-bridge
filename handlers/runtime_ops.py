@@ -209,7 +209,7 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         tasks = []
         for sid, s in list(ctx["sessions"].items()):
             backend = ctx["session_backend"](s)
-            pid = backend.get_pid(s) if hasattr(backend, "get_pid") else None
+            pid = backend.get_pid(s)
             tasks.append({
                 "id": sid,
                 "name": s.name,
@@ -239,8 +239,7 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         if task_id in ctx["sessions"]:
             s = ctx["sessions"][task_id]
             backend = ctx["session_backend"](s)
-            if hasattr(backend, "kill_session_proc"):
-                killed = backend.kill_session_proc(s)
+            killed = backend.kill_session_proc(s)
         elif task_id in ctx["shell_sessions"]:
             sh = ctx["shell_sessions"].pop(task_id, None)
             if sh and sh.proc.returncode is None:

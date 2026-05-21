@@ -1334,16 +1334,11 @@ def _get_recent_messages_sync(session: "Session", n: int = 2) -> list:
         if not session.resume_id:
             return []
         backend = _session_backend(session)
-        if session.backend_name == "codex":
-            if not hasattr(backend, "_find_native_session_file"):
-                return []
-            path = backend._find_native_session_file(session.resume_id)
-            return _read_recent_msgs(path, "codex", n) if path else []
-        else:
-            if not hasattr(backend, "_find_session_file_sync"):
-                return []
-            path = backend._find_session_file_sync(session.resume_id)
-            return _read_recent_msgs(path, "claude", n) if path else []
+        path = backend.find_session_file(session.resume_id)
+        if not path:
+            return []
+        fmt = "codex" if session.backend_name == "codex" else "claude"
+        return _read_recent_msgs(path, fmt, n)
     except Exception:
         return []
 

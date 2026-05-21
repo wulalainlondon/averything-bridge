@@ -16,7 +16,8 @@ from dataclasses import dataclass, field
 from shutil import which
 from typing import Optional, TYPE_CHECKING
 
-from .base import Backend
+from .base import Backend, _StatesMixin
+from .jsonrpc import JsonRpcPlumber
 from .events import (
     send_event, stream_text,
     _evt_error, _evt_stopped, _evt_done,
@@ -43,8 +44,7 @@ _ACP_PROTOCOL_VERSION = 1
 class _GeminiState:
     proc: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
     read_task: Optional[asyncio.Task] = field(default=None, repr=False)
-    next_id: int = 1
-    rpc_futures: dict = field(default_factory=dict)
+    plumber: JsonRpcPlumber = field(default_factory=lambda: JsonRpcPlumber("gemini"))
     # ACP session identity (assigned by Gemini after session/new or session/load)
     acp_session_id: Optional[str] = None
     # Current turn state
@@ -54,24 +54,17 @@ class _GeminiState:
     spawning: bool = False
 
 
-class GeminiCliBackend(Backend):
+class GeminiCliBackend(Backend, _StatesMixin):
     """One gemini --acp subprocess per bridge session."""
 
     def __init__(self, gemini_bin: str = "") -> None:
         self._gemini_bin = gemini_bin or _find_gemini_bin()
         self._states: dict[str, _GeminiState] = {}
 
-    def _get_state(self, session: "Session") -> _GeminiState:
-        if session.session_id not in self._states:
-            self._states[session.session_id] = _GeminiState()
-        return self._states[session.session_id]
+    def _state_factory(self) -> _GeminiState:
+        return _GeminiState()
 
     # ------------------------------------------------------------------ JSON-RPC helpers
-
-    def _alloc_id(self, state: _GeminiState) -> int:
-        rid = state.next_id
-        state.next_id += 1
-        return rid
 
     async def _write(self, state: _GeminiState, obj: dict) -> None:
         assert state.proc and state.proc.stdin
@@ -81,27 +74,12 @@ class GeminiCliBackend(Backend):
     async def _rpc(self, state: _GeminiState, method: str,
                    params: dict | None, timeout: float = 30.0) -> dict:
         """Send a request and wait for the response."""
-        rid = self._alloc_id(state)
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
-        state.rpc_futures[rid] = fut
-        req: dict = {"jsonrpc": "2.0", "id": rid, "method": method}
-        if params is not None:
-            req["params"] = params
-        await self._write(state, req)
-        try:
-            return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
-        except asyncio.TimeoutError:
-            state.rpc_futures.pop(rid, None)
-            raise TimeoutError(f"gemini ACP '{method}' timed out after {timeout}s")
+        return await state.plumber.request(state.proc, method, params, timeout)
 
     async def _notify(self, state: _GeminiState,
                       method: str, params: dict | None = None) -> None:
         """Send a notification (no id, no response expected)."""
-        msg: dict = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            msg["params"] = params
-        await self._write(state, msg)
+        await state.plumber.notify(state.proc, method, params)
 
     # ------------------------------------------------------------------ read loop
 
@@ -125,10 +103,7 @@ class GeminiCliBackend(Backend):
         finally:
             log.info("[gemini:%s] read_loop exited (rc=%s)",
                      session.session_id[:8], proc.returncode)
-            for fut in state.rpc_futures.values():
-                if not fut.done():
-                    fut.set_exception(RuntimeError("gemini process died"))
-            state.rpc_futures.clear()
+            state.plumber.fail_all(RuntimeError("gemini process died"))
             if state.turn_active:
                 state.turn_error = "gemini process exited unexpectedly"
                 # Resolve the pending session/prompt future via turn_stop_reason
@@ -141,16 +116,8 @@ class GeminiCliBackend(Backend):
         method = msg.get("method", "")
 
         # ── RPC response: {"id": N, "result": {...}} or {"id": N, "error": {...}}
-        if rid is not None and "result" in msg:
-            fut = state.rpc_futures.pop(rid, None)
-            if fut and not fut.done():
-                fut.set_result(msg["result"])
-            return
-
-        if rid is not None and "error" in msg:
-            fut = state.rpc_futures.pop(rid, None)
-            if fut and not fut.done():
-                fut.set_exception(RuntimeError(str(msg["error"])))
+        if rid is not None and ("result" in msg or "error" in msg):
+            state.plumber.dispatch_response(msg)
             return
 
         # ── Server-side RPC request: {"id": N, "method": "...", "params": {...}}
@@ -214,7 +181,7 @@ class GeminiCliBackend(Backend):
             tool_name = tool_call.get("name") or tool_call.get("toolName") or "tool"
             tool_input = tool_call.get("input") or tool_call.get("args") or {}
             tool_id = tool_call.get("toolCallId") or tool_call.get("id") or "tc"
-            await send_event(session, _evt_tool_start(tool_id, tool_name, tool_input))
+            await send_event(session, _evt_tool_start(tool_id, tool_name, json.dumps(tool_input) if isinstance(tool_input, (dict, list)) else str(tool_input)))
 
         elif kind == "tool_call_update":
             tool_call = update.get("toolCall", {}) or {}
@@ -223,8 +190,8 @@ class GeminiCliBackend(Backend):
             status = update.get("status") or ""
             if status in ("completed", "done", "success", "error"):
                 output = update.get("output") or update.get("result") or ""
-                await send_event(session, _evt_tool_result(tool_id, tool_name, str(output)))
-                await send_event(session, _evt_tool_end(tool_id, tool_name))
+                await send_event(session, _evt_tool_result(tool_id, str(output)))
+                await send_event(session, _evt_tool_end(tool_id))
 
         elif kind == "usage_update":
             usage = update.get("usage") or {}
@@ -357,23 +324,19 @@ class GeminiCliBackend(Backend):
 
     async def send(self, session: "Session", content: str,
                    images: list | None = None, files: list | None = None) -> None:
-        state = self._get_state(session)
-
-        if session.is_streaming:
-            await send_event(session, _evt_error("Session is currently processing a request.", "session_busy"))
+        if not await self._begin_send(session):
             return
+        session.is_stopping = False
+
+        state = self._get_state(session)
 
         if state.proc is None or state.proc.returncode is not None:
             try:
                 await self.spawn(session)
             except Exception as exc:
+                session.is_streaming = False
                 await send_event(session, _evt_error(f"Failed to start gemini: {exc}", "spawn_failed"))
                 return
-
-        session.is_streaming = True
-        session.is_stopping = False
-        session.accumulated_text = ""
-        session.last_activity = time.time()
 
         # Build ACP ContentBlock[]
         prompt_blocks: list[dict] = []
@@ -507,7 +470,7 @@ def _resolve_prompt_future(state: _GeminiState) -> None:
     """Resolve the pending session/prompt future so _run_turn can unblock."""
     # The session/prompt future is identified as the most recently allocated RPC
     # with no result yet. We inject a synthetic result.
-    for fut in list(state.rpc_futures.values()):
+    for fut in list(state.plumber._futures.values()):
         if not fut.done():
             if state.turn_error:
                 fut.set_exception(RuntimeError(state.turn_error))
@@ -545,6 +508,7 @@ def _load_gemini_sessions(limit: int = 100) -> list[dict]:
                 "id": f"gemini_{sid[:12]}",
                 "name": name,
                 "claude_uuid": sid,
+                "resume_id": sid,
                 "last_used": mtime,
                 "cwd": data.get("cwd") or os.path.expanduser("~"),
             })

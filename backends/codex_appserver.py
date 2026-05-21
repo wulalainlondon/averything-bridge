@@ -21,7 +21,8 @@ from dataclasses import dataclass, field
 from shutil import which
 from typing import Optional, TYPE_CHECKING
 
-from .base import Backend
+from .base import Backend, _StatesMixin
+from .jsonrpc import JsonRpcPlumber
 from .events import (
     send_event, stream_text,
     _evt_error, _evt_stopped, _evt_done, _evt_session_warning, _evt_session_closed,
@@ -61,7 +62,7 @@ class _AppServerState:
     compact_error: Optional[str] = None
 
 
-class CodexAppServerBackend(Backend):
+class CodexAppServerBackend(Backend, _StatesMixin):
     """Persistent Codex app-server backend — one process, per-session threads."""
 
     def __init__(self, codex_bin: str,
@@ -79,8 +80,7 @@ class CodexAppServerBackend(Backend):
         # Singleton app-server
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._read_task: Optional[asyncio.Task] = None
-        self._next_id: int = 1
-        self._rpc_futures: dict[int, asyncio.Future] = {}
+        self._rpc_plumber = JsonRpcPlumber("codex")
 
         # Per-session state
         self._states: dict[str, _AppServerState] = {}
@@ -91,44 +91,14 @@ class CodexAppServerBackend(Backend):
 
     # ------------------------------------------------------------------ helpers
 
-    def _get_state(self, session: "Session") -> _AppServerState:
-        if session.session_id not in self._states:
-            self._states[session.session_id] = _AppServerState()
-        return self._states[session.session_id]
-
-    def _alloc_id(self) -> int:
-        rid = self._next_id
-        self._next_id += 1
-        return rid
-
-    async def _send_rpc(self, method: str, params: dict | None, rid: int) -> None:
-        assert self._proc and self._proc.stdin
-        payload = {"id": rid, "method": method}
-        if params is not None:
-            payload["params"] = params
-        msg = json.dumps(payload)
-        self._proc.stdin.write((msg + "\n").encode())
-        await self._proc.stdin.drain()
+    def _state_factory(self) -> "_AppServerState":
+        return _AppServerState()
 
     async def _send_notification(self, method: str, params: dict | None = None) -> None:
-        assert self._proc and self._proc.stdin
-        msg = {"method": method}
-        if params is not None:
-            msg["params"] = params
-        self._proc.stdin.write((json.dumps(msg) + "\n").encode())
-        await self._proc.stdin.drain()
+        await self._rpc_plumber.notify(self._proc, method, params)
 
     async def _rpc(self, method: str, params: dict | None, timeout: float = 30.0) -> dict:
-        rid = self._alloc_id()
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._rpc_futures[rid] = fut
-        await self._send_rpc(method, params, rid)
-        try:
-            return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
-        except asyncio.TimeoutError:
-            self._rpc_futures.pop(rid, None)
-            raise TimeoutError(f"codex app-server RPC '{method}' timed out after {timeout}s")
+        return await self._rpc_plumber.request(self._proc, method, params, timeout)
 
     async def _ensure_server(self) -> None:
         """Spawn and initialize the singleton app-server if it's not running."""
@@ -174,37 +144,20 @@ class CodexAppServerBackend(Backend):
                     msg = json.loads(line)
                 except Exception:
                     continue
+                if self._rpc_plumber.dispatch_response(msg):
+                    continue
                 await self._dispatch(msg)
         except Exception as exc:
             log.warning("[codex-appserver] read_loop error: %s", exc)
         finally:
             log.info("[codex-appserver] read_loop exited (proc rc=%s)", proc.returncode)
-            # Fail any pending RPCs
-            for fut in self._rpc_futures.values():
-                if not fut.done():
-                    fut.set_exception(RuntimeError("app-server process died"))
-            self._rpc_futures.clear()
+            self._rpc_plumber.fail_all(RuntimeError("app-server process died"))
             # Mark proc gone so next call restarts it
             self._proc = None
 
     async def _dispatch(self, msg: dict) -> None:
-        rid = msg.get("id")
+        # --- Notifications (RPC responses are handled by _rpc_plumber in _read_loop) ---
         method = msg.get("method", "")
-
-        # --- RPC response (has "id" + "result" or "error") ---
-        if rid is not None and "result" in msg:
-            fut = self._rpc_futures.pop(rid, None)
-            if fut and not fut.done():
-                fut.set_result(msg["result"])
-            return
-        if rid is not None and "error" in msg:
-            fut = self._rpc_futures.pop(rid, None)
-            if fut and not fut.done():
-                err = msg["error"]
-                fut.set_exception(RuntimeError(str(err)))
-            return
-
-        # --- Notifications ---
         params = msg.get("params", {}) or {}
         thread_id = params.get("threadId")
         session = self._thread_to_session.get(thread_id) if thread_id else None
@@ -351,15 +304,11 @@ class CodexAppServerBackend(Backend):
 
     async def send(self, session: "Session", content: str,
                    images: list | None = None, files: list | None = None) -> None:
-        state = self._get_state(session)
-        if session.is_streaming:
-            await send_event(session, _evt_error("Session is currently processing a request.", "session_busy"))
+        if not await self._begin_send(session):
             return
-
-        session.is_streaming = True
         session.is_stopping = False
-        session.accumulated_text = ""
-        session.last_activity = time.time()
+
+        state = self._get_state(session)
 
         # Ensure we have an active thread. Also re-spawn if app-server died (proc gone).
         proc_alive = self._proc is not None and self._proc.returncode is None
@@ -589,6 +538,24 @@ class CodexAppServerBackend(Backend):
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             return True
+        return False
+
+    def find_session_file(self, resume_id: str) -> "str | None":
+        path = self._find_native_session_file(resume_id)
+        return path if path else None
+
+    _TURN_END_STOP_REASONS = frozenset({"end_turn", "max_tokens", "stop_sequence"})
+
+    def detect_turn_end(self, lines: list) -> bool:
+        for d in lines:
+            if d.get("type") != "response_item":
+                continue
+            payload = d.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            if (payload.get("role") == "assistant"
+                    and payload.get("stop_reason") in self._TURN_END_STOP_REASONS):
+                return True
         return False
 
     def supports_resume(self) -> bool:
@@ -823,6 +790,7 @@ class CodexAppServerBackend(Backend):
                         "id": f"native_{sid[:12]}",
                         "name": _sanitize_session_name(raw_name, sid[:8]),
                         "claude_uuid": sid,
+                        "resume_id": sid,
                         "last_used": self._parse_iso_to_epoch(str(row.get("updated_at") or "")),
                         "cwd": self._read_native_session_cwd(sid),
                     })
