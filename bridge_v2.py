@@ -533,7 +533,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "request_status",
     "claim_bridge", "unclaim_bridge",
     "restart_bridge",
-    "push_file", "file_push_ack",
+    "push_file", "file_push_ack", "get_inbox",
     "get_all_sessions",
     # search subsystem
     "request_search", "request_search_health", "request_session_list",
@@ -846,6 +846,39 @@ def init_firebase() -> None:
 _PUSH_INLINE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
+_INBOX_TTL_SECONDS = 7 * 24 * 3600  # 7 days
+
+
+def _inbox_file_path() -> str:
+    return os.path.join(_DATA_DIR, "inbox.json")
+
+
+def _save_inbox() -> None:
+    try:
+        with open(_inbox_file_path(), "w", encoding="utf-8") as f:
+            json.dump(_PUSH_FILE_REGISTRY, f)
+    except Exception as exc:
+        log.warning("inbox save failed: %s", exc)
+
+
+def _load_inbox() -> None:
+    global _PUSH_FILE_REGISTRY
+    path = _inbox_file_path()
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        now = time.time()
+        _PUSH_FILE_REGISTRY = {
+            fid: entry for fid, entry in data.items()
+            if now - entry.get("pushed_at", 0) < _INBOX_TTL_SECONDS
+        }
+        log.info("Loaded inbox: %d entries", len(_PUSH_FILE_REGISTRY))
+    except Exception as exc:
+        log.warning("inbox load failed: %s", exc)
+
+
 async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> None:
     if _ROOT_DIR:
         from utils.path_jail import resolve_jailed, JailEscape
@@ -891,7 +924,9 @@ async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> N
                 "data": data_b64,
                 "target_device_ids": target_device_ids,
                 "acked_device_ids": [],
+                "pushed_at": time.time(),
             }
+            _save_inbox()
             log.info("push_file inline: %s (%d bytes)", filename, size)
             broadcast_payload = {
                 "type": "file_push",
@@ -912,7 +947,7 @@ async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> N
             except Exception:
                 pass
             _spawn_task(f"broadcast-push:{file_id}", _broadcast_json(broadcast_payload))
-            _spawn_task(f"notify-fcm:push-file:{file_id}", notify_fcm("Bridge", f"📎 {filename}", ""))
+            _spawn_task(f"notify-fcm:push-file:{file_id}", notify_fcm_file_push(file_id, filename))
         except Exception as exc:
             log.warning("push_file inline failed: %s", exc)
             try:
@@ -939,7 +974,7 @@ async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> N
             blob.upload_from_filename(expanded, content_type=mime_type)
             import datetime
             url = blob.generate_signed_url(
-                expiration=datetime.timedelta(hours=1),
+                expiration=datetime.timedelta(days=7),
                 method="GET",
                 version="v4",
             )
@@ -954,7 +989,9 @@ async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> N
             "mime_type": mime_type,
             "target_device_ids": target_device_ids,
             "acked_device_ids": [],
+            "pushed_at": time.time(),
         }
+        _save_inbox()
         log.info("push_file uploaded: %s → %s", filename, blob_path)
 
         await _broadcast_json({
@@ -965,7 +1002,7 @@ async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> N
             "size": size,
             "mime_type": mime_type,
         })
-        _spawn_task(f"notify-fcm:push-file:{file_id}", notify_fcm("Bridge", f"📎 {filename}", ""))
+        _spawn_task(f"notify-fcm:push-file:{file_id}", notify_fcm_file_push(file_id, filename))
     except Exception as exc:
         log.warning("push_file upload failed: %s", exc)
         try:
@@ -984,10 +1021,11 @@ async def _handle_file_push_ack(file_id: str, device_id: str = "") -> None:
     if device_id:
         acked.add(device_id)
         entry["acked_device_ids"] = sorted(acked)
-    should_delete = (not target) or target.issubset(acked)
+    should_delete = bool(target) and target.issubset(acked)
     if not should_delete:
         return
     _PUSH_FILE_REGISTRY.pop(file_id, None)
+    _save_inbox()
     blob_path = entry.get("blob_path")
     if not blob_path or _firebase_storage_app is None:
         return
@@ -1075,6 +1113,35 @@ async def notify_fcm(session_name: str, last_text: str, session_id: str = "") ->
                 await asyncio.sleep(wait)
             else:
                 log.error("FCM send failed after 3 attempts: %s", exc)
+
+
+async def notify_fcm_file_push(file_id: str, filename: str) -> None:
+    if _firebase_app is None:
+        return
+    try:
+        with open(FCM_TOKEN_FILE) as f:
+            token = f.read().strip()
+    except FileNotFoundError:
+        return
+    message = fb_messaging.Message(
+        notification=fb_messaging.Notification(
+            title="📎 新檔案",
+            body=filename,
+        ),
+        data={
+            "type": "file_push",
+            "file_id": file_id,
+            "filename": filename,
+            "deep_link": "bridge://inbox",
+        },
+        token=token,
+    )
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, fb_messaging.send, message)
+        log.info("FCM file_push notification sent: %s", filename)
+    except Exception as exc:
+        log.warning("FCM file_push notify failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1860,7 +1927,14 @@ async def handler(ws: ServerConnection) -> None:
         await replay_offline_buffers(ws, _SESSIONS.values())
         _spawn_task(f"unread-snapshot:connect:{client.client_id}", _send_unread_snapshot_deferred(ws, client))
         # Re-deliver any file pushes that were broadcast before this client connected
+        device_id = client.device_id or ""
+        _reconnect_now = time.time()
         for fid, entry in list(_PUSH_FILE_REGISTRY.items()):
+            if _reconnect_now - entry.get("pushed_at", 0) > _INBOX_TTL_SECONDS:
+                continue
+            acked = set(entry.get("acked_device_ids") or [])
+            if device_id and device_id in acked:
+                continue
             payload: dict = {
                 "type": "file_push",
                 "file_id": fid,
@@ -1874,7 +1948,10 @@ async def handler(ws: ServerConnection) -> None:
                 payload["url"] = entry["url"]
             else:
                 continue
-            await ws.send(json.dumps(payload))
+            try:
+                await ws.send(json.dumps(payload))
+            except Exception:
+                break
     except Exception:
         pass
 
@@ -2046,6 +2123,36 @@ async def handler(ws: ServerConnection) -> None:
                 _clear_pairing()
                 log.info("Bridge unclaimed")
                 await ws.send(json.dumps({"type": "unclaim_ack", "is_locked": False}))
+                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                continue
+
+            if mtype == "get_inbox":
+                _inbox_conn = client_manager.CLIENTS.get(ws)
+                inbox_device_id = (_inbox_conn.device_id if _inbox_conn else "") or ""
+                inbox_now = time.time()
+                inbox_items = []
+                for fid, entry in list(_PUSH_FILE_REGISTRY.items()):
+                    if inbox_now - entry.get("pushed_at", 0) > _INBOX_TTL_SECONDS:
+                        continue
+                    acked = set(entry.get("acked_device_ids") or [])
+                    if inbox_device_id and inbox_device_id in acked:
+                        continue
+                    item = {
+                        "file_id": fid,
+                        "filename": entry["filename"],
+                        "size": entry["size"],
+                        "mime_type": entry["mime_type"],
+                        "pushed_at": entry.get("pushed_at", 0),
+                    }
+                    if "data" in entry:
+                        item["data"] = entry["data"]
+                    elif "url" in entry:
+                        item["url"] = entry["url"]
+                    inbox_items.append(item)
+                try:
+                    await ws.send(json.dumps({"type": "inbox_list", "items": inbox_items}))
+                except Exception:
+                    pass
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
 
@@ -2325,6 +2432,7 @@ async def main(port: int, tunnel: bool = False,
     except Exception:
         pass
     init_firebase()
+    _load_inbox()
     _migrate_codex_saved_sessions()
     _restore_sessions_from_disk()
     _apply_session_meta()
