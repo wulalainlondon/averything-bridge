@@ -40,6 +40,9 @@ _CODEX_WRAPPER_CLOSED_RE = re.compile(
     r"<(turn_aborted)>.*?</\1>",
     re.IGNORECASE | re.DOTALL,
 )
+# Errors that mean the Codex thread no longer exists on the server side
+# (e.g. app-server restarted). Detected here so we can respawn silently.
+_STALE_THREAD_RE = re.compile(r"Unknown session", re.IGNORECASE)
 
 
 @dataclass
@@ -62,9 +65,11 @@ class CodexAppServerBackend(Backend):
     """Persistent Codex app-server backend — one process, per-session threads."""
 
     def __init__(self, codex_bin: str,
-                 broadcast_fn: "Callable[[dict], Coroutine] | None" = None):
+                 broadcast_fn: "Callable[[dict], Coroutine] | None" = None,
+                 notify_fcm_fn: "Callable[[str, str, str], Coroutine] | None" = None):
         self._codex_bin = codex_bin
         self._broadcast_fn = broadcast_fn
+        self._notify_fcm_fn = notify_fcm_fn
         self._codex_home = os.path.expanduser("~/.codex")
         self._native_sessions_root = os.path.join(self._codex_home, "sessions")
         self._native_session_index_path = os.path.join(self._codex_home, "session_index.jsonl")
@@ -393,11 +398,27 @@ class CodexAppServerBackend(Backend):
     async def _run_turn(self, session: "Session", state: _AppServerState,
                         user_input: list[dict]) -> None:
         try:
-            await self._rpc("turn/start", {
-                "threadId": state.thread_id,
-                "input": user_input,
-                "approvalPolicy": "never",
-            }, timeout=30.0)
+            try:
+                await self._rpc("turn/start", {
+                    "threadId": state.thread_id,
+                    "input": user_input,
+                    "approvalPolicy": "never",
+                }, timeout=30.0)
+            except RuntimeError as rpc_exc:
+                if not _STALE_THREAD_RE.search(str(rpc_exc)):
+                    raise
+                # turn/start rejected the thread (Codex restarted between spawn and send).
+                # Respawn silently and retry once — the user sees no error.
+                log.warning("[codex-appserver] stale thread on turn/start session=%s, respawning",
+                            session.session_id[:8])
+                self._thread_to_session.pop(state.thread_id or "", None)
+                state.thread_id = None
+                await self.spawn(session)
+                await self._rpc("turn/start", {
+                    "threadId": state.thread_id,
+                    "input": user_input,
+                    "approvalPolicy": "never",
+                }, timeout=30.0)
 
             # Wait until turn completes or timeout.
             try:
@@ -405,13 +426,39 @@ class CodexAppServerBackend(Backend):
             except asyncio.TimeoutError:
                 state.turn_error = "Codex turn timed out after 6000s"
 
+            # Stale-thread error via notification path (no id, routed through _dispatch).
+            # Respawn and retry once rather than surfacing a confusing error to the user.
+            if state.turn_error and _STALE_THREAD_RE.search(state.turn_error) and not session.is_stopping:
+                log.warning("[codex-appserver] stale thread (notification) session=%s, respawning: %s",
+                            session.session_id[:8], state.turn_error)
+                self._thread_to_session.pop(state.thread_id or "", None)
+                state.thread_id = None
+                state.turn_error = None
+                state.turn_done_event.clear()
+                state.turn_active = True
+                await self.spawn(session)
+                await self._rpc("turn/start", {
+                    "threadId": state.thread_id,
+                    "input": user_input,
+                    "approvalPolicy": "never",
+                }, timeout=30.0)
+                try:
+                    await asyncio.wait_for(state.turn_done_event.wait(), timeout=6000.0)
+                except asyncio.TimeoutError:
+                    state.turn_error = "Codex turn timed out after 6000s"
+
             if session.is_stopping:
                 await send_event(session, _evt_stopped())
             elif state.turn_error:
                 log.warning("[codex-appserver] turn error: %s", state.turn_error)
                 await send_event(session, _evt_error(state.turn_error, "turn_error"))
             else:
+                if self._notify_fcm_fn is not None:
+                    asyncio.create_task(
+                        self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id)
+                    )
                 await send_event(session, _evt_done())
+                session.accumulated_text = ""
                 if (session.context_max
                         and session.context_used >= int(session.context_max * _COMPACT_THRESHOLD)
                         and state.thread_id):
