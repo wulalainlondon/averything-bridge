@@ -617,7 +617,11 @@ def _get_or_create_backend(name: str) -> "Backend":
         if not CODEX_BIN:
             CODEX_BIN = _find_codex_bin()
         from backends.codex_appserver import CodexAppServerBackend
-        backend = CodexAppServerBackend(codex_bin=CODEX_BIN, broadcast_fn=_broadcast_json)
+        backend = CodexAppServerBackend(
+            codex_bin=CODEX_BIN,
+            broadcast_fn=_broadcast_json,
+            notify_fcm_fn=notify_fcm,
+        )
     elif backend_name == "ollama":
         from backends.ollama import OllamaBackend
         backend = OllamaBackend(model=_DEFAULT_OLLAMA_MODEL, host=_OLLAMA_HOST)
@@ -1028,17 +1032,19 @@ async def notify_fcm(session_name: str, last_text: str, session_id: str = "") ->
         log.warning("No FCM token on file — skipping notification")
         return
 
-    # Extract first meaningful line, strip markdown markers
+    # Extract a concise first sentence for notification body.
     import re as _re
-    clean = _re.sub(r'[*`#_~>]+', '', last_text).strip()
+    clean = _re.sub(r'[*`#_~>]+', '', last_text)
+    clean = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean)  # markdown links
+    clean = _re.sub(r'\s+', ' ', clean).strip()
     summary = ""
-    for line in clean.splitlines():
-        line = line.strip()
-        if line:
-            summary = line[:160]
-            break
+    sentence_parts = _re.split(r'(?<=[。！？!?\.])\s+', clean, maxsplit=1)
+    if sentence_parts:
+        summary = sentence_parts[0].strip()
     if not summary:
-        summary = clean[:160]
+        summary = clean
+    if len(summary) > 120:
+        summary = summary[:120].rstrip() + "…"
 
     message = fb_messaging.Message(
         notification=fb_messaging.Notification(
@@ -2017,7 +2023,8 @@ async def handler(ws: ServerConnection) -> None:
                     await ws.send(json.dumps(_msg_error("Bridge already claimed by another device")))
                     _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                     continue
-                _PAIRING = {"paired_token": token, "paired_device_id": device_id, "paired_at": int(time.time())}
+                _PAIRING.clear()
+                _PAIRING.update({"paired_token": token, "paired_device_id": device_id, "paired_at": int(time.time())})
                 _save_pairing(_PAIRING)
                 log.info("Bridge claimed by device_id=%s", device_id)
                 await ws.send(json.dumps({"type": "claim_ack", "is_locked": True, "locked_to_me": True}))
@@ -2031,7 +2038,7 @@ async def handler(ws: ServerConnection) -> None:
                     await ws.send(json.dumps(_msg_error("Unauthorized: token mismatch")))
                     _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                     continue
-                _PAIRING = {}
+                _PAIRING.clear()
                 _clear_pairing()
                 log.info("Bridge unclaimed")
                 await ws.send(json.dumps({"type": "unclaim_ack", "is_locked": False}))

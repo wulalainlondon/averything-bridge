@@ -119,6 +119,9 @@ bash install.sh
 
 This installs a launchd agent so the bridge starts automatically on login and restarts if it crashes.
 
+Before each release/update, run the mandatory gate checklist:
+- [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)
+
 Windows (Task Scheduler):
 
 ```powershell

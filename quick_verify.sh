@@ -87,6 +87,11 @@ venv/bin/python -m pytest tests/ -q --tb=short 2>&1 | tail -3
 pass_line=$(venv/bin/python -m pytest tests/ -q --tb=short 2>&1 | grep -E "passed")
 [[ "$pass_line" == *"passed"* ]] && ok "pytest: $pass_line" || fail "pytest: $pass_line"
 
+# 7. Guard: bridge_v2.py must compile (prevents global/local regressions)
+venv/bin/python -m py_compile bridge_v2.py >/dev/null 2>&1 \
+  && ok "guard: bridge_v2.py py_compile ok" \
+  || fail "guard: bridge_v2.py py_compile failed"
+
 echo ""
 echo "Result: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

@@ -38,6 +38,14 @@ CHECK_SCRIPT="$BRIDGE_DIR/bridge_healthcheck.py"
 
 export BRIDGE_DISABLE_MDNS="${BRIDGE_DISABLE_MDNS:-1}"
 
+preflight_check() {
+  if ! "$PYTHON_BIN" -m py_compile "$BRIDGE_DIR/bridge_v2.py" 2>>"$ERR_FILE_INST"; then
+    echo "[supervisor:$NAME] preflight failed: bridge_v2.py has syntax errors"
+    return 1
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # cleanup() — kill child and remove lock on exit
 # ---------------------------------------------------------------------------
@@ -154,6 +162,13 @@ wait_for_port_free() {
 # Main spawn + monitor loop
 # ---------------------------------------------------------------------------
 while true; do
+  if ! preflight_check; then
+    sleep "$BACKOFF"
+    BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
+    (( RETRY_COUNT++ ))
+    continue
+  fi
+
   # Enforce maximum consecutive restart limit.
   if (( RETRY_COUNT >= MAX_RETRIES )); then
     echo "[supervisor:$NAME] reached max restarts ($MAX_RETRIES), sleeping 60s before resetting counter"
