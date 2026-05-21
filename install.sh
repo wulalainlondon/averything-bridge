@@ -11,6 +11,35 @@ SERVICE_TARGET="gui/$(id -u)/$SERVICE_LABEL"
 DOMAIN_TARGET="gui/$(id -u)"
 
 # ============================================================================
+# Evict any legacy bridge labels that are NOT the current SERVICE_LABEL.
+#
+# Why: SERVICE_LABEL is configurable via BRIDGE_SERVICE_LABEL.  When it
+# changes (e.g. com.claude-bridge.app → com.wulala.claude-bridge) the new
+# plist is created but the old one is never removed.  Both have KeepAlive=true
+# so both supervisors stay alive and fight for the same port.  We clean up
+# all known historical labels here, before the pre-flight check, so we can
+# never end up with two supervisors.
+# ============================================================================
+_LEGACY_LABELS=(
+  "com.claude-bridge.app"
+  "com.wulala.claude-bridge"
+)
+for _legacy in "${_LEGACY_LABELS[@]}"; do
+  [[ "$_legacy" == "$SERVICE_LABEL" ]] && continue
+  _legacy_target="gui/$(id -u)/$_legacy"
+  _legacy_plist="$LAUNCH_AGENTS/$_legacy.plist"
+  if launchctl print "$_legacy_target" >/dev/null 2>&1; then
+    echo "[install] Evicting legacy bridge service: $_legacy"
+    launchctl bootout "$_legacy_target" 2>/dev/null || true
+    sleep 1
+  fi
+  if [[ -f "$_legacy_plist" ]]; then
+    echo "[install] Removing legacy plist: $_legacy_plist"
+    rm -f "$_legacy_plist"
+  fi
+done
+
+# ============================================================================
 # Pre-flight: refuse to run from inside the bridge's own process tree.
 #
 # Why: install.sh ultimately restarts the bridge service.  If launched from a
