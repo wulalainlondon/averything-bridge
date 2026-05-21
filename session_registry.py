@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections import deque
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any, Deque, Optional
 
 from utils.uuid_helper import is_valid_uuid
+
+log = logging.getLogger(__name__)
 
 
 DEFAULT_CWD = os.path.expanduser(os.environ.get("BRIDGE_DEFAULT_CWD", "") or "~")
@@ -265,6 +268,7 @@ def restore_sessions_from_disk(
     normalize_backend: Callable[[str | None], str],
     log_info: Callable[..., None] | None = None,
     log_warning: Callable[..., None] | None = None,
+    root_dir: str = "",
 ) -> int:
     """Load saved_sessions.json into sessions so sessions survive bridge restarts."""
     from auto_register import prune_old_saved_sessions
@@ -297,11 +301,22 @@ def restore_sessions_from_disk(
             continue
         try:
             saved_last_used = float(data.get("last_used") or time.time())
+            cwd = os.path.expanduser(data.get("cwd") or default_cwd)
+            if root_dir:
+                from utils.path_jail import is_inside_jail
+                real_cwd = os.path.realpath(cwd)
+                real_root = os.path.realpath(root_dir)
+                if not is_inside_jail(real_cwd, real_root):
+                    log.warning(
+                        "[jail] Dropping restored session %s: cwd=%r outside root=%r",
+                        sid, cwd, root_dir,
+                    )
+                    continue
             session = Session(
                 session_id=sid,
                 name=data.get("name", sid[:8]),
                 created_at=saved_last_used,
-                cwd=os.path.expanduser(data.get("cwd") or default_cwd),
+                cwd=cwd,
                 backend_name=normalize_backend(data.get("backend")),
                 model=str(data.get("model") or ""),
                 sandbox=str(data.get("sandbox") or "danger-full-access"),

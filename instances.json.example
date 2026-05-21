@@ -1,0 +1,22 @@
+{
+  "instances": [
+    {
+      "name": "work",
+      "port": 8766,
+      "data_dir": "~/.bridge-instances/work",
+      "root_dir": "/Users/YOURNAME/work"
+    },
+    {
+      "name": "home",
+      "port": 8767,
+      "data_dir": "~/.bridge-instances/home",
+      "root_dir": "/Users/YOURNAME/home"
+    },
+    {
+      "name": "shared",
+      "port": 8768,
+      "data_dir": "~/.bridge-instances/shared",
+      "root_dir": ""
+    }
+  ]
+}

@@ -1,12 +1,16 @@
 """Session lifecycle WebSocket routes."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
 from typing import Any
 
 from route_utils import safe_send_json
+from utils.path_jail import resolve_jailed, JailEscape
+
+log = logging.getLogger(__name__)
 
 
 async def handle_session_message(
@@ -21,11 +25,27 @@ async def handle_session_message(
         sid = msg["session_id"]
         name = msg["name"]
         cwd = os.path.expanduser(msg.get("cwd") or ctx.default_cwd)
+        root_dir = ctx.get("root_dir", "") if isinstance(ctx, dict) else getattr(ctx, "root_dir", "")
+        try:
+            cwd = resolve_jailed(cwd, root_dir)
+        except JailEscape as e:
+            await safe_send_json(ws, ctx.msg_error(f"Path outside instance root: {e.req_path}"))
+            log.warning("[jail] new_session escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
+            return True
         resume_claude_id = msg.get("resume_claude_id", "")
         backend_name = ctx.normalize_backend_name(msg.get("backend"))
         effort = msg.get("effort", "")
         sandbox = str(msg.get("sandbox") or "danger-full-access")
         image_dir = str(msg.get("image_dir") or "")
+        if image_dir:
+            _root_dir = ctx.get("root_dir", "") if isinstance(ctx, dict) else getattr(ctx, "root_dir", "")
+            if _root_dir:
+                try:
+                    image_dir = resolve_jailed(image_dir, _root_dir)
+                except JailEscape as e:
+                    await safe_send_json(ws, ctx.msg_error(f"image_dir outside instance root: {e.req_path}"))
+                    log.warning("[jail] new_session image_dir escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
+                    return True
 
         async with ctx.sessions_lock:
             if sid in ctx.sessions:
@@ -202,6 +222,15 @@ async def handle_session_message(
         requested_sandbox = str(msg.get("sandbox") or "")
         target_sandbox = requested_sandbox or source.sandbox or "danger-full-access"
         target_image_dir = str(msg.get("image_dir") or source.image_dir or "")
+        if target_image_dir:
+            _root_dir = ctx.get("root_dir", "") if isinstance(ctx, dict) else getattr(ctx, "root_dir", "")
+            if _root_dir:
+                try:
+                    target_image_dir = resolve_jailed(target_image_dir, _root_dir)
+                except JailEscape as e:
+                    await safe_send_json(ws, ctx.msg_error(f"image_dir outside instance root: {e.req_path}", sid))
+                    log.warning("[jail] switch_session_config image_dir escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
+                    return True
         if requested_sandbox:
             await ctx.send_event(source, ctx.evt_session_warning(
                 f"Sandbox change requested ({requested_sandbox}) — will apply by creating a new session."

@@ -69,8 +69,39 @@ rsync -a --delete \
   --exclude 'search.db-shm' \
   --exclude 'search.db-wal' \
   --exclude 'launchd-wrapper.log' \
+  --exclude 'instances.json' \
   "$SRC_DIR/" "$RUNTIME_DIR/"
 cd "$RUNTIME_DIR"
+
+# ============================================================================
+# Bootstrap instances.json — create on first install/upgrade; never overwrite.
+# ============================================================================
+INSTANCES_CONFIG="$RUNTIME_DIR/instances.json"
+if [[ ! -f "$INSTANCES_CONFIG" ]]; then
+  if [[ -f "$RUNTIME_DIR/saved_sessions.json" ]]; then
+    # Upgrading from single-instance: auto-generate default instance config
+    echo "[install] Detected existing single-instance state. Generating default instances.json..."
+    cat > "$INSTANCES_CONFIG" <<EOF
+{
+  "instances": [
+    {
+      "name": "default",
+      "port": 8766,
+      "data_dir": "$RUNTIME_DIR",
+      "root_dir": ""
+    }
+  ]
+}
+EOF
+    echo "[install] Generated $INSTANCES_CONFIG with single default instance (port 8766, data_dir=$RUNTIME_DIR)"
+  else
+    # Fresh install: copy example
+    cp "$RUNTIME_DIR/instances.json.example" "$INSTANCES_CONFIG"
+    echo "[install] Created $INSTANCES_CONFIG from example."
+    echo "[install]    Edit it to configure your instances, then re-run install.sh."
+    echo "[install]    At minimum, update 'root_dir' values to real paths."
+  fi
+fi
 
 # ============================================================================
 # Setup venv.  Only --force-reinstall when requirements.txt actually changed.
@@ -98,7 +129,7 @@ else
   pip install -r requirements.txt --quiet
 fi
 
-chmod +x run_bridge.sh bridge_supervisor.sh bridge_healthcheck.py bridge_launch.sh
+chmod +x run_bridge.sh bridge_supervisor.sh supervisor_instance.sh bridge_healthcheck.py bridge_launch.sh
 
 # ============================================================================
 # Write plist into a temp path; only swap if content actually differs.
@@ -131,7 +162,7 @@ cat > "$PLIST_TMP" <<PLIST
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$HOME</string>
-    <key>BRIDGE_PORT</key><string>8766</string>
+    <key>BRIDGE_INSTANCES_CONFIG</key><string>$RUNTIME_DIR/instances.json</string>
     <key>BRIDGE_DISABLE_MDNS</key><string>1</string>
   </dict>
   <key>SoftResourceLimits</key>
@@ -202,27 +233,54 @@ else
 fi
 
 # ============================================================================
-# Wait for bridge to come back up.
+# Wait for bridge instances to come back up.
+# Reads instances.json for the authoritative port list; falls back to port
+# 8766 only if parsing fails (e.g. fresh example config not yet edited).
 # ============================================================================
-echo "==> Waiting for bridge to become healthy..."
-HEALTHY=false
-for i in {1..20}; do
-  sleep 0.5
-  if "$RUNTIME_DIR/venv/bin/python" "$RUNTIME_DIR/bridge_healthcheck.py" \
-       --host 127.0.0.1 --port 8766 --timeout 1 2>/dev/null; then
-    HEALTHY=true
-    break
-  fi
-done
+echo "==> Waiting for bridge instances to start..."
+UNHEALTHY=0
 
-if [[ "$HEALTHY" == "true" ]]; then
-  echo "Bridge is healthy on :8766"
-else
-  echo "WARNING: Bridge did not pass healthcheck within 10s." >&2
-  echo "  Check logs:" >&2
-  echo "    /tmp/$SERVICE_LABEL.stderr.log" >&2
-  echo "    /tmp/$SERVICE_LABEL.stdout.log" >&2
-  echo "    $RUNTIME_DIR/bridge_v2.log" >&2
+# Parse instances.json into name|port lines; on failure emit a sentinel.
+INSTANCES_LIST="$(python3 -c "
+import json, sys
+try:
+    data = json.load(open('$RUNTIME_DIR/instances.json'))
+    for inst in data['instances']:
+        print(f\"{inst['name']}|{inst['port']}|\")
+except Exception as e:
+    print(f'ERROR|0|{e}', file=sys.stderr)
+" 2>/dev/null)" || true
+
+if [[ -z "$INSTANCES_LIST" ]]; then
+  # Fallback: instances.json unreadable — check port 8766 only
+  echo "[install] Could not parse instances.json; falling back to port 8766 healthcheck"
+  INSTANCES_LIST="default|8766|"
+fi
+
+while IFS='|' read -r name port _rest; do
+  [[ -z "$name" || "$name" == "ERROR" ]] && continue
+  # Wait up to 10 s (20 x 0.5 s) for this instance to become healthy
+  for i in {1..20}; do
+    sleep 0.5
+    if "$RUNTIME_DIR/venv/bin/python" "$RUNTIME_DIR/bridge_healthcheck.py" \
+         --host 127.0.0.1 --port "$port" --timeout 1 2>/dev/null; then
+      echo "[install] instance '$name' is healthy on :$port"
+      break
+    fi
+  done
+  # Final verdict check
+  if ! "$RUNTIME_DIR/venv/bin/python" "$RUNTIME_DIR/bridge_healthcheck.py" \
+       --host 127.0.0.1 --port "$port" --timeout 1 2>/dev/null; then
+    echo "WARNING: instance '$name' on port $port did not pass healthcheck within 10s." >&2
+    echo "  Check logs:" >&2
+    echo "    /tmp/$SERVICE_LABEL.stderr.log" >&2
+    echo "    /tmp/$SERVICE_LABEL.stdout.log" >&2
+    echo "    $RUNTIME_DIR/instances/$name/bridge.log" >&2
+    UNHEALTHY=1
+  fi
+done <<< "$INSTANCES_LIST"
+
+if (( UNHEALTHY )); then
   exit 1
 fi
 

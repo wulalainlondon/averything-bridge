@@ -136,6 +136,26 @@ READ_CURSOR_FILE      = os.path.join(BRIDGE_DIR, "read_cursors.json")
 CLAUDE_PROJECTS_DIR   = str(Path.home() / ".claude" / "projects")
 PAIRING_FILE          = os.path.join(BRIDGE_DIR, "pairing.json")
 
+_DATA_DIR: str = ""  # set by _init_paths() in main()
+_ROOT_DIR: str = ""  # set in main(); "" means no jail
+_INSTANCE_NAME: str = ""  # set in main(); from --instance-name or BRIDGE_INSTANCE_NAME env
+
+
+def _init_paths(data_dir: str) -> None:
+    global LOG_FILE, FCM_TOKEN_FILE, SERVICE_ACCOUNT_FILE, \
+           SAVED_SESSIONS_FILE, CODEX_SAVED_SESSIONS_FILE, \
+           SESSION_META_FILE, READ_CURSOR_FILE, PAIRING_FILE, _DATA_DIR
+    _DATA_DIR = data_dir
+    os.makedirs(data_dir, exist_ok=True)
+    LOG_FILE                  = os.path.join(data_dir, "bridge_v2.log")
+    FCM_TOKEN_FILE            = os.path.join(data_dir, "fcm_token.txt")
+    SERVICE_ACCOUNT_FILE      = os.path.join(data_dir, "serviceAccountKey.json")
+    SAVED_SESSIONS_FILE       = os.path.join(data_dir, "saved_sessions.json")
+    CODEX_SAVED_SESSIONS_FILE = os.path.join(data_dir, "saved_sessions_codex.json")
+    SESSION_META_FILE         = os.path.join(data_dir, "session_meta.json")
+    READ_CURSOR_FILE          = os.path.join(data_dir, "read_cursors.json")
+    PAIRING_FILE              = os.path.join(data_dir, "pairing.json")
+
 
 def _load_pairing() -> dict:
     try:
@@ -157,7 +177,7 @@ def _clear_pairing() -> None:
         pass
 
 
-_PAIRING: dict = _load_pairing()
+_PAIRING: dict = {}
 
 
 def _find_claude_bin() -> str:
@@ -243,14 +263,6 @@ def _detect_tailscale_ip() -> "str | None":
         return None
 
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 log = logging.getLogger("bridge_v2")
 logging.getLogger("watchdog").setLevel(logging.INFO)
 logging.getLogger("fsevents").setLevel(logging.INFO)
@@ -821,6 +833,17 @@ _PUSH_INLINE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
 async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> None:
+    if _ROOT_DIR:
+        from utils.path_jail import resolve_jailed, JailEscape
+        try:
+            path = resolve_jailed(path, _ROOT_DIR)
+        except JailEscape as e:
+            log.warning("[jail] push_file escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
+            try:
+                await ws.send(json.dumps({"type": "error", "message": f"Path outside instance root: {e.req_path}"}))
+            except Exception:
+                pass
+            return
     expanded = os.path.expanduser(path)
     if not os.path.isfile(expanded):
         try:
@@ -1069,6 +1092,7 @@ def _restore_sessions_from_disk() -> None:
         normalize_backend=_normalize_backend_name,
         log_info=log.info,
         log_warning=log.warning,
+        root_dir=_ROOT_DIR,
     )
 
 
@@ -1811,6 +1835,9 @@ async def handler(ws: ServerConnection) -> None:
             "device_name": client.device_name,
             "is_locked": bool(_paired_token),
             "locked_to_me": bool(_paired_token) and _paired_token == _provided_token,
+            "instance_name": _INSTANCE_NAME,
+            "root_dir": _ROOT_DIR,
+            "data_dir": _DATA_DIR,
         }))
         await ws.send(json.dumps(build_sessions_list()))
 
@@ -1855,6 +1882,7 @@ async def handler(ws: ServerConnection) -> None:
             "max_shells": MAX_SHELLS,
             "session_backend": _session_backend,
             "shell_cls": ShellSession,
+            "root_dir": _ROOT_DIR,
             "shell_reader": _shell_reader,
             "msg_error": _msg_error,
             "msg_shell_created": _msg_shell_created,
@@ -1871,6 +1899,7 @@ async def handler(ws: ServerConnection) -> None:
             "msg_dir_listing": _msg_dir_listing,
             "fcm_token_file": FCM_TOKEN_FILE,
             "log": log,
+            "root_dir": _ROOT_DIR,
         }
         router_ctx = RouterContext(
             sessions=_SESSIONS,
@@ -1923,6 +1952,10 @@ async def handler(ws: ServerConnection) -> None:
             get_search_worker=get_worker,
             strip_turn_aborted_notice=_strip_turn_aborted_notice,
             log_prompt_lifecycle=_log_prompt_lifecycle,
+            root_dir=_ROOT_DIR,
+            data_dir=_DATA_DIR,
+            instance_name=_INSTANCE_NAME,
+            pairing=_PAIRING,
         )
         async for raw in ws:
             _mark_client_activity()
@@ -1962,6 +1995,9 @@ async def handler(ws: ServerConnection) -> None:
                     "device_name": client.device_name,
                     "is_locked": bool(_paired_token),
                     "locked_to_me": bool(_paired_token) and _paired_token == _provided_token,
+                    "instance_name": _INSTANCE_NAME,
+                    "root_dir": _ROOT_DIR,
+                    "data_dir": _DATA_DIR,
                 }))
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
@@ -2085,6 +2121,15 @@ async def _media_request_handler(connection, request):
     if ext not in _ALLOWED_MEDIA_EXTS:
         return connection.respond(http.HTTPStatus.FORBIDDEN, "Forbidden\n")
     real_path = os.path.realpath(file_path)
+    if _ROOT_DIR:
+        from utils.path_jail import resolve_jailed, JailEscape
+        try:
+            resolve_jailed(file_path, _ROOT_DIR)
+        except JailEscape:
+            return connection.respond(
+                http.HTTPStatus.FORBIDDEN,
+                json.dumps({"error": "path outside instance root"}) + "\n",
+            )
     if not os.path.isfile(real_path):
         return connection.respond(http.HTTPStatus.NOT_FOUND, "Not found\n")
     try:
@@ -2203,8 +2248,48 @@ async def main(port: int, tunnel: bool = False,
                backend_name: str = "claude", model: str = "",
                ollama_host: str = "http://localhost:11434",
                discovery_port: int = 8767,
-               no_discovery: bool = False) -> None:
+               no_discovery: bool = False,
+               data_dir: str = "",
+               root_dir: str = "",
+               instance_name: str = "") -> None:
     global CLAUDE_BIN, CODEX_BIN, BUN_BIN, _DEFAULT_BACKEND_NAME, _DEFAULT_OLLAMA_MODEL, _OLLAMA_HOST, _PERMISSION_MANAGER
+
+    resolved_data_dir = (
+        os.path.realpath(os.path.expanduser(data_dir))
+        if data_dir
+        else os.environ.get("BRIDGE_DATA_DIR", "") or BRIDGE_DIR
+    )
+    _init_paths(resolved_data_dir)
+
+    global _PAIRING
+    _PAIRING = _load_pairing()
+
+    # Re-configure root logger to write to the correct data_dir log file
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+    global _ROOT_DIR
+    if root_dir:
+        _ROOT_DIR = os.path.realpath(os.path.expanduser(root_dir))
+        if not os.path.isdir(_ROOT_DIR):
+            print(f"[bridge] ERROR: --root-dir {root_dir!r} does not exist or is not a directory", file=sys.stderr)
+            sys.exit(1)
+        log.info("[bridge] root_dir=%s", _ROOT_DIR)
+    else:
+        _ROOT_DIR = os.environ.get("BRIDGE_ROOT_DIR", "")
+        if _ROOT_DIR:
+            _ROOT_DIR = os.path.realpath(os.path.expanduser(_ROOT_DIR))
+
+    global _INSTANCE_NAME
+    _INSTANCE_NAME = instance_name or os.environ.get("BRIDGE_INSTANCE_NAME", "")
 
     _DEFAULT_BACKEND_NAME = _normalize_backend_name(backend_name)
     _DEFAULT_OLLAMA_MODEL = model or "llama3.2"
@@ -2314,6 +2399,12 @@ if __name__ == "__main__":
                         help="UDP port for LAN discovery broadcasts (default: 8767)")
     parser.add_argument("--no-discovery", action="store_true",
                         help="Disable UDP LAN discovery broadcasts")
+    parser.add_argument("--data-dir", default="",
+                        help="Per-instance data directory for persistence files (default: bridge source dir)")
+    parser.add_argument("--root-dir", default="",
+                        help="Filesystem jail root; user-provided paths cannot escape this directory (default: no jail)")
+    parser.add_argument("--instance-name", default="",
+                        help="Instance name for identification in hello_ack (default: empty)")
     args = parser.parse_args()
     asyncio.run(main(
         args.port,
@@ -2323,4 +2414,7 @@ if __name__ == "__main__":
         ollama_host=args.ollama_host,
         discovery_port=args.discovery_port,
         no_discovery=args.no_discovery,
+        data_dir=args.data_dir,
+        root_dir=args.root_dir,
+        instance_name=args.instance_name,
     ))

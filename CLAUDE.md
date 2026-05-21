@@ -222,6 +222,19 @@ Sessions restored on: startup via `_restore_sessions_from_disk()`.
 
 ## Network Layer
 
+**`hello_ack` fields** (sent in response to every `hello` message):
+
+| Field | Type | Source |
+|-------|------|--------|
+| `client_id` | str | assigned by bridge on connect |
+| `device_id` | str | echoed from client |
+| `device_name` | str | echoed from client |
+| `is_locked` | bool | pairing state (bridge_v2.py only) |
+| `locked_to_me` | bool | pairing state (bridge_v2.py only) |
+| `instance_name` | str | `--instance-name` flag or `BRIDGE_INSTANCE_NAME` env |
+| `root_dir` | str | filesystem jail root (`""` = no jail) |
+| `data_dir` | str | instance persistence directory |
+
 **mDNS**: `zeroconf` library registers `_bridge._tcp.local.` at startup.
 Clients discover via `bridge.local`. Disabled by `BRIDGE_DISABLE_MDNS=1`.
 

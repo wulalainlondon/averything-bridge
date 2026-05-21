@@ -72,6 +72,14 @@ class RouterContext:
     get_search_worker: Callable[[], Any]
     strip_turn_aborted_notice: Callable[[str], str]
     log_prompt_lifecycle: Callable[..., None]
+    root_dir: str = ""
+    data_dir: str = ""
+    instance_name: str = ""
+    pairing: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.pairing is None:
+            self.pairing = {}
 
 
 async def handle_low_coupling_message(
@@ -101,11 +109,18 @@ async def handle_low_coupling_message(
         if device_name:
             client.device_name = device_name[:128]
         client.last_seen = time.time()
+        _paired_token = str(ctx.pairing.get("paired_token") or "").strip()
+        _provided_token = str(msg.get("auth_token") or "").strip()
         await _safe_send_json(ws, {
             "type": "hello_ack",
             "client_id": client.client_id,
             "device_id": client.device_id,
             "device_name": client.device_name,
+            "is_locked": bool(_paired_token),
+            "locked_to_me": bool(_paired_token) and _paired_token == _provided_token,
+            "instance_name": ctx.instance_name,
+            "root_dir": ctx.root_dir,
+            "data_dir": ctx.data_dir,
         })
         ctx.spawn_task(
             f"unread-snapshot:hello:{client.client_id}",

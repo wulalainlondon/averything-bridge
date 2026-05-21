@@ -3,9 +3,14 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import logging
 import os
 import shutil
 import signal
+
+from utils.path_jail import resolve_jailed, JailEscape
+
+log = logging.getLogger(__name__)
 
 
 async def _collect_processes_async(limit: int = 200) -> list[dict]:
@@ -137,13 +142,25 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
             return True
 
         cwd = msg.get("cwd", os.path.expanduser("~"))
+        root_dir = ctx.get("root_dir", "")
+        try:
+            cwd = resolve_jailed(cwd, root_dir)
+        except JailEscape as e:
+            try:
+                await ws.send(json.dumps(ctx["msg_error"](f"Path outside instance root: {e.req_path}")))
+            except Exception:
+                pass
+            log.warning("[jail] shell_create escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
+            return True
         shell_id = "sh_" + os.urandom(4).hex()
+        _root_dir = ctx.get("root_dir", "")
+        cwd_final = cwd if os.path.isdir(cwd) else (_root_dir if _root_dir and os.path.isdir(_root_dir) else os.path.expanduser("~"))
         proc = await asyncio.create_subprocess_exec(
             *_shell_command(),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=cwd if os.path.isdir(cwd) else os.path.expanduser("~"),
+            cwd=cwd_final,
             env={**os.environ, "TERM": "dumb"},
         )
         shell = ctx["shell_cls"](shell_id=shell_id, proc=proc, ws_ref=ws, cwd=cwd)

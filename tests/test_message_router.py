@@ -291,6 +291,11 @@ def test_router_handles_hello_updates_client_and_sends_ack_unread_snapshot():
         "client_id": "client_a",
         "device_id": "phone",
         "device_name": "Pixel",
+        "is_locked": False,
+        "locked_to_me": False,
+        "instance_name": "",
+        "root_dir": "",
+        "data_dir": "",
     }]
     assert calls["closed_duplicates"] == ["phone"]
     assert calls["unread_snapshot"] == []

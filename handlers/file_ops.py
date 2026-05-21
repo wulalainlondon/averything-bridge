@@ -5,6 +5,8 @@ import logging
 import os
 import time
 
+from utils.path_jail import resolve_jailed, JailEscape
+
 log = logging.getLogger(__name__)
 
 _SESSIONS_CACHE: dict[str, tuple[float, list[dict]]] = {}
@@ -135,7 +137,16 @@ async def _resumable_for_path(path: str, backends: dict, active_uuids: set[str])
 async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
     if mtype == "browse_dir":
         req_path = msg.get("path") or "~"
-        path = os.path.realpath(os.path.expanduser(req_path))
+        root_dir = ctx.get("root_dir", "")
+        try:
+            path = resolve_jailed(req_path, root_dir)
+        except JailEscape as e:
+            try:
+                await ws.send(json.dumps({"type": "error", "text": f"Path outside instance root: {req_path}"}))
+            except Exception:
+                pass
+            log.warning("[jail] browse_dir escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
+            return True
         entries = _list_entries(path)
 
         active_items = _active_sessions_for_path(path, ctx["sessions"])
