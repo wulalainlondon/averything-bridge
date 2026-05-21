@@ -155,6 +155,8 @@ def _init_paths(data_dir: str) -> None:
     SESSION_META_FILE         = os.path.join(data_dir, "session_meta.json")
     READ_CURSOR_FILE          = os.path.join(data_dir, "read_cursors.json")
     PAIRING_FILE              = os.path.join(data_dir, "pairing.json")
+    # Point search index into this instance's data dir so instances don't share search.db
+    os.environ["BRIDGE_SEARCH__INDEX_PATH"] = os.path.join(data_dir, "search.db")
 
 
 def _load_pairing() -> dict:
