@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 
+# App-side mirror: SQLITE_HYDRATE_LIMIT in app/src/config/limits.ts (must stay ≤ DEFAULT_HISTORY_LIMIT)
 DEFAULT_HISTORY_LIMIT = int(os.environ.get("BRIDGE_HISTORY_LIMIT", "100"))
 MAX_HISTORY_LIMIT = int(os.environ.get("BRIDGE_MAX_HISTORY_LIMIT", "10000"))
 HISTORY_INDEX_TTL_SECONDS = float(os.environ.get("BRIDGE_HISTORY_INDEX_TTL_SECONDS", "300"))
