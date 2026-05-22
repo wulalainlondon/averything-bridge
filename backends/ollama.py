@@ -17,7 +17,7 @@ except ImportError:
 
 from .base import Backend
 from .events import (
-    send_event,
+    send_event, emit_done,
     _evt_text_chunk, _evt_done, _evt_error, _evt_stopped,
     _evt_session_warning, _evt_session_closed,
 )
@@ -28,11 +28,13 @@ OLLAMA_HISTORY_CAP = clamp_history_limit(os.environ.get("BRIDGE_OLLAMA_HISTORY_C
 
 
 class OllamaBackend(Backend):
-    def __init__(self, model: str = "llama3.2", host: str = "http://localhost:11434"):
+    def __init__(self, model: str = "llama3.2", host: str = "http://localhost:11434",
+                 notify_fcm_fn=None):
         if not _AIOHTTP_AVAILABLE:
             log.warning("aiohttp not installed — Ollama backend disabled. Run: pip install aiohttp")
         self.model = model
         self.host = host
+        self._notify_fcm_fn = notify_fcm_fn
         self._histories: dict[str, list] = {}  # session_id → message history
 
     async def spawn(self, session) -> None:
@@ -47,6 +49,7 @@ class OllamaBackend(Backend):
 
         if not await self._begin_send(session):
             return
+        session.is_stopping = False
 
         history = self._histories.setdefault(session.session_id, [])
         history.append({
@@ -70,6 +73,8 @@ class OllamaBackend(Backend):
 
                     full_text = ""
                     async for line in resp.content:
+                        if session.is_stopping:
+                            break
                         line = line.strip()
                         if not line:
                             continue
@@ -91,20 +96,31 @@ class OllamaBackend(Backend):
                     if len(history) > OLLAMA_HISTORY_CAP:
                         del history[:-OLLAMA_HISTORY_CAP]
                     session.is_streaming = False
-                    await send_event(session, _evt_done())
+                    if session.is_stopping:
+                        return  # stop() already sent _evt_stopped()
+                    if self._notify_fcm_fn is not None:
+                        asyncio.create_task(self._notify_fcm_fn(
+                            session.name, session.accumulated_text, session.session_id))
+                    await emit_done(session)
 
         except Exception as exc:
             session.is_streaming = False
             await send_event(session, _evt_error(f"Ollama error: {exc}"))
+        finally:
+            session.is_stopping = False
+            session.accumulated_text = ""
 
     async def stop(self, session) -> None:
         session.is_stopping = True
         session.is_streaming = False
+        session.accumulated_text = ""
         await send_event(session, _evt_stopped())
 
     async def clear(self, session) -> None:
         self._histories[session.session_id] = []
         session.is_streaming = False
+        session.is_stopping = False
+        session.accumulated_text = ""
         await send_event(session, _evt_session_warning("History cleared."))
 
     async def close(self, session) -> None:

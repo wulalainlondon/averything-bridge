@@ -16,7 +16,7 @@ from typing import Any, Callable, Coroutine, Optional, TYPE_CHECKING
 from .base import Backend, _StatesMixin
 from utils.uuid_helper import is_valid_uuid
 from .events import (
-    send_event, stream_text, scan_for_media,
+    send_event, stream_text, emit_done,
     _evt_error, _evt_stopped, _evt_done,
     _evt_tool_start, _evt_tool_result, _evt_tool_end, _evt_thinking_chunk,
     _evt_session_warning, _evt_session_died, _evt_session_closed,
@@ -60,6 +60,7 @@ class _ClaudeState:
     stderr_task: Optional[asyncio.Task] = field(default=None, repr=False)
     watch_task: Optional[asyncio.Task] = field(default=None, repr=False)
     timeout_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    tree_poll_task: Optional[asyncio.Task] = field(default=None, repr=False)
     timed_out: bool = False
     spawning: bool = False
     tool_blocks: dict = field(default_factory=dict)
@@ -171,6 +172,10 @@ class ClaudeCliBackend(Backend, _StatesMixin):
             state.timeout_task.cancel()
         state.timeout_task = asyncio.create_task(self._idle_watchdog(session))
 
+        if state.tree_poll_task and not state.tree_poll_task.done():
+            state.tree_poll_task.cancel()
+        state.tree_poll_task = asyncio.create_task(self._agent_tree_poller(session))
+
     async def stop(self, session: "Session") -> None:
         state = self._get_state(session)
 
@@ -197,6 +202,9 @@ class ClaudeCliBackend(Backend, _StatesMixin):
             pass
 
         session.is_streaming = False
+        if state.tree_poll_task and not state.tree_poll_task.done():
+            state.tree_poll_task.cancel()
+            state.tree_poll_task = None
         session.accumulated_text = ""
         state.tool_blocks = {}
         await send_event(session, _evt_stopped())
@@ -213,6 +221,9 @@ class ClaudeCliBackend(Backend, _StatesMixin):
         session.accumulated_text = ""
         state.tool_blocks = {}
         session.is_streaming = False
+        if state.tree_poll_task and not state.tree_poll_task.done():
+            state.tree_poll_task.cancel()
+            state.tree_poll_task = None
 
         if state.proc is not None and state.proc.returncode is None:
             try:
@@ -259,6 +270,13 @@ class ClaudeCliBackend(Backend, _StatesMixin):
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+        if state.tree_poll_task and not state.tree_poll_task.done():
+            state.tree_poll_task.cancel()
+            try:
+                await state.tree_poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Removal from _SESSIONS is the bridge handler's responsibility
         self._states.pop(session.session_id, None)
@@ -574,6 +592,280 @@ console.log(JSON.stringify(data));
             mode=mode,
             before_source_message_id=before_source_message_id,
         )
+
+    def _build_agent_tree_sync(self, resume_id: str) -> dict:
+        _empty = {"resume_id": resume_id, "total_agents": 0, "tree": []}
+        try:
+            main_path = self._find_session_file_sync(resume_id)
+            if not main_path:
+                return _empty
+            subagent_dir = os.path.join(os.path.dirname(main_path), resume_id, "subagents")
+            if not os.path.isdir(subagent_dir):
+                return _empty
+        except Exception:
+            return _empty
+
+        # Step 1: scan all agent-{id}.jsonl files in subagent_dir
+        agents: dict[str, dict] = {}  # agent_id → node dict (without children yet)
+        for entry in os.scandir(subagent_dir):
+            if not entry.name.endswith(".jsonl") or not entry.is_file():
+                continue
+            if not entry.name.startswith("agent-"):
+                continue
+            agent_id = entry.name[len("agent-"):-len(".jsonl")]
+            try:
+                # Read meta
+                meta_path = os.path.join(subagent_dir, f"agent-{agent_id}.meta.json")
+                agent_type = "unknown"
+                try:
+                    with open(meta_path, encoding="utf-8", errors="ignore") as mf:
+                        meta = json.loads(mf.read())
+                        agent_type = meta.get("agentType", "unknown") or "unknown"
+                except Exception:
+                    pass
+
+                # Parse JSONL
+                first_prompt_id: "str | None" = None
+                start_ts: "int | None" = None
+                end_ts: "int | None" = None
+                description = ""
+                tool_calls: list = []
+                output_preview = ""
+                first_user_found = False
+                last_assistant_record: "dict | None" = None
+
+                with open(entry.path, encoding="utf-8", errors="ignore") as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        # start_ts from first record
+                        if start_ts is None:
+                            ts_str = rec.get("timestamp", "")
+                            if ts_str:
+                                try:
+                                    start_ts = int(datetime.datetime.fromisoformat(
+                                        ts_str.replace("Z", "+00:00")
+                                    ).timestamp() * 1000)
+                                except Exception:
+                                    pass
+
+                        # end_ts updated on every record
+                        ts_str = rec.get("timestamp", "")
+                        if ts_str:
+                            try:
+                                end_ts = int(datetime.datetime.fromisoformat(
+                                    ts_str.replace("Z", "+00:00")
+                                ).timestamp() * 1000)
+                            except Exception:
+                                pass
+
+                        rtype = rec.get("type", "")
+
+                        if rtype == "user" and not first_user_found:
+                            first_user_found = True
+                            first_prompt_id = rec.get("promptId")
+                            # description: first 150 chars of first user message content
+                            content = rec.get("message", {}).get("content", "")
+                            text = ""
+                            if isinstance(content, str):
+                                text = content
+                            elif isinstance(content, list):
+                                for blk in content:
+                                    if isinstance(blk, dict) and blk.get("type") == "text":
+                                        text = blk.get("text", "")
+                                        break
+                            description = text[:150]
+
+                        if rtype == "assistant":
+                            last_assistant_record = rec
+                            if len(tool_calls) < 50:
+                                rec_ts_str = rec.get("timestamp", "")
+                                rec_ts: "int | None" = None
+                                if rec_ts_str:
+                                    try:
+                                        rec_ts = int(datetime.datetime.fromisoformat(
+                                            rec_ts_str.replace("Z", "+00:00")
+                                        ).timestamp() * 1000)
+                                    except Exception:
+                                        pass
+                                content = rec.get("message", {}).get("content", [])
+                                if isinstance(content, list):
+                                    for blk in content:
+                                        if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                                            if len(tool_calls) < 50:
+                                                tool_calls.append({
+                                                    "name": blk.get("name", ""),
+                                                    "ts": rec_ts,
+                                                })
+
+                # output_preview: last text block of last assistant record
+                if last_assistant_record is not None:
+                    content = last_assistant_record.get("message", {}).get("content", [])
+                    if isinstance(content, list):
+                        last_text = ""
+                        for blk in content:
+                            if isinstance(blk, dict) and blk.get("type") == "text":
+                                last_text = blk.get("text", "")
+                        output_preview = last_text[:200]
+
+                duration_ms: "int | None" = None
+                if start_ts is not None and end_ts is not None:
+                    duration_ms = end_ts - start_ts
+
+                agents[agent_id] = {
+                    "agent_id": agent_id,
+                    "agent_type": agent_type,
+                    "description": description,
+                    "prompt_id": first_prompt_id,
+                    "parent_agent_id": None,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "duration_ms": duration_ms,
+                    "tool_calls": tool_calls,
+                    "output_preview": output_preview,
+                    "children": [],
+                }
+            except Exception:
+                pass
+
+        if not agents:
+            return _empty
+
+        # Step 2: build main_prompt_ids from main JSONL
+        main_prompt_ids: set = set()
+        try:
+            with open(main_path, encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                        if rec.get("type") == "user":
+                            pid = rec.get("promptId")
+                            if pid:
+                                main_prompt_ids.add(pid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Step 3: build subagent_prompt_ids: promptId → agent_id
+        # For each subagent, scan all its user records' promptIds
+        subagent_prompt_ids: dict[str, str] = {}
+        for agent_id, node in agents.items():
+            agent_jsonl = os.path.join(subagent_dir, f"agent-{agent_id}.jsonl")
+            try:
+                with open(agent_jsonl, encoding="utf-8", errors="ignore") as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                            if rec.get("type") == "user":
+                                pid = rec.get("promptId")
+                                if pid:
+                                    subagent_prompt_ids[pid] = agent_id
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # Step 4: determine parent_agent_id for each agent
+        for agent_id, node in agents.items():
+            fp = node["prompt_id"]
+            if fp is None:
+                node["parent_agent_id"] = None
+            elif fp in main_prompt_ids:
+                node["parent_agent_id"] = None
+            else:
+                parent = subagent_prompt_ids.get(fp)
+                # Avoid self-reference
+                node["parent_agent_id"] = parent if parent and parent != agent_id else None
+
+        # Step 5: build tree recursively
+        root_nodes = []
+        children_map: dict[str, list] = {aid: [] for aid in agents}
+        for agent_id, node in agents.items():
+            p = node["parent_agent_id"]
+            if p is not None and p in children_map:
+                children_map[p].append(agent_id)
+            else:
+                root_nodes.append(agent_id)
+
+        # Iterative BFS build to avoid recursion limit and cycle crashes.
+        built: dict[str, dict] = {}
+        queue = list(root_nodes)
+        visited: set[str] = set()
+        while queue:
+            aid = queue.pop(0)
+            if aid in visited:
+                continue
+            visited.add(aid)
+            node = dict(agents[aid])
+            node["children"] = []
+            built[aid] = node
+            queue.extend(c for c in children_map.get(aid, []) if c not in visited)
+
+        # Attach children in reverse BFS order so parents are populated last.
+        for aid in reversed(list(visited)):
+            node = built[aid]
+            node["children"] = [built[c] for c in children_map.get(aid, []) if c in built]
+
+        tree = [built[aid] for aid in root_nodes if aid in built]
+
+        # Filter to latest conversation turn only.
+        # Re-scan main JSONL for the most recent user message's promptId so
+        # agents from previous turns are excluded.
+        latest_prompt_id: "str | None" = None
+        latest_ts = 0
+        try:
+            with open(main_path, encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    if rec.get("type") == "user" and not rec.get("isSidechain") and rec.get("promptId"):
+                        ts_str = rec.get("timestamp", "")
+                        ts_ms = 0
+                        if ts_str:
+                            try:
+                                ts_ms = int(datetime.datetime.fromisoformat(
+                                    ts_str.replace("Z", "+00:00")
+                                ).timestamp() * 1000)
+                            except Exception:
+                                pass
+                        if ts_ms >= latest_ts:
+                            latest_ts = ts_ms
+                            latest_prompt_id = rec["promptId"]
+        except Exception:
+            pass
+
+        if latest_prompt_id:
+            filtered = [n for n in tree if n.get("prompt_id") == latest_prompt_id]
+            if filtered:
+                tree = filtered
+
+        return {
+            "resume_id": resume_id,
+            "total_agents": len(agents),
+            "tree": tree,
+        }
+
+    async def build_agent_tree(self, resume_id: str) -> dict:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._build_agent_tree_sync, resume_id)
 
     async def warmup_history_cache(self, max_sessions: int = 30) -> None:
         """Bridge 啟動後在背景預建近期 session 的 history index。"""
@@ -925,7 +1217,6 @@ console.log(JSON.stringify(data));
                         if text:
                             session.accumulated_text += text
                             await stream_text(text, session)
-                            await scan_for_media(text, session)
                     elif btype == "tool_use":
                         tool_id = block.get("id", "")
                         name = block.get("name", "")
@@ -948,6 +1239,9 @@ console.log(JSON.stringify(data));
                 subtype = evt.get("subtype", "")
                 new_uuid = evt.get("session_id")
                 session.is_streaming = False
+                if state.tree_poll_task and not state.tree_poll_task.done():
+                    state.tree_poll_task.cancel()
+                    state.tree_poll_task = None
                 if subtype == "success":
                     usage = evt.get("usage", {})
                     # context_used = actual context window occupied = new input + cache creation.
@@ -980,8 +1274,7 @@ console.log(JSON.stringify(data));
                                 pass
                     if self._notify_fcm_fn is not None:
                         asyncio.create_task(self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id))
-                    await send_event(session, _evt_done())
-                    session.accumulated_text = ""
+                    await emit_done(session)
                     state.tool_blocks = {}
 
                     # Auto-compact: if context exceeds threshold and compact not already running,
@@ -1111,6 +1404,9 @@ console.log(JSON.stringify(data));
             state.tool_blocks = {}
             if state.timeout_task and not state.timeout_task.done():
                 state.timeout_task.cancel()
+            if state.tree_poll_task and not state.tree_poll_task.done():
+                state.tree_poll_task.cancel()
+                state.tree_poll_task = None
             await send_event(session, _evt_error(
                 f"Claude process exited (rc={rc}); current response was stopped.",
                 "process_exited",
@@ -1173,6 +1469,41 @@ console.log(JSON.stringify(data));
                 f"Claude process exited (rc={rc}) and will not restart."
             ))
 
+    async def _agent_tree_poller(self, session: "Session") -> None:
+        await asyncio.sleep(3)  # 初始延遲，等 subagent 有機會出現
+        last_fingerprint: tuple = (-1, -1)  # (total_agents, completed_count)
+        while session.is_streaming:
+            try:
+                if session.resume_id:
+                    loop = asyncio.get_event_loop()
+                    tree_data = await loop.run_in_executor(
+                        None, self._build_agent_tree_sync, session.resume_id
+                    )
+                    total = tree_data.get("total_agents", 0)
+                    if total > 0:
+                        # 計算「已完成的 agent 數」作為指紋，有變化才推送
+                        def _count_done(nodes: list) -> int:
+                            cnt = 0
+                            for n in nodes:
+                                if n.get("end_ts") is not None:
+                                    cnt += 1
+                                cnt += _count_done(n.get("children", []))
+                            return cnt
+                        done_count = _count_done(tree_data.get("tree", []))
+                        fingerprint = (total, done_count)
+                        if fingerprint != last_fingerprint:
+                            last_fingerprint = fingerprint
+                            msg = json.dumps({
+                                "type": "agent_tree",
+                                "session_id": session.session_id,
+                                **tree_data,
+                            })
+                            if session.ws_ref and getattr(session.ws_ref, "open", False):
+                                await session.ws_ref.send(msg)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
     async def _idle_watchdog(self, session: "Session") -> None:
         state = self._get_state(session)
         while True:
@@ -1191,6 +1522,9 @@ console.log(JSON.stringify(data));
             ))
             session.is_stopping = True
             session.is_streaming = False
+            if state.tree_poll_task and not state.tree_poll_task.done():
+                state.tree_poll_task.cancel()
+                state.tree_poll_task = None
             session.accumulated_text = ""
             state.tool_blocks = {}
             state.timed_out = True

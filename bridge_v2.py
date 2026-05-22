@@ -108,6 +108,7 @@ from backends.events import (
     _msg_session_history, _msg_history_snapshot, _msg_history_delta, _msg_resumable_sessions, _msg_session_uuid,
     _msg_shell_created, _msg_shell_output, _msg_shell_closed,
     _msg_tasks_list, _msg_task_killed, _msg_processes_list, _msg_process_killed, _msg_dir_listing, _msg_usage_report,
+    _msg_agent_tree,
     set_event_dispatcher,
 )
 from backends.history import DEFAULT_HISTORY_LIMIT, clamp_history_limit
@@ -546,6 +547,8 @@ _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
     "request_status": [],
     "claim_bridge":   [],   # auth_token validated at handler level
     "unclaim_bridge": [],   # auth_token validated at handler level
+    "get_agent_tree": [("session_id", str)],
+    "fork_session":   [("session_id", str)],
 }
 
 _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
@@ -566,6 +569,8 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "request_search_context",
     # WebRTC P2P signaling (handled by handlers.webrtc_signaling)
     "webrtc_offer", "webrtc_answer", "webrtc_ice",
+    "get_agent_tree",
+    "fork_session",
 })
 
 def validate_client_msg(msg: object) -> str | None:
@@ -655,10 +660,12 @@ def _get_or_create_backend(name: str) -> "Backend":
             codex_bin=CODEX_BIN,
             broadcast_fn=_broadcast_json,
             notify_fcm_fn=notify_fcm,
+            persist_session_fn=_persist_session,
         )
     elif backend_name == "ollama":
         from backends.ollama import OllamaBackend
-        backend = OllamaBackend(model=_DEFAULT_OLLAMA_MODEL, host=_OLLAMA_HOST)
+        backend = OllamaBackend(model=_DEFAULT_OLLAMA_MODEL, host=_OLLAMA_HOST,
+                                notify_fcm_fn=notify_fcm)
     elif backend_name == "gemini":
         from backends.gemini_cli import GeminiCliBackend
         backend = GeminiCliBackend()
@@ -2039,6 +2046,7 @@ async def handler(ws: ServerConnection) -> None:
             "msg_resumable_sessions": _msg_resumable_sessions,
             "permission_mode": _PERMISSION_MANAGER.mode() if _PERMISSION_MANAGER else "off",
             "restart_trigger_path": _RESTART_TRIGGER_PATH,
+            "msg_agent_tree": _msg_agent_tree,
         }
         runtime_ctx = {
             "sessions": _SESSIONS,

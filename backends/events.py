@@ -250,6 +250,13 @@ def _msg_usage_report(
         "seven_day_sonnet": seven_day_sonnet,
     }
 
+def _msg_agent_tree(session_id: str, tree_data: dict) -> dict:
+    return {
+        "type": "agent_tree",
+        "session_id": session_id,
+        **tree_data,  # resume_id, total_agents, tree
+    }
+
 
 # ---------------------------------------------------------------------------
 # send_event — route session-scoped events; buffer when client is offline
@@ -315,6 +322,18 @@ def _extract_html_title(path: str) -> str:
     except Exception:
         pass
     return ""
+
+async def emit_done(session: "Session") -> None:
+    """Scan accumulated text for media/document paths, then send done event.
+
+    Call this instead of send_event(session, _evt_done()) so all backends
+    get media detection without each needing to import scan_for_media.
+    """
+    if session.accumulated_text:
+        await scan_for_media(session.accumulated_text, session)
+        session.accumulated_text = ""
+    await send_event(session, _evt_done())
+
 
 async def scan_for_media(text: str, session: "Session") -> None:
     from urllib.parse import quote as urlquote

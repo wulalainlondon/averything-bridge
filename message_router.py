@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Coroutine
 
+from handlers.fork_ops import handle_fork_message
 from prompt_routes import handle_prompt_message
 from route_utils import safe_send_json as _safe_send_json
 from session_routes import handle_session_message
@@ -129,6 +130,9 @@ async def handle_low_coupling_message(
         return True
 
     if await handle_session_message(mtype=mtype, msg=msg, ws=ws, client=client, ctx=ctx):
+        return True
+
+    if await handle_fork_message(mtype=mtype, msg=msg, ws=ws, client=client, ctx=ctx):
         return True
 
     if mtype == "request_history":

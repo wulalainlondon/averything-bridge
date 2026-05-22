@@ -24,7 +24,7 @@ from typing import Optional, TYPE_CHECKING
 from .base import Backend, _StatesMixin
 from .jsonrpc import JsonRpcPlumber
 from .events import (
-    send_event, stream_text,
+    send_event, stream_text, emit_done,
     _evt_error, _evt_stopped, _evt_done, _evt_session_warning, _evt_session_closed,
     _msg_session_uuid, _msg_usage_report,
 )
@@ -67,10 +67,12 @@ class CodexAppServerBackend(Backend, _StatesMixin):
 
     def __init__(self, codex_bin: str,
                  broadcast_fn: "Callable[[dict], Coroutine] | None" = None,
-                 notify_fcm_fn: "Callable[[str, str, str], Coroutine] | None" = None):
+                 notify_fcm_fn: "Callable[[str, str, str], Coroutine] | None" = None,
+                 persist_session_fn: "Callable | None" = None):
         self._codex_bin = codex_bin
         self._broadcast_fn = broadcast_fn
         self._notify_fcm_fn = notify_fcm_fn
+        self._persist_session_fn = persist_session_fn
         self._codex_home = os.path.expanduser("~/.codex")
         self._native_sessions_root = os.path.join(self._codex_home, "sessions")
         self._native_session_index_path = os.path.join(self._codex_home, "session_index.jsonl")
@@ -300,6 +302,8 @@ class CodexAppServerBackend(Backend, _StatesMixin):
             except Exception:
                 pass
         session.resume_id = state.thread_id
+        if self._persist_session_fn is not None:
+            self._persist_session_fn(session)
         log.info("[codex-appserver] session=%s thread=%s", session.session_id[:8], state.thread_id[:8])
 
     async def send(self, session: "Session", content: str,
@@ -406,8 +410,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                     asyncio.create_task(
                         self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id)
                     )
-                await send_event(session, _evt_done())
-                session.accumulated_text = ""
+                await emit_done(session)
                 if (session.context_max
                         and session.context_used >= int(session.context_max * _COMPACT_THRESHOLD)
                         and state.thread_id):
@@ -420,6 +423,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
             state.turn_active = False
             session.is_streaming = False
             session.is_stopping = False
+            session.accumulated_text = ""
             self._cleanup_temp_images(state)
 
     async def _auto_compact(self, session: "Session", state: _AppServerState) -> None:
@@ -501,6 +505,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
         state.turn_error = "stopped"
         state.turn_done_event.set()
         session.is_streaming = False
+        session.accumulated_text = ""
         await send_event(session, _evt_stopped())
 
     async def clear(self, session: "Session") -> None:

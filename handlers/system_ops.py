@@ -83,4 +83,25 @@ async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
                 pass
         return True
 
+    if mtype == "get_agent_tree":
+        session_id = msg.get("session_id", "")
+        sessions = ctx["sessions"]
+        session = sessions.get(session_id)
+        if not session:
+            return True
+        resume_id = session.resume_id
+        if not resume_id:
+            return True
+        backends = ctx["backends"]
+        backend = backends.get(session.backend_name or "claude")
+        if backend is None or not hasattr(backend, "build_agent_tree"):
+            return True
+        tree_data = await backend.build_agent_tree(resume_id)
+        msg_builder = ctx["msg_agent_tree"]
+        try:
+            await ws.send(json.dumps(msg_builder(session_id, tree_data)))
+        except Exception:
+            pass
+        return True
+
     return False

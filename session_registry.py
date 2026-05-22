@@ -61,6 +61,8 @@ class Session:
     recent_request_ids: set[str] = field(default_factory=set)
     # BUG-07: set to True after first user message is indexed into FTS5 search.db
     _fts_first_msg_indexed: bool = False
+    parent_session_id: str | None = None
+    forked_at: float | None = None
 
 
 SESSIONS: dict[str, Session] = {}
@@ -226,6 +228,8 @@ def persist_session(
         "model": session.model,
         "sandbox": session.sandbox,
         "image_dir": session.image_dir,
+        "parent_session_id": session.parent_session_id,
+        "forked_at": session.forked_at,
     }
     cutoff = int(time.time()) - 90 * 24 * 3600
     saved = {
@@ -324,6 +328,8 @@ def restore_sessions_from_disk(
             )
             session.resume_id = data.get("resume_id") or data.get("claude_uuid") or None
             session.last_activity = saved_last_used
+            session.parent_session_id = data.get("parent_session_id") or None
+            session.forked_at = float(data["forked_at"]) if data.get("forked_at") is not None else None
             sessions[sid] = session
             count += 1
         except Exception as exc:
