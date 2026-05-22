@@ -139,9 +139,12 @@ def prune_old_saved_sessions(saved_path: Path, days: int = 30) -> int:
     pruned = {sid: m for sid, m in data.items() if (m.get('last_used') or 0) > cutoff}
     removed = before - len(pruned)
     if removed > 0:
-        tmp = saved_path.with_suffix('.json.tmp')
+        import os
+        import tempfile
+        fd, tmp_str = tempfile.mkstemp(dir=saved_path.parent, prefix='.tmp_', suffix='.json')
+        tmp = Path(tmp_str)
         try:
-            with tmp.open('w', encoding='utf-8') as f:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(pruned, f, indent=2, ensure_ascii=False)
             tmp.replace(saved_path)
             log.info(
@@ -158,11 +161,18 @@ def prune_old_saved_sessions(saved_path: Path, days: int = 30) -> int:
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    """Write *data* to *path* via a temp file to avoid partial writes."""
+    """Write *data* to *path* via a temp file to avoid partial writes.
+
+    Uses mkstemp() for a unique temp filename so concurrent writers in
+    different processes don't clobber each other's .tmp file.
+    """
+    import os
+    import tempfile
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.json.tmp')
+    fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix='.tmp_', suffix='.json')
+    tmp = Path(tmp_str)
     try:
-        with tmp.open('w', encoding='utf-8') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         tmp.replace(path)
     except Exception:
