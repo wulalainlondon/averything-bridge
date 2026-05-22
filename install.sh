@@ -3,6 +3,13 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME_DIR="$HOME/.claude-bridge-runtime"
+
+if [[ "$SRC_DIR" == "$RUNTIME_DIR" ]]; then
+  echo "ERROR: install.sh 從 runtime 目錄執行 — rsync 會是 no-op，程式碼不會更新。" >&2
+  echo "       請從 source 目錄執行，例如：" >&2
+  echo "         bash ~/Downloads/Helper/claude-bridge/bridge/install.sh" >&2
+  exit 1
+fi
 SERVICE_LABEL="${BRIDGE_SERVICE_LABEL:-com.claude-bridge.app}"
 PLIST_NAME="${SERVICE_LABEL}.plist"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
@@ -99,6 +106,7 @@ rsync -a --delete \
   --exclude 'search.db-wal' \
   --exclude 'launchd-wrapper.log' \
   --exclude 'instances.json' \
+  --exclude 'install.sh' \
   "$SRC_DIR/" "$RUNTIME_DIR/"
 cd "$RUNTIME_DIR"
 
@@ -278,6 +286,17 @@ if [[ "$PLIST_CHANGED" == "true" ]] || [[ "$SERVICE_LOADED" == "false" ]]; then
   launchctl enable "$SERVICE_TARGET" 2>/dev/null || true
 else
   echo "==> Hot-restarting service (kickstart -k)"
+  # Kill the running bridge process(es) BEFORE kickstart so the new supervisor
+  # starts with a free port and launches fresh code.  Without this, supervisor
+  # adopts the healthy orphan and the newly-deployed bridge_v2.py never takes
+  # effect — the same bug that affects code-only deploys (plist unchanged).
+  PORT="${BRIDGE_PORT:-8766}"
+  STRAGGLER_PIDS="$(lsof -ti :"$PORT" 2>/dev/null || true)"
+  if [[ -n "$STRAGGLER_PIDS" ]]; then
+    echo "    Killing bridge on port $PORT (pid(s): $STRAGGLER_PIDS) so new code takes effect"
+    echo "$STRAGGLER_PIDS" | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
   launchctl kickstart -k "$SERVICE_TARGET"
 fi
 

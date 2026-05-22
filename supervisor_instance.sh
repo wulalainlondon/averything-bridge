@@ -128,6 +128,20 @@ done
 echo $$ > "$LOCK_PID_FILE"
 
 echo "[supervisor:$NAME] start, port=$PORT, data-dir=$DATA_DIR"
+
+# ---------------------------------------------------------------------------
+# Log rotation — keep bridge.err under 5 MB (1 backup)
+# ---------------------------------------------------------------------------
+_LOG_MAX_BYTES=$((5 * 1024 * 1024))
+if [[ -f "$ERR_FILE_INST" ]]; then
+  _ERR_SIZE=$(wc -c < "$ERR_FILE_INST" 2>/dev/null || echo 0)
+  if [[ "$_ERR_SIZE" -gt "$_LOG_MAX_BYTES" ]]; then
+    mv -f "$ERR_FILE_INST" "${ERR_FILE_INST}.1"
+    : > "$ERR_FILE_INST"
+    echo "[supervisor:$NAME] rotated bridge.err (was ${_ERR_SIZE} bytes)"
+  fi
+fi
+
 BACKOFF=1
 MAX_RETRIES=10
 RETRY_COUNT=0

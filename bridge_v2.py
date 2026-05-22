@@ -13,6 +13,7 @@ import asyncio
 import http
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import mimetypes
 import os
 from pathlib import Path
@@ -2488,7 +2489,12 @@ async def main(port: int, tunnel: bool = False,
         level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            RotatingFileHandler(
+                LOG_FILE,
+                maxBytes=10 * 1024 * 1024,  # 10 MB per file
+                backupCount=3,
+                encoding="utf-8",
+            ),
             logging.StreamHandler(sys.stdout),
         ],
     )
