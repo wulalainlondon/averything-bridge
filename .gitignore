@@ -15,3 +15,4 @@ supervisor.pid
 .supervisor.lock/
 bridge_v2.log
 bridge.err
+path_overrides.json

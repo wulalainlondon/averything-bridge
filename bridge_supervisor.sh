@@ -23,7 +23,10 @@ for inst in data['instances']:
     port = inst['port']
     data_dir = os.path.expanduser(inst['data_dir'])
     root_dir = os.path.expanduser(inst.get('root_dir', ''))
-    print(f'{name}|{port}|{data_dir}|{root_dir}')
+    backend = inst.get('backend', '')
+    model = inst.get('model', '')
+    ollama_host = inst.get('ollama_host', '')
+    print(f'{name}|{port}|{data_dir}|{root_dir}|{backend}|{model}|{ollama_host}')
 " 2>&1)" || { echo "[supervisor] Failed to parse $INSTANCES_CONFIG: $INSTANCES_JSON"; exit 1; }
 
 if [[ -z "$INSTANCES_JSON" ]]; then
@@ -49,6 +52,9 @@ CHILD_PIDS=()
 CHILD_PORTS=()
 CHILD_DATA_DIRS=()
 CHILD_ROOT_DIRS=()
+CHILD_BACKENDS=()
+CHILD_MODELS=()
+CHILD_OLLAMA_HOSTS=()
 
 # ---------------------------------------------------------------------------
 # cleanup() — kill all child supervisors on exit
@@ -60,10 +66,12 @@ cleanup() {
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       echo "[supervisor] stopping instance '${CHILD_NAMES[$i]}' (pid=$pid)"
       kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
     fi
   done
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # ---------------------------------------------------------------------------
 # spawn_instance INDEX — (re-)spawn supervisor_instance.sh for one entry
@@ -74,18 +82,27 @@ spawn_instance() {
   local port="${CHILD_PORTS[$idx]}"
   local data_dir="${CHILD_DATA_DIRS[$idx]}"
   local root_dir="${CHILD_ROOT_DIRS[$idx]}"
+  local backend="${CHILD_BACKENDS[$idx]}"
+  local model="${CHILD_MODELS[$idx]}"
+  local ollama_host="${CHILD_OLLAMA_HOSTS[$idx]}"
 
   mkdir -p "$data_dir"
 
+  args=(--name "$name" --port "$port" --data-dir "$data_dir")
   if [[ -n "$root_dir" ]]; then
-    "$BRIDGE_DIR/supervisor_instance.sh" \
-      --name "$name" --port "$port" \
-      --data-dir "$data_dir" --root-dir "$root_dir" &
-  else
-    "$BRIDGE_DIR/supervisor_instance.sh" \
-      --name "$name" --port "$port" \
-      --data-dir "$data_dir" &
+    args+=(--root-dir "$root_dir")
   fi
+  if [[ -n "$backend" ]]; then
+    args+=(--backend "$backend")
+  fi
+  if [[ -n "$model" ]]; then
+    args+=(--model "$model")
+  fi
+  if [[ -n "$ollama_host" ]]; then
+    args+=(--ollama-host "$ollama_host")
+  fi
+
+  "$BRIDGE_DIR/supervisor_instance.sh" "${args[@]}" &
   CHILD_PIDS[$idx]=$!
   echo "[supervisor] started instance '$name' on port $port (supervisor pid=${CHILD_PIDS[$idx]})"
 }
@@ -93,12 +110,15 @@ spawn_instance() {
 # ---------------------------------------------------------------------------
 # Populate arrays and do the initial spawn
 # ---------------------------------------------------------------------------
-while IFS='|' read -r name port data_dir root_dir; do
+while IFS='|' read -r name port data_dir root_dir backend model ollama_host; do
   idx=${#CHILD_NAMES[@]}
   CHILD_NAMES+=("$name")
   CHILD_PORTS+=("$port")
   CHILD_DATA_DIRS+=("$data_dir")
   CHILD_ROOT_DIRS+=("$root_dir")
+  CHILD_BACKENDS+=("$backend")
+  CHILD_MODELS+=("$model")
+  CHILD_OLLAMA_HOSTS+=("$ollama_host")
   CHILD_PIDS+=("")   # placeholder; filled by spawn_instance
   spawn_instance "$idx"
 done <<< "$INSTANCES_JSON"

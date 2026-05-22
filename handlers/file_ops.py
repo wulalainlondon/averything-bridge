@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -177,6 +178,12 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
                 ctx["log"].info("FCM token registered: %s…", token[:20])
             except Exception as exc:
                 ctx["log"].warning("Failed to save FCM token: %s", exc)
+            tunnel_url = ctx.get("get_tunnel_url", lambda: None)()
+            if tunnel_url and not ctx.get("is_tunnel_delivered", lambda: True)():
+                notify_fn = ctx.get("notify_tunnel_fcm_once")
+                if notify_fn:
+                    asyncio.ensure_future(notify_fn(tunnel_url))
+                    ctx["log"].info("FCM token arrived with pending tunnel URL — resending immediately")
         return True
 
     return False

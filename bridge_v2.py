@@ -139,6 +139,8 @@ PAIRING_FILE          = os.path.join(BRIDGE_DIR, "pairing.json")
 _DATA_DIR: str = ""  # set by _init_paths() in main()
 _ROOT_DIR: str = ""  # set in main(); "" means no jail
 _INSTANCE_NAME: str = ""  # set in main(); from --instance-name or BRIDGE_INSTANCE_NAME env
+_LAN_IP: str = ""  # set in main(); LAN IP sent in hello_ack so clients can auto-update their config
+_INSTANCE_ID: str = ""  # set by _init_paths() from bridge_identity.json (stable across restarts)
 
 # Restart-agent trigger file — bridge writes this to ask launchd's
 # restart-agent (a sibling service, NOT a bridge child) to kickstart us.
@@ -148,10 +150,30 @@ _RESTART_TRIGGER_PATH: str = os.environ.get(
 )
 
 
+def _load_or_create_stable_id(data_dir: str) -> str:
+    """Load a stable bridge ID from bridge_identity.json, creating it on first run."""
+    identity_file = os.path.join(data_dir, "bridge_identity.json")
+    try:
+        with open(identity_file) as f:
+            data = json.load(f)
+        stored = data.get("bridge_id", "")
+        if isinstance(stored, str) and stored.startswith("b_") and len(stored) > 4:
+            return stored
+    except Exception:
+        pass
+    new_id = "b_" + uuid.uuid4().hex[:12]
+    try:
+        with open(identity_file, "w") as f:
+            json.dump({"bridge_id": new_id, "created_at": int(time.time())}, f)
+    except Exception:
+        pass
+    return new_id
+
+
 def _init_paths(data_dir: str) -> None:
     global LOG_FILE, FCM_TOKEN_FILE, SERVICE_ACCOUNT_FILE, \
            SAVED_SESSIONS_FILE, CODEX_SAVED_SESSIONS_FILE, \
-           SESSION_META_FILE, READ_CURSOR_FILE, PAIRING_FILE, _DATA_DIR
+           SESSION_META_FILE, READ_CURSOR_FILE, PAIRING_FILE, _DATA_DIR, _INSTANCE_ID
     _DATA_DIR = data_dir
     os.makedirs(data_dir, exist_ok=True)
     LOG_FILE                  = os.path.join(data_dir, "bridge_v2.log")
@@ -164,6 +186,9 @@ def _init_paths(data_dir: str) -> None:
     PAIRING_FILE              = os.path.join(data_dir, "pairing.json")
     # Point search index into this instance's data dir so instances don't share search.db
     os.environ["BRIDGE_SEARCH__INDEX_PATH"] = os.path.join(data_dir, "search.db")
+    _INSTANCE_ID = _load_or_create_stable_id(data_dir)
+    # Deferred log — logger may not be configured yet at this point; will be printed after basicConfig
+    print(f"[bridge] stable instance_id={_INSTANCE_ID}")
 
 
 def _load_pairing() -> dict:
@@ -527,7 +552,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "rename_session", "clear_session", "get_usage", "get_resumable_sessions",
     "shell_create", "shell_input", "shell_close", "get_tasks", "kill_task",
     "get_processes", "kill_process",
-    "fcm_token", "request_sessions_list", "browse_dir", "request_history",
+    "fcm_token", "tunnel_url_ack", "request_sessions_list", "browse_dir", "request_history",
     "set_effort", "hello", "set_session_meta", "switch_session_config",
     "permission_response",
     "request_status",
@@ -1046,25 +1071,41 @@ async def _handle_file_push_ack(file_id: str, device_id: str = "") -> None:
 # ---------------------------------------------------------------------------
 # FCM notification
 # ---------------------------------------------------------------------------
-async def _notify_fcm_tunnel(ws_url: str) -> None:
+async def _do_send_tunnel_fcm(ws_url: str) -> bool:
+    """Send one FCM tunnel_url notification. Returns True on success."""
     if _firebase_app is None:
-        return
+        return False
     try:
         with open(FCM_TOKEN_FILE) as f:
             token = f.read().strip()
     except FileNotFoundError:
         log.warning("FCM tunnel notify: no token on file")
-        return
+        return False
     try:
         message = fb_messaging.Message(
-            data={"type": "tunnel_url", "url": ws_url},
+            data={"type": "tunnel_url", "url": ws_url, "instance_id": _INSTANCE_ID},
             token=token,
         )
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, fb_messaging.send, message)
         log.info("FCM tunnel URL pushed to device: %s", ws_url)
+        return True
     except Exception as exc:
         log.warning("FCM tunnel notify failed: %s", exc)
+        return False
+
+
+async def _notify_fcm_tunnel_with_retry(ws_url: str) -> None:
+    """Send tunnel URL via FCM, retrying every 60s (max 5 total attempts) until ACK."""
+    global _TUNNEL_URL_DELIVERED
+    for attempt in range(5):
+        if _TUNNEL_URL_DELIVERED:
+            log.info("FCM tunnel URL delivery confirmed — stopping retry after %d attempt(s)", attempt)
+            return
+        await _do_send_tunnel_fcm(ws_url)
+        if attempt < 4:
+            await asyncio.sleep(60)
+    log.info("FCM tunnel URL retry exhausted (5 attempts)")
 
 
 async def notify_fcm(session_name: str, last_text: str, session_id: str = "") -> None:
@@ -1078,17 +1119,25 @@ async def notify_fcm(session_name: str, last_text: str, session_id: str = "") ->
         log.warning("No FCM token on file — skipping notification")
         return
 
-    # Extract a concise first sentence for notification body.
+    # Extract a concise summary from the LAST paragraph of the turn (the completion
+    # summary), not the first sentence (which is typically "Let me look at...").
     import re as _re
-    clean = _re.sub(r'[*`#_~>]+', '', last_text)
-    clean = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean)  # markdown links
-    clean = _re.sub(r'\s+', ' ', clean).strip()
-    summary = ""
+
+    def _clean_md(s: str) -> str:
+        s = _re.sub(r'[*`#_~>]+', '', s)
+        s = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', s)  # markdown links
+        return _re.sub(r'\s+', ' ', s).strip()
+
+    # Find last non-empty paragraph; fall back to entire text if no paragraph breaks.
+    paragraphs = [p for p in last_text.split('\n\n') if p.strip()]
+    source = paragraphs[-1] if paragraphs else last_text
+    clean = _clean_md(source)
+
+    # Within that paragraph, take the first complete sentence.
     sentence_parts = _re.split(r'(?<=[。！？!?\.])\s+', clean, maxsplit=1)
-    if sentence_parts:
-        summary = sentence_parts[0].strip()
+    summary = sentence_parts[0].strip() if sentence_parts else clean
     if not summary:
-        summary = clean
+        summary = _clean_md(last_text)
     if len(summary) > 120:
         summary = summary[:120].rstrip() + "…"
 
@@ -1784,10 +1833,12 @@ async def _send_all_sessions(ws: Any, batch_size: int = 50) -> None:
 # ---------------------------------------------------------------------------
 _AUTO_TUNNEL_TASK: "asyncio.Task | None" = None
 _CLOUDFLARED_PROC: "asyncio.subprocess.Process | None" = None
+_CURRENT_TUNNEL_URL: "str | None" = None  # set after cloudflared reports its URL
+_TUNNEL_RETRY_TASK: "asyncio.Task | None" = None   # FCM retry loop for tunnel URL
+_TUNNEL_URL_DELIVERED: bool = False                 # True after app sends tunnel_url_ack
 _BRIDGE_PORT = 8766
 _PERF = PerfTracker(slow_threshold_ms=250.0, report_interval_s=60.0)
 _PERMISSION_MANAGER: "PermissionManager | None" = None
-_INSTANCE_ID = "b_" + uuid.uuid4().hex[:8]
 
 
 # ---------------------------------------------------------------------------
@@ -1802,6 +1853,19 @@ async def _auto_tunnel_after_delay(delay: int = 30) -> None:
     log.info("No client for %ds — auto-starting Cloudflare tunnel", delay)
     print(f"\n[auto-tunnel] No client for {delay}s, starting tunnel...")
     await _start_cloudflared_tunnel(_BRIDGE_PORT)
+
+
+async def _cloudflared_watchdog() -> None:
+    """Restart cloudflared if it crashes while no client is connected."""
+    while True:
+        await asyncio.sleep(60)
+        if _is_cloudflared_running():
+            continue
+        if client_manager.has_clients():
+            # Client is present — normal client-disconnect path will handle this
+            continue
+        log.info("cloudflared watchdog: process died with no clients — restarting tunnel")
+        await _start_cloudflared_tunnel(_BRIDGE_PORT)
 
 
 async def _run_session_queue(session: Session) -> None:
@@ -1848,6 +1912,11 @@ async def handler(ws: ServerConnection) -> None:
     if _AUTO_TUNNEL_TASK and not _AUTO_TUNNEL_TASK.done():
         _AUTO_TUNNEL_TASK.cancel()
         _AUTO_TUNNEL_TASK = None
+
+    # Proactively start tunnel so client gets the URL while still on WiFi,
+    # avoiding FCM dependency on the next reconnect.
+    if os.environ.get("BRIDGE_AUTO_TUNNEL") == "1" and not _is_cloudflared_running():
+        _spawn_task("cloudflared-start:on-connect", _start_cloudflared_tunnel(_BRIDGE_PORT))
 
     remote = ws.remote_address
     client = ClientConn(
@@ -1906,8 +1975,11 @@ async def handler(ws: ServerConnection) -> None:
     try:
         _paired_token = _PAIRING.get("paired_token", "").strip()
         _provided_token = str(first_msg.get("auth_token") or "").strip()
+        log.info("hello_ack → client=%s instance_id=%s tunnel=%s",
+                 client.client_id, _INSTANCE_ID, bool(_CURRENT_TUNNEL_URL))
         await ws.send(json.dumps({
             "type": "hello_ack",
+            "instance_id": _INSTANCE_ID,
             "client_id": client.client_id,
             "device_id": client.device_id,
             "device_name": client.device_name,
@@ -1916,6 +1988,8 @@ async def handler(ws: ServerConnection) -> None:
             "instance_name": _INSTANCE_NAME,
             "root_dir": _ROOT_DIR,
             "data_dir": _DATA_DIR,
+            **({"lan_ip": _LAN_IP} if _LAN_IP else {}),
+            **({"tunnel_url": _CURRENT_TUNNEL_URL} if _CURRENT_TUNNEL_URL else {}),
         }))
         await ws.send(json.dumps(build_sessions_list()))
 
@@ -1989,6 +2063,9 @@ async def handler(ws: ServerConnection) -> None:
             "fcm_token_file": FCM_TOKEN_FILE,
             "log": log,
             "root_dir": _ROOT_DIR,
+            "get_tunnel_url": lambda: _CURRENT_TUNNEL_URL,
+            "is_tunnel_delivered": lambda: _TUNNEL_URL_DELIVERED,
+            "notify_tunnel_fcm_once": _do_send_tunnel_fcm,
         }
         router_ctx = RouterContext(
             sessions=_SESSIONS,
@@ -2079,6 +2156,7 @@ async def handler(ws: ServerConnection) -> None:
                 _provided_token = str(msg.get("auth_token") or "").strip()
                 await ws.send(json.dumps({
                     "type": "hello_ack",
+                    "instance_id": _INSTANCE_ID,
                     "client_id": client.client_id,
                     "device_id": client.device_id,
                     "device_name": client.device_name,
@@ -2087,6 +2165,8 @@ async def handler(ws: ServerConnection) -> None:
                     "instance_name": _INSTANCE_NAME,
                     "root_dir": _ROOT_DIR,
                     "data_dir": _DATA_DIR,
+                    **({"lan_ip": _LAN_IP} if _LAN_IP else {}),
+                    **({"tunnel_url": _CURRENT_TUNNEL_URL} if _CURRENT_TUNNEL_URL else {}),
                 }))
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
@@ -2153,6 +2233,16 @@ async def handler(ws: ServerConnection) -> None:
                     await ws.send(json.dumps({"type": "inbox_list", "items": inbox_items}))
                 except Exception:
                     pass
+                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                continue
+
+            if mtype == "tunnel_url_ack":
+                global _TUNNEL_URL_DELIVERED, _TUNNEL_RETRY_TASK
+                _TUNNEL_URL_DELIVERED = True
+                if _TUNNEL_RETRY_TASK and not _TUNNEL_RETRY_TASK.done():
+                    _TUNNEL_RETRY_TASK.cancel()
+                    _TUNNEL_RETRY_TASK = None
+                log.info("tunnel_url_ack received — FCM retry cancelled")
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
 
@@ -2314,7 +2404,7 @@ def _is_cloudflared_running() -> bool:
 
 
 async def _start_cloudflared_tunnel(port: int) -> None:
-    global _CLOUDFLARED_PROC
+    global _CLOUDFLARED_PROC, _CURRENT_TUNNEL_URL, _TUNNEL_RETRY_TASK, _TUNNEL_URL_DELIVERED
     if _is_cloudflared_running():
         log.info("cloudflared already running, skipping")
         return
@@ -2341,12 +2431,19 @@ async def _start_cloudflared_tunnel(port: int) -> None:
             print(f"   {ws_url}")
             print(f"{'='*56}\n")
             log.info("Cloudflared tunnel: %s", ws_url)
+            _CURRENT_TUNNEL_URL = ws_url
+            _TUNNEL_URL_DELIVERED = False
+            if _TUNNEL_RETRY_TASK and not _TUNNEL_RETRY_TASK.done():
+                _TUNNEL_RETRY_TASK.cancel()
+            _TUNNEL_RETRY_TASK = _spawn_task("notify-fcm:tunnel", _notify_fcm_tunnel_with_retry(ws_url))
             set_media_base_url(url)
             _spawn_task("cloudflared-drain-stderr", _drain_proc_stderr(proc))
-            _spawn_task("notify-fcm:tunnel", _notify_fcm_tunnel(ws_url))
+            # Push URL to any clients already connected (e.g. on WiFi when tunnel starts)
+            _spawn_task("broadcast-tunnel-url", _broadcast_json({"type": "tunnel_url", "url": ws_url, "instance_id": _INSTANCE_ID}))
             return
     log.warning("cloudflared tunnel URL not detected")
     _CLOUDFLARED_PROC = None
+    _CURRENT_TUNNEL_URL = None
 
 
 async def _warmup_history_cache_background() -> None:
@@ -2408,8 +2505,12 @@ async def main(port: int, tunnel: bool = False,
         if _ROOT_DIR:
             _ROOT_DIR = os.path.realpath(os.path.expanduser(_ROOT_DIR))
 
-    global _INSTANCE_NAME
+    global _INSTANCE_NAME, _LAN_IP
     _INSTANCE_NAME = instance_name or os.environ.get("BRIDGE_INSTANCE_NAME", "")
+    try:
+        _LAN_IP = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        _LAN_IP = ""
 
     _DEFAULT_BACKEND_NAME = _normalize_backend_name(backend_name)
     _DEFAULT_OLLAMA_MODEL = model or "llama3.2"
@@ -2490,6 +2591,8 @@ async def main(port: int, tunnel: bool = False,
         log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
         if tunnel:
             _spawn_task("cloudflared-start", _start_cloudflared_tunnel(port))
+        if os.environ.get("BRIDGE_AUTO_TUNNEL") == "1":
+            _spawn_task("cloudflared-watchdog", _cloudflared_watchdog())
         init_cache_db()
         _spawn_task("preload-sessions-cache:startup", preload_sessions_cache(_BACKENDS))
         _spawn_task("session-cache-refresher", _session_cache_refresher())

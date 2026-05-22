@@ -164,6 +164,22 @@ fi
 chmod +x run_bridge.sh bridge_supervisor.sh supervisor_instance.sh bridge_healthcheck.py bridge_launch.sh restart_agent.sh
 
 # ============================================================================
+# Install cloudflared for auto-tunnel support (best-effort).
+# ============================================================================
+echo "==> Check cloudflared"
+if command -v cloudflared >/dev/null 2>&1; then
+  echo "    cloudflared already installed: $(cloudflared --version 2>&1 | head -1)"
+elif command -v brew >/dev/null 2>&1; then
+  echo "    Installing cloudflared via Homebrew..."
+  brew install cloudflared --quiet
+  echo "    cloudflared installed: $(cloudflared --version 2>&1 | head -1)"
+else
+  echo "    WARNING: brew not found — cloudflared skipped."
+  echo "             Auto-tunnel will not work until cloudflared is installed."
+  echo "             Manual install: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/"
+fi
+
+# ============================================================================
 # Write plist into a temp path; only swap if content actually differs.
 # This lets us avoid bootout/bootstrap on every deploy.
 # ============================================================================
@@ -195,7 +211,8 @@ cat > "$PLIST_TMP" <<PLIST
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$HOME</string>
     <key>BRIDGE_INSTANCES_CONFIG</key><string>$RUNTIME_DIR/instances.json</string>
-    <key>BRIDGE_DISABLE_MDNS</key><string>1</string>
+    <key>BRIDGE_DISABLE_MDNS</key><string>0</string>
+    <key>BRIDGE_AUTO_TUNNEL</key><string>1</string>
   </dict>
   <key>SoftResourceLimits</key>
   <dict>

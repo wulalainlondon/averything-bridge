@@ -1,6 +1,6 @@
 #!/bin/bash
 set -uo pipefail
-# Usage: supervisor_instance.sh --name NAME --port PORT --data-dir DATA_DIR [--root-dir ROOT_DIR]
+# Usage: supervisor_instance.sh --name NAME --port PORT --data-dir DATA_DIR [--root-dir ROOT_DIR] [--backend BACKEND] [--model MODEL]
 
 # ---------------------------------------------------------------------------
 # Parse named arguments
@@ -9,6 +9,9 @@ NAME=""
 PORT=""
 DATA_DIR=""
 ROOT_DIR=""
+BACKEND=""
+MODEL=""
+OLLAMA_HOST=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -16,12 +19,15 @@ while [[ $# -gt 0 ]]; do
     --port)     PORT="$2";     shift 2 ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
     --root-dir) ROOT_DIR="$2"; shift 2 ;;
+    --backend)  BACKEND="$2";  shift 2 ;;
+    --model)    MODEL="$2";    shift 2 ;;
+    --ollama-host) OLLAMA_HOST="$2"; shift 2 ;;
     *) echo "[supervisor] Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
 if [[ -z "$NAME" || -z "$PORT" || -z "$DATA_DIR" ]]; then
-  echo "[supervisor] Usage: $0 --name NAME --port PORT --data-dir DATA_DIR [--root-dir ROOT_DIR]" >&2
+  echo "[supervisor] Usage: $0 --name NAME --port PORT --data-dir DATA_DIR [--root-dir ROOT_DIR] [--backend BACKEND] [--model MODEL]" >&2
   exit 1
 fi
 
@@ -55,44 +61,70 @@ cleanup() {
     sleep 1
     kill -9 "$CHILD_PID" 2>/dev/null || true
   fi
-  rm -rf "$LOCK_DIR"
+  # Only remove lock if we are the current owner (prevents standing-by instances
+  # from wiping the active supervisor's lock on their way out).
+  if [[ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" == "$$" ]]; then
+    rm -rf "$LOCK_DIR"
+  fi
 }
 trap cleanup EXIT INT TERM
+
+# read_lock_owner — read lock PID, retry once on empty file (handles transient
+# window during stale-lock clearing: rm -rf then mkdir leaves file momentarily
+# absent, which would otherwise trigger a false "lock taken" self-exit).
+read_lock_owner() {
+  local _o
+  _o="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+  if [[ -z "$_o" ]]; then
+    sleep 1
+    _o="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+  fi
+  echo "$_o"
+}
 
 # ---------------------------------------------------------------------------
 # Lock acquisition — detect stale lock and handle healthy orphans
 # ---------------------------------------------------------------------------
 LOCK_PID_FILE="$LOCK_DIR/pid"
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+_lock_wait_logged=0
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
   OLD_LOCK_PID="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
   if [[ -n "$OLD_LOCK_PID" ]] && kill -0 "$OLD_LOCK_PID" 2>/dev/null; then
-    echo "[supervisor:$NAME] already running (pid=$OLD_LOCK_PID), exiting"
-    exit 0
-  else
-    echo "[supervisor:$NAME] stale lock (pid=${OLD_LOCK_PID:-?} dead), clearing"
-    # If an orphan bridge is healthy, keep it alive and adopt it.
-    ORPHAN_PIDS="$(pgrep -f "${BRIDGE_DIR}/bridge_v2\.py" 2>/dev/null || true)"
-    HEALTHY_ORPHAN=""
-    if [[ -n "$ORPHAN_PIDS" ]]; then
-      for opid in $ORPHAN_PIDS; do
-        if "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 5 2>/dev/null; then
-          echo "[supervisor:$NAME] orphan bridge pid=$opid is healthy — will adopt"
-          HEALTHY_ORPHAN="$opid"
-          break
-        fi
-      done
-      if [[ -z "$HEALTHY_ORPHAN" ]]; then
-        echo "[supervisor:$NAME] killing orphan bridge_v2.py pids: $ORPHAN_PIDS"
-        kill $ORPHAN_PIDS 2>/dev/null || true
-        sleep 1
-        kill -9 $ORPHAN_PIDS 2>/dev/null || true
-      fi
+    # Active supervisor holds the lock — stand by instead of exiting immediately.
+    # This prevents the outer bridge_supervisor.sh from seeing a quick exit and
+    # re-spawning indefinitely, which caused a lock-race churn that restarted the
+    # bridge every 15 seconds.
+    if (( _lock_wait_logged == 0 )); then
+      echo "[supervisor:$NAME] supervisor $OLD_LOCK_PID active, standing by"
+      _lock_wait_logged=1
     fi
-    rm -rf "$LOCK_DIR"
-    mkdir "$LOCK_DIR"
+    sleep 15
+    continue
   fi
-fi
+  # Stale lock: old holder is dead. Clear it and retry mkdir.
+  echo "[supervisor:$NAME] stale lock (pid=${OLD_LOCK_PID:-?} dead), clearing"
+  # If an orphan bridge is healthy, keep it alive and adopt it.
+  ORPHAN_PIDS="$(pgrep -f "${BRIDGE_DIR}/bridge_v2\.py" 2>/dev/null || true)"
+  HEALTHY_ORPHAN=""
+  if [[ -n "$ORPHAN_PIDS" ]]; then
+    for opid in $ORPHAN_PIDS; do
+      if "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 5 2>/dev/null; then
+        echo "[supervisor:$NAME] orphan bridge pid=$opid is healthy — will adopt"
+        HEALTHY_ORPHAN="$opid"
+        break
+      fi
+    done
+    if [[ -z "$HEALTHY_ORPHAN" ]]; then
+      echo "[supervisor:$NAME] killing orphan bridge_v2.py pids: $ORPHAN_PIDS"
+      kill $ORPHAN_PIDS 2>/dev/null || true
+      sleep 1
+      kill -9 $ORPHAN_PIDS 2>/dev/null || true
+    fi
+  fi
+  rm -rf "$LOCK_DIR"
+  # Loop back to retry mkdir
+done
 echo $$ > "$LOCK_PID_FILE"
 
 echo "[supervisor:$NAME] start, port=$PORT, data-dir=$DATA_DIR"
@@ -131,6 +163,11 @@ if [[ -n "$EXISTING_PID" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
         CONSEC_FAIL=0
       fi
       sleep 5
+      _lock_owner="$(read_lock_owner)"
+      if [[ "${_lock_owner}" != "$$" ]]; then
+        echo "[supervisor:$NAME] lock taken by pid=${_lock_owner:-?}, self-exiting"
+        exit 0
+      fi
     done
   fi
 fi
@@ -142,6 +179,13 @@ wait_for_port_free() {
   local max_wait="${1:-30}"
   local waited=0
   while lsof -t -i :"$PORT" -sTCP:LISTEN >/dev/null 2>&1; do
+    # Never force-kill if we lost the lock — another supervisor owns this port.
+    local _wfp_owner
+    _wfp_owner="$(read_lock_owner)"
+    if [[ "${_wfp_owner}" != "$$" ]]; then
+      echo "[supervisor:$NAME] lock taken by pid=${_wfp_owner:-?} while waiting for port, self-exiting"
+      exit 0
+    fi
     if (( waited >= max_wait )); then
       echo "[supervisor:$NAME] port $PORT still busy after ${max_wait}s — force-killing"
       lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || true
@@ -162,6 +206,13 @@ wait_for_port_free() {
 # Main spawn + monitor loop
 # ---------------------------------------------------------------------------
 while true; do
+  # Self-eviction at top of every outer loop iteration.
+  _lock_owner="$(read_lock_owner)"
+  if [[ "${_lock_owner}" != "$$" ]]; then
+    echo "[supervisor:$NAME] lock taken by pid=${_lock_owner:-?}, self-exiting"
+    exit 0
+  fi
+
   if ! preflight_check; then
     sleep "$BACKOFF"
     BACKOFF=$(( BACKOFF < 60 ? BACKOFF * 2 : 60 ))
@@ -198,34 +249,53 @@ while true; do
     fi
   fi
 
-  # Build spawn command — only include --root-dir when non-empty.
+  # Build spawn command — only include optional arguments when non-empty.
+  args=(--port "$PORT" --data-dir "$DATA_DIR")
   if [[ -n "$ROOT_DIR" ]]; then
-    "$BRIDGE_DIR/run_bridge.sh" --port "$PORT" --data-dir "$DATA_DIR" --root-dir "$ROOT_DIR" >>"$LOG_FILE_INST" 2>>"$ERR_FILE_INST" &
-  else
-    "$BRIDGE_DIR/run_bridge.sh" --port "$PORT" --data-dir "$DATA_DIR" >>"$LOG_FILE_INST" 2>>"$ERR_FILE_INST" &
+    args+=(--root-dir "$ROOT_DIR")
   fi
+  if [[ -n "$BACKEND" ]]; then
+    args+=(--backend "$BACKEND")
+  fi
+  if [[ -n "$MODEL" ]]; then
+    args+=(--model "$MODEL")
+  fi
+  if [[ -n "$OLLAMA_HOST" ]]; then
+    args+=(--ollama-host "$OLLAMA_HOST")
+  fi
+
+  "$BRIDGE_DIR/run_bridge.sh" "${args[@]}" >>"$LOG_FILE_INST" 2>>"$ERR_FILE_INST" &
   CHILD_PID=$!
   echo "$CHILD_PID" > "$PID_FILE"
   echo "[supervisor:$NAME] spawned bridge pid=$CHILD_PID (attempt $((RETRY_COUNT+1))/$MAX_RETRIES)"
 
-  # Wait for healthy up to 25s; also verify OUR PID owns the port.
-  # (Guards against a stale bridge answering the healthcheck while our bridge
-  # failed to bind — root cause of the EADDRINUSE restart flood.)
+  # Wait for healthy up to 120s; also verify OUR PID owns the port.
+  # Uses 120s (240 × 0.5s) instead of 25s to accommodate slow init paths
+  # (1900+ session restore + codex backend scan can take 30-60s on cold start).
+  # With SO_REUSEPORT multiple PIDs may listen simultaneously; we check
+  # whether CHILD_PID is IN the listener set rather than requiring it to be
+  # the sole owner, and clean up any stale co-listeners.
   HEALTHY=0
-  for _ in {1..50}; do
+  for _ in {1..240}; do
     if ! kill -0 "$CHILD_PID" 2>/dev/null; then
       break
     fi
     if "$PYTHON_BIN" "$CHECK_SCRIPT" --host 127.0.0.1 --port "$PORT" --timeout 0.5; then
-      PORT_OWNER="$(lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
-      if [[ "${PORT_OWNER:-}" == "$CHILD_PID" ]]; then
+      PORT_OWNERS="$(lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+      if echo "${PORT_OWNERS}" | grep -qx "${CHILD_PID}"; then
+        # Kill any stale co-listeners from previous bridge runs
+        for _spid in $(echo "${PORT_OWNERS}" | grep -v "^${CHILD_PID}$"); do
+          echo "[supervisor:$NAME] killing stale co-listener pid=$_spid from port $PORT"
+          kill -9 "$_spid" 2>/dev/null || true
+        done
         BACKOFF=1
         RETRY_COUNT=0
         HEALTHY=1
         break
       else
-        echo "[supervisor:$NAME] stale bridge pid=${PORT_OWNER:-?} owns port (expected $CHILD_PID) — killing stale"
-        [[ -n "${PORT_OWNER:-}" ]] && { kill -9 "$PORT_OWNER" 2>/dev/null || true; sleep 1; }
+        STALE_PORT_OWNER="$(echo "${PORT_OWNERS}" | head -1)"
+        echo "[supervisor:$NAME] stale bridge pid=${STALE_PORT_OWNER:-?} owns port (expected $CHILD_PID) — killing stale"
+        [[ -n "${PORT_OWNERS:-}" ]] && { kill -9 $PORT_OWNERS 2>/dev/null || true; sleep 1; }
         kill "$CHILD_PID" 2>/dev/null || true
         break
       fi
@@ -234,7 +304,7 @@ while true; do
   done
 
   if (( HEALTHY == 0 )); then
-    echo "[supervisor:$NAME] bridge did not become healthy within 25s"
+    echo "[supervisor:$NAME] bridge did not become healthy within 120s"
     kill "$CHILD_PID" 2>/dev/null || true
     sleep 1
     kill -9 "$CHILD_PID" 2>/dev/null || true
@@ -274,5 +344,10 @@ while true; do
     fi
 
     sleep 5
+    _lock_owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    if [[ "${_lock_owner}" != "$$" ]]; then
+      echo "[supervisor:$NAME] lock taken by pid=${_lock_owner:-?}, self-exiting"
+      exit 0
+    fi
   done
 done

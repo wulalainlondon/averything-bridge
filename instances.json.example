@@ -4,7 +4,10 @@
       "name": "work",
       "port": 8766,
       "data_dir": "~/.bridge-instances/work",
-      "root_dir": "/Users/YOURNAME/work"
+      "root_dir": "/Users/YOURNAME/work",
+      "backend": "ollama",
+      "model": "qwen2.5:1.5b",
+      "ollama_host": "http://localhost:11434"
     },
     {
       "name": "home",

@@ -568,7 +568,8 @@ class CodexAppServerBackend(Backend, _StatesMixin):
         return "danger-full-access"
 
     async def get_resumable_sessions(self, limit: int = 100) -> list[dict]:
-        return self._load_native_codex_sessions(limit=limit)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._load_native_codex_sessions, limit)
 
     async def load_session_history(
         self,
