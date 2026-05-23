@@ -549,6 +549,7 @@ _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
     "unclaim_bridge": [],   # auth_token validated at handler level
     "get_agent_tree": [("session_id", str)],
     "fork_session":   [("session_id", str)],
+    "get_git_diff":   [("session_id", str)],
 }
 
 _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
@@ -571,6 +572,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "webrtc_offer", "webrtc_answer", "webrtc_ice",
     "get_agent_tree",
     "fork_session",
+    "get_git_diff",
 })
 
 def validate_client_msg(msg: object) -> str | None:
@@ -1844,6 +1846,9 @@ _CLOUDFLARED_PROC: "asyncio.subprocess.Process | None" = None
 _CURRENT_TUNNEL_URL: "str | None" = None  # set after cloudflared reports its URL
 _TUNNEL_RETRY_TASK: "asyncio.Task | None" = None   # FCM retry loop for tunnel URL
 _TUNNEL_URL_DELIVERED: bool = False                 # True after app sends tunnel_url_ack
+# Path to the file written by cloudflared_launcher.sh (external tunnel management).
+# Set from BRIDGE_TUNNEL_URL_FILE env var in main().  Empty = self-managed mode.
+_TUNNEL_URL_FILE: str = ""
 _BRIDGE_PORT = 8766
 _PERF = PerfTracker(slow_threshold_ms=250.0, report_interval_s=60.0)
 _PERMISSION_MANAGER: "PermissionManager | None" = None
@@ -2455,6 +2460,45 @@ async def _start_cloudflared_tunnel(port: int) -> None:
     _CURRENT_TUNNEL_URL = None
 
 
+async def _tunnel_url_file_watcher() -> None:
+    """Poll _TUNNEL_URL_FILE every 30 s; broadcast + FCM-notify when URL changes."""
+    global _CURRENT_TUNNEL_URL, _TUNNEL_RETRY_TASK
+    log.info("[tunnel-watcher] started, watching %s", _TUNNEL_URL_FILE)
+    while True:
+        await asyncio.sleep(30)
+        try:
+            if not _TUNNEL_URL_FILE:
+                break
+            if os.path.isfile(_TUNNEL_URL_FILE):
+                candidate = open(_TUNNEL_URL_FILE).read().strip()
+            else:
+                candidate = ""
+            if candidate == (_CURRENT_TUNNEL_URL or ""):
+                continue
+            _CURRENT_TUNNEL_URL = candidate or None
+            if _CURRENT_TUNNEL_URL:
+                log.info("[tunnel-watcher] URL changed → %s", _CURRENT_TUNNEL_URL)
+                https_url = _CURRENT_TUNNEL_URL.replace("wss://", "https://")
+                set_media_base_url(https_url)
+                if _TUNNEL_RETRY_TASK and not _TUNNEL_RETRY_TASK.done():
+                    _TUNNEL_RETRY_TASK.cancel()
+                _TUNNEL_RETRY_TASK = _spawn_task(
+                    "notify-fcm:tunnel", _notify_fcm_tunnel_with_retry(_CURRENT_TUNNEL_URL)
+                )
+            else:
+                log.info("[tunnel-watcher] URL cleared (cloudflared restarting?)")
+            _spawn_task(
+                "broadcast-tunnel-url",
+                _broadcast_json({
+                    "type": "tunnel_url",
+                    "url": _CURRENT_TUNNEL_URL or "",
+                    "instance_id": _INSTANCE_ID,
+                }),
+            )
+        except Exception as exc:
+            log.warning("[tunnel-watcher] error: %s", exc)
+
+
 async def _warmup_history_cache_background() -> None:
     """啟動後延遲 8 秒，趁空閒預建所有 backend 的 session history index。"""
     await asyncio.sleep(8)
@@ -2486,6 +2530,15 @@ async def main(port: int, tunnel: bool = False,
         else os.environ.get("BRIDGE_DATA_DIR", "") or BRIDGE_DIR
     )
     _init_paths(resolved_data_dir)
+
+    # Load tunnel URL from external file if cloudflared is managed by launchd.
+    global _TUNNEL_URL_FILE, _CURRENT_TUNNEL_URL
+    _TUNNEL_URL_FILE = os.environ.get("BRIDGE_TUNNEL_URL_FILE", "")
+    if _TUNNEL_URL_FILE and os.path.isfile(_TUNNEL_URL_FILE):
+        _stored = open(_TUNNEL_URL_FILE).read().strip()
+        if _stored:
+            _CURRENT_TUNNEL_URL = _stored
+            log.info("Loaded tunnel URL from file: %s", _stored)
 
     global _PAIRING
     _PAIRING = _load_pairing()
@@ -2603,10 +2656,17 @@ async def main(port: int, tunnel: bool = False,
 
     async with serve(**serve_kwargs):
         log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
-        if tunnel:
-            _spawn_task("cloudflared-start", _start_cloudflared_tunnel(port))
-        if os.environ.get("BRIDGE_AUTO_TUNNEL") == "1":
-            _spawn_task("cloudflared-watchdog", _cloudflared_watchdog())
+        if _TUNNEL_URL_FILE:
+            # External tunnel management: cloudflared_launcher.sh owns the process.
+            # Bridge just polls the URL file and broadcasts changes.
+            log.info("External tunnel mode: watching %s", _TUNNEL_URL_FILE)
+            _spawn_task("tunnel-url-watcher", _tunnel_url_file_watcher())
+        else:
+            # Self-managed tunnel (legacy / manual --tunnel flag).
+            if tunnel:
+                _spawn_task("cloudflared-start", _start_cloudflared_tunnel(port))
+            if os.environ.get("BRIDGE_AUTO_TUNNEL") == "1":
+                _spawn_task("cloudflared-watchdog", _cloudflared_watchdog())
         init_cache_db()
         _spawn_task("preload-sessions-cache:startup", preload_sessions_cache(_BACKENDS))
         _spawn_task("session-cache-refresher", _session_cache_refresher())

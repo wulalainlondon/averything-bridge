@@ -107,6 +107,8 @@ rsync -a --delete \
   --exclude 'launchd-wrapper.log' \
   --exclude 'instances.json' \
   --exclude 'install.sh' \
+  --exclude 'tunnel_url.txt' \
+  --exclude 'bridge_identity.json' \
   "$SRC_DIR/" "$RUNTIME_DIR/"
 cd "$RUNTIME_DIR"
 
@@ -169,7 +171,7 @@ else
   pip install -r requirements.txt --quiet
 fi
 
-chmod +x run_bridge.sh bridge_supervisor.sh supervisor_instance.sh bridge_healthcheck.py bridge_launch.sh restart_agent.sh
+chmod +x run_bridge.sh bridge_supervisor.sh supervisor_instance.sh bridge_healthcheck.py bridge_launch.sh restart_agent.sh cloudflared_launcher.sh
 
 # ============================================================================
 # Install cloudflared for auto-tunnel support (best-effort).
@@ -185,6 +187,22 @@ else
   echo "    WARNING: brew not found — cloudflared skipped."
   echo "             Auto-tunnel will not work until cloudflared is installed."
   echo "             Manual install: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/"
+fi
+
+# ============================================================================
+# Check git — required for diff visualization feature.
+# ============================================================================
+echo "==> Check git"
+if command -v git >/dev/null 2>&1; then
+  echo "    git already installed: $(git --version)"
+elif command -v brew >/dev/null 2>&1; then
+  echo "    Installing git via Homebrew..."
+  brew install git --quiet
+  echo "    git installed: $(git --version)"
+else
+  echo "    WARNING: git not found and Homebrew is unavailable."
+  echo "             To install: xcode-select --install"
+  echo "             (This opens a macOS system dialog to install Command Line Tools)"
 fi
 
 # ============================================================================
@@ -220,7 +238,8 @@ cat > "$PLIST_TMP" <<PLIST
     <key>HOME</key><string>$HOME</string>
     <key>BRIDGE_INSTANCES_CONFIG</key><string>$RUNTIME_DIR/instances.json</string>
     <key>BRIDGE_DISABLE_MDNS</key><string>0</string>
-    <key>BRIDGE_AUTO_TUNNEL</key><string>1</string>
+    <key>BRIDGE_AUTO_TUNNEL</key><string>0</string>
+    <key>BRIDGE_TUNNEL_URL_FILE</key><string>$RUNTIME_DIR/tunnel_url.txt</string>
   </dict>
   <key>SoftResourceLimits</key>
   <dict>
@@ -360,6 +379,71 @@ fi
 # (on a restart_bridge WS command), launchd fires restart_agent.sh which
 # does a kickstart of the bridge service without being in its process tree.
 # ============================================================================
+# ============================================================================
+# Register cloudflared as an independent launchd service.
+#
+# Key invariant: if the plist is UNCHANGED, we do NOT restart the service.
+# This preserves the running cloudflared process (and its tunnel URL) across
+# bridge deploys.  Only a plist change (e.g. port update) forces a restart.
+# ============================================================================
+echo "==> Register cloudflared service"
+CFD_LABEL="com.claude-bridge.cloudflared"
+CFD_PLIST_PATH="$LAUNCH_AGENTS/$CFD_LABEL.plist"
+CFD_TARGET="gui/$(id -u)/$CFD_LABEL"
+CFD_URL_FILE="$RUNTIME_DIR/tunnel_url.txt"
+
+if ! command -v cloudflared >/dev/null 2>&1; then
+  echo "    cloudflared not installed — skipping service registration"
+  echo "    (install via: brew install cloudflared)"
+else
+  CFD_TMP="$(mktemp -t claude-bridge-cfd.XXXXXX)"
+  cat > "$CFD_TMP" <<CFD_PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$CFD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec $RUNTIME_DIR/cloudflared_launcher.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>$RUNTIME_DIR</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/tmp/$CFD_LABEL.stdout.log</string>
+  <key>StandardErrorPath</key><string>/tmp/$CFD_LABEL.stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>BRIDGE_DATA_DIR</key><string>$RUNTIME_DIR</string>
+    <key>BRIDGE_PORT</key><string>8766</string>
+    <key>BRIDGE_TUNNEL_URL_FILE</key><string>$CFD_URL_FILE</string>
+  </dict>
+</dict>
+</plist>
+CFD_PLIST_EOF
+
+  if [[ ! -f "$CFD_PLIST_PATH" ]] || ! cmp -s "$CFD_TMP" "$CFD_PLIST_PATH"; then
+    # Plist changed (or first install) — restart service to pick up new config.
+    mv "$CFD_TMP" "$CFD_PLIST_PATH"
+    echo "    cloudflared plist updated — restarting service"
+    if launchctl print "$CFD_TARGET" >/dev/null 2>&1; then
+      launchctl bootout "$CFD_TARGET" 2>/dev/null || true
+      sleep 1
+    fi
+    launchctl bootstrap "$DOMAIN_TARGET" "$CFD_PLIST_PATH"
+    launchctl enable "$CFD_TARGET" 2>/dev/null || true
+    echo "    cloudflared service registered (will acquire new tunnel URL)"
+  else
+    rm -f "$CFD_TMP"
+    echo "    cloudflared plist unchanged — service left running (tunnel URL preserved)"
+  fi
+fi
+
 echo "==> Register restart-agent"
 RAGENT_LABEL="com.claude-bridge.restart-agent"
 RAGENT_PLIST_PATH="$LAUNCH_AGENTS/$RAGENT_LABEL.plist"

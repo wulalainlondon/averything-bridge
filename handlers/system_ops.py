@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import shutil
 import time
 import platform
+
+_GITIGNORE_DEFAULTS = """\
+node_modules/
+dist/
+.next/
+build/
+out/
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.DS_Store
+.gradle/
+.idea/
+*.class
+"""
 
 
 async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
@@ -104,6 +125,66 @@ async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         msg_builder = ctx["msg_agent_tree"]
         try:
             await ws.send(json.dumps(msg_builder(session_id, tree_data)))
+        except Exception:
+            pass
+        return True
+
+    if mtype == "get_git_diff":
+        session_id = msg.get("session_id", "")
+        sessions = ctx["sessions"]
+        session = sessions.get(session_id)
+        cwd = session.cwd if session else ""
+
+        if not cwd or not os.path.isdir(cwd):
+            payload = {"type": "git_diff_result", "session_id": session_id, "diff": "", "error": "no_cwd", "initialized": False}
+        elif shutil.which("git") is None:
+            payload = {"type": "git_diff_result", "session_id": session_id, "diff": "", "error": "git_not_found", "initialized": False}
+        else:
+            initialized = False
+            if not os.path.isdir(os.path.join(cwd, ".git")):
+                # Auto-init: write .gitignore if absent, then create baseline commit
+                try:
+                    gitignore_path = os.path.join(cwd, ".gitignore")
+                    if not os.path.exists(gitignore_path):
+                        with open(gitignore_path, "w", encoding="utf-8") as f:
+                            f.write(_GITIGNORE_DEFAULTS)
+                    for args in [
+                        ["git", "init"],
+                        ["git", "add", "-A"],
+                        ["git", "-c", "user.email=bridge@local", "-c", "user.name=claude-bridge",
+                         "commit", "-m", "baseline (claude-bridge)", "--allow-empty"],
+                    ]:
+                        proc = await asyncio.create_subprocess_exec(
+                            *args, cwd=cwd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        await asyncio.wait_for(proc.communicate(), timeout=30)
+                    initialized = True
+                except Exception as exc:
+                    payload = {"type": "git_diff_result", "session_id": session_id, "diff": "", "error": str(exc), "initialized": False}
+                    try:
+                        await ws.send(json.dumps(payload))
+                    except Exception:
+                        pass
+                    return True
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "diff", "HEAD",
+                    cwd=cwd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                payload = {"type": "git_diff_result", "session_id": session_id, "diff": stdout.decode("utf-8", errors="replace"), "error": None, "initialized": initialized}
+            except asyncio.TimeoutError:
+                payload = {"type": "git_diff_result", "session_id": session_id, "diff": "", "error": "timeout", "initialized": False}
+            except Exception as exc:
+                payload = {"type": "git_diff_result", "session_id": session_id, "diff": "", "error": str(exc), "initialized": False}
+
+        try:
+            await ws.send(json.dumps(payload))
         except Exception:
             pass
         return True
