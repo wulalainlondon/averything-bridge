@@ -1,6 +1,8 @@
-# claude-bridge
+# averything-bridge
 
 Control Claude, Codex, or Ollama on your Mac from your phone.
+
+**[Download Android app (v1.1.0)](https://github.com/wulalainlondon/averything-bridge/releases/latest/download/averything-v1.1.0.apk)**
 
 For AI agents/Codex auto-setup instructions, see `AGENTS.md`.
 
@@ -26,8 +28,8 @@ The bridge manages sessions, streams responses back to your phone in real time, 
 ## Quick start
 
 ```bash
-git clone https://github.com/your-username/claude-bridge
-cd claude-bridge
+git clone https://github.com/wulalainlondon/averything-bridge
+cd averything-bridge
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 venv/bin/python bridge_v2.py --port 8766
@@ -151,7 +153,8 @@ See [docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md) for the full setup guide.
 
 ## Companion app
 
-→ [claude-bridge-app](https://github.com/your-username/claude-bridge-app) — the Android/iOS app
+→ [averything-app](https://github.com/BridgeAverthing/averything-app) — Android/iOS app source
+→ [Download latest APK](https://github.com/wulalainlondon/averything-bridge/releases/latest)
 
 ## License
 
