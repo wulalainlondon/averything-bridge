@@ -343,7 +343,13 @@ console.log(JSON.stringify(data));
             def fmt(entry):
                 if not entry:
                     return None
-                return {"utilization": entry.get("utilization"), "resets_at": entry.get("resets_at")}
+                util = entry.get("utilization")
+                if util is not None:
+                    try:
+                        util = float(util) / 100.0
+                    except (TypeError, ValueError):
+                        util = None
+                return {"utilization": util, "resets_at": entry.get("resets_at")}
 
             await ws.send(json.dumps(_msg_usage_report(
                 fmt(data.get("five_hour")),
@@ -1116,8 +1122,26 @@ console.log(JSON.stringify(data));
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
         ]
+        model_str = session.model or ""
+        if model_str == "opusplan":
+            # Plan mode: Claude plans but does not execute tools; no permission bypass needed
+            cmd += ["--model", "opus", "--permission-mode", "plan"]
+        else:
+            if session.sandbox == "read-only":
+                cmd += [
+                    "--dangerously-skip-permissions",
+                    "--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch",
+                ]
+            elif session.sandbox == "workspace-write":
+                cmd += [
+                    "--dangerously-skip-permissions",
+                    "--disallowedTools", "Bash",
+                ]
+            else:
+                cmd.append("--dangerously-skip-permissions")
+            if model_str:
+                cmd += ["--model", model_str]
         if session.resume_id:
             cmd += ["--resume", session.resume_id]
         if session.effort and session.effort != "auto":

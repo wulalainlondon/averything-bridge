@@ -65,7 +65,7 @@ class OllamaBackend(Backend):
             async with aiohttp.ClientSession() as client:
                 async with client.post(
                     f"{self.host}/api/chat",
-                    json={"model": self.model, "messages": history, "stream": True},
+                    json={"model": session.model or self.model, "messages": history, "stream": True},
                     timeout=aiohttp.ClientTimeout(total=300),
                 ) as resp:
                     if resp.status != 200:

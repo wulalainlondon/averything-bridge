@@ -108,7 +108,7 @@ load_session_history(resume_id, limit)     # default: []
 | Capability | Claude CLI | Codex | Ollama |
 |-----------|:---------:|:-----:|:------:|
 | supports_resume | ✓ | ✓ | ✓ |
-| fetch_usage | ✓ | ✗ | ✗ |
+| fetch_usage | ✓ | ✓ | ✗ |
 | get_resumable_sessions | ✓ | ✓ | ✗ |
 | load_session_history | ✓ | ✓ | ✓ |
 

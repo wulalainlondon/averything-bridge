@@ -10,7 +10,11 @@ async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
     if mtype == "get_usage":
         sessions = ctx["sessions"]
         session_backend = ctx["session_backend"]
-        if sessions:
+        session_id = msg.get("session_id")
+        if session_id and session_id in sessions:
+            backend = session_backend(sessions[session_id])
+            ctx["asyncio"].create_task(backend.fetch_usage(ws))
+        elif sessions:
             backends = {session_backend(s) for s in sessions.values()}
             for backend in backends:
                 ctx["asyncio"].create_task(backend.fetch_usage(ws))

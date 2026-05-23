@@ -35,6 +35,7 @@ async def handle_session_message(
         resume_claude_id = msg.get("resume_claude_id", "")
         backend_name = ctx.normalize_backend_name(msg.get("backend"))
         effort = msg.get("effort", "")
+        model = str(msg.get("model") or "")
         sandbox = str(msg.get("sandbox") or "danger-full-access")
         image_dir = str(msg.get("image_dir") or "")
         if image_dir:
@@ -81,6 +82,7 @@ async def handle_session_message(
                 ws_ref=ws,
                 resume_id=resume_claude_id or None,
                 effort=effort,
+                model=model,
                 backend_name=backend_name,
                 sandbox=sandbox,
                 image_dir=image_dir,

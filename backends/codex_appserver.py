@@ -620,36 +620,47 @@ class CodexAppServerBackend(Backend, _StatesMixin):
             log.info("codex-appserver warmup_history_cache: pre-built index for %d sessions", warmed)
 
     async def fetch_usage(self, ws) -> None:
+        from datetime import datetime, timezone as _tz
+
+        rpc_rate_limits: dict = {}
         try:
             await self._ensure_server()
             result = await self._rpc("account/rateLimits/read", None, timeout=10.0)
-            rate_limits = result.get("rateLimits") or result.get("rate_limits") or {}
-            if isinstance(rate_limits, dict):
+            rpc_rate_limits = result.get("rateLimits") or result.get("rate_limits") or {}
+            if isinstance(rpc_rate_limits, dict):
                 for state in self._states.values():
-                    state.last_rate_limits = rate_limits
+                    state.last_rate_limits = rpc_rate_limits
         except Exception as exc:
             log.debug("[codex-appserver] account/rateLimits/read failed: %s", exc)
 
-        latest: _AppServerState | None = None
-        for state in self._states.values():
-            if latest is None or state.usage_updated_at > latest.usage_updated_at:
-                latest = state
+        # Use fresh RPC result; fall back to cached state only if RPC failed
+        rate_limits: dict = rpc_rate_limits
+        if not rate_limits:
+            latest: _AppServerState | None = None
+            for state in self._states.values():
+                if latest is None or state.usage_updated_at > latest.usage_updated_at:
+                    latest = state
+            rate_limits = latest.last_rate_limits if latest else {}
 
         def fmt_window(window: dict | None) -> dict | None:
             if not isinstance(window, dict):
                 return None
-            utilization = window.get("usedPercent")
-            if utilization is None:
-                utilization = window.get("used_percent")
-            resets_at = window.get("resetsAt")
-            if resets_at is None:
-                resets_at = window.get("resets_at")
+            used_pct = window.get("usedPercent")
+            if used_pct is None:
+                used_pct = window.get("used_percent")
+            utilization = None
+            if used_pct is not None:
+                try:
+                    utilization = (100.0 - float(used_pct)) / 100.0
+                except (TypeError, ValueError):
+                    utilization = None
+            resets_at = window.get("resetsAt") or window.get("resets_at")
+            if isinstance(resets_at, (int, float)) and resets_at > 1e9:
+                resets_at = datetime.fromtimestamp(resets_at, tz=_tz.utc).isoformat()
             return {
                 "utilization": utilization,
                 "resets_at": str(resets_at) if resets_at is not None else None,
             }
-
-        rate_limits = latest.last_rate_limits if latest else {}
         five_hour = fmt_window(rate_limits.get("primary") if isinstance(rate_limits, dict) else None)
         seven_day = fmt_window(rate_limits.get("secondary") if isinstance(rate_limits, dict) else None)
 
