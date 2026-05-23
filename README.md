@@ -156,6 +156,10 @@ See [docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md) for the full setup guide.
 → [averything-app](https://github.com/BridgeAverthing/averything-app) — Android/iOS app source
 → [Download latest APK](https://github.com/wulalainlondon/averything-bridge/releases/latest)
 
+## Contact
+
+Questions or feedback → open an issue or email wulalainlondon@gmail.com
+
 ## License
 
 MIT
