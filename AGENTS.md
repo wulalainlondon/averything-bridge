@@ -28,4 +28,24 @@ When an agent opens this repo, perform setup automatically:
    - If **no** (or ADB unavailable): tell the user to download the APK manually from:
      `https://github.com/wulalainlondon/averything-bridge/releases/latest`
 
+7. **Ask the user:** "Do you want push notifications when AI tasks finish? (optional — requires a free Firebase account)"
+   - If **yes**, follow these steps:
+     ```
+     Step 1: Go to https://console.firebase.google.com and create a new project.
+     Step 2: In the project, go to Project Settings → Service accounts → Generate new private key.
+             Download the JSON file.
+     Step 3: Place the file at ~/.config/claude-bridge/serviceAccountKey.json
+             (or set SERVICE_ACCOUNT_FILE env var to its path)
+     Step 4: Run the bridge install script again so it picks up the key:
+     ```
+     ```bash
+     # macOS/Linux
+     bash install.sh
+
+     # Windows
+     powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1
+     ```
+     Confirm FCM is active by checking the bridge log for "Firebase FCM initialized".
+   - If **no**: skip — bridge works fine without it. Push notifications will be disabled.
+
 Do not ask follow-up questions unless a command fails.
