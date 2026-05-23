@@ -1,24 +1,24 @@
 # averything-bridge
 
-Control Claude, Codex, or Ollama on your Mac from your phone.
+Control Claude, Codex, or Ollama on your computer from your phone.
 
 **[Download Android app (v1.1.0)](https://github.com/wulalainlondon/averything-bridge/releases/latest/download/averything-v1.1.0.apk)**
 
 For AI agents/Codex auto-setup instructions, see `AGENTS.md`.
 
-This is the server-side bridge. It runs on your Mac and connects your mobile app to local AI runtimes via WebSocket. I built this because I wanted to use Claude from my phone while the actual computation runs on my Mac — and I use it every day.
+This is the server-side bridge. It runs on your computer (Mac, Windows, or Linux) and connects your mobile app to local AI runtimes via WebSocket. I built this because I wanted to use Claude from my phone while the actual computation runs on my machine — and I use it every day.
 
 ## How it works
 
 ```
-Phone App  ──WebSocket──  bridge (your Mac)  ──subprocess──  Claude / Codex / Ollama
+Phone App  ──WebSocket──  bridge (Mac / Windows / Linux)  ──subprocess──  Claude / Codex / Ollama
 ```
 
 The bridge manages sessions, streams responses back to your phone in real time, and handles reconnects, offline buffering, and push notifications when a long task finishes.
 
 ## Requirements
 
-- macOS (Linux/Windows also supported; auto-start script is macOS-only)
+- **Mac, Windows, or Linux** — anything that runs Python 3.10+
 - Python 3.10+
 - At least one of:
   - [Claude CLI](https://claude.ai/download) (`npm install -g @anthropic-ai/claude-code`)
@@ -43,7 +43,7 @@ py -3 -m venv venv
 .\venv\Scripts\python bridge_v2.py --port 8766
 ```
 
-Then open the companion app on your phone and point it at your Mac's IP.
+Then open the companion app on your phone and point it at your computer's IP.
 
 ## One-click install
 
