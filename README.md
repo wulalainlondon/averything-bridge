@@ -2,7 +2,7 @@
 
 Control Claude, Codex, or Ollama on your computer from your phone.
 
-**[Download Android app (v1.1.0)](https://github.com/wulalainlondon/averything-bridge/releases/latest/download/averything-v1.1.0.apk)**
+**[Download Android app (v1.2.1)](https://github.com/wulalainlondon/averything-bridge/releases/latest/download/averything-v1.2.1.apk)**
 
 For AI agents/Codex auto-setup instructions, see `AGENTS.md`.
 

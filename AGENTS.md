@@ -21,7 +21,7 @@ When an agent opens this repo, perform setup automatically:
      adb devices
 
      # Download and install APK
-     curl -L -o /tmp/averything.apk https://github.com/wulalainlondon/averything-bridge/releases/latest/download/averything-v1.1.0.apk
+     curl -L -o /tmp/averything.apk https://github.com/wulalainlondon/averything-bridge/releases/latest/download/averything-v1.2.1.apk
      adb install /tmp/averything.apk
      ```
      If no device is listed by `adb devices`, tell the user to connect their phone via USB with USB debugging enabled (Settings → Developer options → USB debugging), then retry.
