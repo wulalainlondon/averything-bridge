@@ -544,13 +544,13 @@ async def _emit_resume_progress(
 async def _shell_reader(shell: "ShellSession") -> None:
     try:
         while True:
-            line = await shell.proc.stdout.readline()
-            if not line:
+            chunk = await shell.proc.stdout.read(4096)
+            if not chunk:
                 break
             if shell.ws_ref:
                 try:
                     await shell.ws_ref.send(json.dumps(
-                        _msg_shell_output(shell.shell_id, line.decode("utf-8", errors="replace"))
+                        _msg_shell_output(shell.shell_id, chunk.decode("utf-8", errors="replace"))
                     ))
                 except Exception:
                     break
