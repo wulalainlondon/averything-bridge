@@ -540,7 +540,7 @@ def test_router_switch_session_config_creates_handoff_session():
             cwd="/work",
             resume_id="resume-1",
             backend_name="codex",
-            model="gpt-5",
+            model="gpt-5.5",
             effort="low",
         )
         sessions = {"s1": source}
@@ -569,7 +569,7 @@ def test_router_switch_session_config_creates_handoff_session():
     assert handled is True
     assert new_session.name == "One (switch)"
     assert new_session.resume_id is None
-    assert new_session.model == "gpt-5.1"
+    assert new_session.model == "gpt-5.5"
     assert new_session.effort == "high"
     assert new_session.queue[0].content == "handoff"
     assert sent[-1]["type"] == "session_switched"

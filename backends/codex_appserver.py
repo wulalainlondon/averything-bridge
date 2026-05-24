@@ -44,6 +44,7 @@ _CODEX_WRAPPER_CLOSED_RE = re.compile(
 # Errors that mean the Codex thread no longer exists on the server side
 # (e.g. app-server restarted). Detected here so we can respawn silently.
 _STALE_THREAD_RE = re.compile(r"Unknown session", re.IGNORECASE)
+CODEX_MODEL = "gpt-5.5"
 
 
 @dataclass
@@ -277,9 +278,8 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                 state.thread_id = None  # fall through to thread/start
 
         if state.thread_id is None:
-            model = session.model or "gpt-5.5"
             result = await self._rpc("thread/start", {
-                "model": model,
+                "model": CODEX_MODEL,
                 "cwd": cwd,
                 "ephemeral": False,
                 "approvalPolicy": "never",

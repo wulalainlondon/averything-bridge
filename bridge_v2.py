@@ -943,7 +943,11 @@ async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> N
     if not mime_type:
         mime_type = "application/octet-stream"
 
-    target_device_ids = client_manager.connected_device_ids(sender_device_id)
+    target_device_ids = [
+        device_id
+        for device_id in client_manager.connected_device_ids()
+        if device_id != sender_device_id
+    ]
 
     # Inline path: base64-encode and send directly over WebSocket (no Firebase)
     if size <= _PUSH_INLINE_MAX_BYTES:
@@ -1056,7 +1060,8 @@ async def _handle_file_push_ack(file_id: str, device_id: str = "") -> None:
     if device_id:
         acked.add(device_id)
         entry["acked_device_ids"] = sorted(acked)
-    should_delete = bool(target) and target.issubset(acked)
+        _save_inbox()
+    should_delete = target.issubset(acked) if target else bool(acked)
     if not should_delete:
         return
     _PUSH_FILE_REGISTRY.pop(file_id, None)
@@ -2020,6 +2025,9 @@ async def handler(ws: ServerConnection) -> None:
             if _reconnect_now - entry.get("pushed_at", 0) > _INBOX_TTL_SECONDS:
                 continue
             acked = set(entry.get("acked_device_ids") or [])
+            target = set(entry.get("target_device_ids") or [])
+            if target and device_id and device_id not in target:
+                continue
             if device_id and device_id in acked:
                 continue
             payload: dict = {
@@ -2229,6 +2237,9 @@ async def handler(ws: ServerConnection) -> None:
                     if inbox_now - entry.get("pushed_at", 0) > _INBOX_TTL_SECONDS:
                         continue
                     acked = set(entry.get("acked_device_ids") or [])
+                    target = set(entry.get("target_device_ids") or [])
+                    if target and inbox_device_id and inbox_device_id not in target:
+                        continue
                     if inbox_device_id and inbox_device_id in acked:
                         continue
                     item = {

@@ -11,6 +11,7 @@ from route_utils import safe_send_json
 from utils.path_jail import resolve_jailed, JailEscape
 
 log = logging.getLogger(__name__)
+CODEX_MODEL = "gpt-5.5"
 
 
 async def handle_session_message(
@@ -36,6 +37,8 @@ async def handle_session_message(
         backend_name = ctx.normalize_backend_name(msg.get("backend"))
         effort = msg.get("effort", "")
         model = str(msg.get("model") or "")
+        if backend_name == "codex":
+            model = CODEX_MODEL
         sandbox = str(msg.get("sandbox") or "danger-full-access")
         image_dir = str(msg.get("image_dir") or "")
         if image_dir:
@@ -222,6 +225,8 @@ async def handle_session_message(
 
         target_backend = ctx.normalize_backend_name(msg.get("backend") or source.backend_name)
         target_model = str(msg.get("model") or source.model or "")
+        if target_backend == "codex":
+            target_model = CODEX_MODEL
         target_effort = str(msg.get("effort") if "effort" in msg else source.effort or "")
         requested_sandbox = str(msg.get("sandbox") or "")
         target_sandbox = requested_sandbox or source.sandbox or "danger-full-access"

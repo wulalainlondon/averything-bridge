@@ -148,3 +148,45 @@ def test_send_event_buffers_when_only_stale_clients_exist(monkeypatch):
         {"type": "text_chunk", "content": "buffer me", "session_id": "s1"}
     ]
     assert clients == {}
+
+
+def test_file_push_ack_deletes_when_no_original_targets(monkeypatch):
+    import bridge_v2 as bv2
+
+    saves = []
+    monkeypatch.setattr(bv2, "_save_inbox", lambda: saves.append(dict(bv2._PUSH_FILE_REGISTRY)))
+    monkeypatch.setattr(bv2, "_firebase_storage_app", None)
+    bv2._PUSH_FILE_REGISTRY = {
+        "file_1": {
+            "blob_path": None,
+            "filename": "a.txt",
+            "target_device_ids": [],
+            "acked_device_ids": [],
+        }
+    }
+
+    asyncio.run(bv2._handle_file_push_ack("file_1", "phone_1"))
+
+    assert "file_1" not in bv2._PUSH_FILE_REGISTRY
+    assert len(saves) == 2
+
+
+def test_file_push_ack_persists_partial_ack_until_all_targets(monkeypatch):
+    import bridge_v2 as bv2
+
+    saves = []
+    monkeypatch.setattr(bv2, "_save_inbox", lambda: saves.append(dict(bv2._PUSH_FILE_REGISTRY)))
+    monkeypatch.setattr(bv2, "_firebase_storage_app", None)
+    bv2._PUSH_FILE_REGISTRY = {
+        "file_1": {
+            "blob_path": None,
+            "filename": "a.txt",
+            "target_device_ids": ["phone_1", "phone_2"],
+            "acked_device_ids": [],
+        }
+    }
+
+    asyncio.run(bv2._handle_file_push_ack("file_1", "phone_1"))
+
+    assert bv2._PUSH_FILE_REGISTRY["file_1"]["acked_device_ids"] == ["phone_1"]
+    assert saves
