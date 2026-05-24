@@ -29,6 +29,8 @@ from .events import (
     _msg_session_uuid, _msg_usage_report,
 )
 from .history import complete_history_message, clamp_history_limit, load_indexed_jsonl_messages, slice_history, _JSONL_HISTORY_CACHE, DEFAULT_HISTORY_LIMIT
+from interactions import REGISTRY as INTERACTIONS, normalize_questions
+from push_registry import notify_fcm_user_input as _notify_fcm_user_input
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
@@ -45,6 +47,28 @@ _CODEX_WRAPPER_CLOSED_RE = re.compile(
 # (e.g. app-server restarted). Detected here so we can respawn silently.
 _STALE_THREAD_RE = re.compile(r"Unknown session", re.IGNORECASE)
 CODEX_MODEL = "gpt-5.5"
+
+# Matches a JSON block (in a fenced code block or inline) containing ask_user_question.
+_ASK_USER_RE = re.compile(
+    r"```(?:json)?\s*(\{[^`]*?\"(?:ask_user_question|AskUserQuestion)\"[^`]*?\})\s*```"
+    r"|(\{[^{}]*\"(?:ask_user_question|AskUserQuestion)\"[^{}]*\})",
+    re.DOTALL,
+)
+
+
+def _extract_ask_user_question(text: str) -> dict | None:
+    """Return the first AskUserQuestion JSON block found in Codex output, or None."""
+    for m in _ASK_USER_RE.finditer(text):
+        raw = m.group(1) or m.group(2)
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and str(data.get("type", "")).lower() in (
+                "ask_user_question", "askuserquestion"
+            ):
+                return data
+        except Exception:
+            continue
+    return None
 
 
 @dataclass
@@ -348,6 +372,20 @@ class CodexAppServerBackend(Backend, _StatesMixin):
 
         asyncio.create_task(self._run_turn(session, state, user_input))
 
+    async def handle_user_input_response(self, session: "Session", interaction, response: dict) -> None:
+        answers = response.get("answers") if isinstance(response.get("answers"), dict) else {}
+        if not answers:
+            answers = {
+                k: v for k, v in response.items()
+                if k not in {"type", "response_type", "request_id", "session_id"}
+            }
+        payload = json.dumps({
+            "request_id": interaction.request_id,
+            "answers": answers,
+            "cancelled": bool(response.get("cancelled") or response.get("canceled")),
+        }, ensure_ascii=False)
+        await self.send(session, f"Structured user input response:\n{payload}")
+
     async def _run_turn(self, session: "Session", state: _AppServerState,
                         user_input: list[dict]) -> None:
         try:
@@ -406,6 +444,31 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                 log.warning("[codex-appserver] turn error: %s", state.turn_error)
                 await send_event(session, _evt_error(state.turn_error, "turn_error"))
             else:
+                # Detect AskUserQuestion JSON block in Codex output.
+                _ask_data = _extract_ask_user_question(session.accumulated_text or "")
+                if _ask_data is not None:
+                    try:
+                        _questions = normalize_questions(_ask_data)
+                        _header = str(_ask_data.get("header") or _ask_data.get("title") or "Question")
+                        _interaction = await INTERACTIONS.create(
+                            session_id=session.session_id,
+                            source="codex",
+                            kind="ask_user_question",
+                            questions=_questions,
+                            header=_header,
+                            requesting_agent="AskUserQuestion",
+                            raw_command=_ask_data,
+                            broadcast_json=self._broadcast_fn,
+                        )
+                        asyncio.create_task(_notify_fcm_user_input(
+                            session_name=session.name,
+                            header=_header,
+                            question_text=_questions[0].get("text", "") if _questions else "",
+                            session_id=session.session_id,
+                            request_id=_interaction.request_id,
+                        ))
+                    except Exception as _exc:
+                        log.warning("[codex-appserver] AskUserQuestion extraction failed: %s", _exc)
                 if self._notify_fcm_fn is not None:
                     asyncio.create_task(
                         self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id)

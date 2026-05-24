@@ -5,6 +5,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Coroutine
 
+from handlers.feed_ops import (
+    handle_feed_push,
+    handle_feed_list_request,
+    handle_feed_fetch,
+    handle_feed_mark_read,
+    handle_feed_delete,
+)
 from handlers.fork_ops import handle_fork_message
 from prompt_routes import handle_prompt_message
 from route_utils import safe_send_json as _safe_send_json
@@ -234,6 +241,49 @@ async def handle_low_coupling_message(
         ctx.spawn_task(
             f"send-all-sessions:{client.client_id}",
             ctx.send_all_sessions(ws),
+        )
+        return True
+
+    if mtype == "feed_push":
+        ctx.spawn_task(
+            f"feed-push:{client.device_id}",
+            handle_feed_push(
+                ws,
+                title=msg["title"],
+                html=msg["html"],
+                source=str(msg.get("source") or "pipeline"),
+                url=str(msg.get("url") or ""),
+                client_dedup_key=str(msg.get("client_dedup_key") or ""),
+                content_type=str(msg.get("content_type") or "html"),
+            ),
+        )
+        return True
+
+    if mtype == "feed_list_request":
+        ctx.spawn_task(
+            f"feed-list:{client.device_id}",
+            handle_feed_list_request(ws),
+        )
+        return True
+
+    if mtype == "feed_fetch":
+        ctx.spawn_task(
+            f"feed-fetch:{msg['feed_id']}",
+            handle_feed_fetch(ws, feed_id=msg["feed_id"]),
+        )
+        return True
+
+    if mtype == "feed_mark_read":
+        ctx.spawn_task(
+            f"feed-mark-read:{msg['feed_id']}",
+            handle_feed_mark_read(ws, feed_id=msg["feed_id"]),
+        )
+        return True
+
+    if mtype == "feed_delete":
+        ctx.spawn_task(
+            f"feed-delete:{msg['feed_id']}",
+            handle_feed_delete(ws, feed_id=msg["feed_id"]),
         )
         return True
 

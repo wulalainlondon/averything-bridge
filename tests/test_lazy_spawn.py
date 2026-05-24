@@ -62,6 +62,7 @@ class TestRestoreSessionsNoSpawn:
     def test_restore_populates_sessions_without_spawn(self, tmp_path, monkeypatch):
         """Five saved sessions load into _SESSIONS with proc=None."""
         import bridge_v2 as bv2
+        import jsonl_sessions
         from backends.claude_cli import ClaudeCliBackend
 
         # Build a fake saved_sessions.json with 5 entries.
@@ -239,6 +240,7 @@ class TestBuildSessionsListNoSpawn:
     def test_codex_rollout_jsonl_registers_with_native_uuid(self, tmp_path, monkeypatch):
         """Codex rollout filenames must register by trailing UUID, not full stem."""
         import bridge_v2 as bv2
+        import jsonl_sessions
 
         uid = _random_uuid()
         root = tmp_path / "codex" / "sessions"
@@ -272,18 +274,35 @@ class TestBuildSessionsListNoSpawn:
         ]
         path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
-        monkeypatch.setattr(bv2, "CODEX_SESSIONS_DIR", str(root))
-        monkeypatch.setattr(bv2, "_SESSIONS", {})
+        sessions = {}
+        monkeypatch.setattr(jsonl_sessions, "CODEX_SESSIONS_DIR", str(root))
+        jsonl_sessions.configure(
+            sessions=sessions,
+            default_cwd=bv2.DEFAULT_CWD,
+            claude_projects_dir=bv2.CLAUDE_PROJECTS_DIR,
+            session_backend=bv2._session_backend,
+            broadcast_json=bv2._broadcast_json,
+            build_sessions_list=lambda: bv2.session_registry.build_sessions_list(
+                sessions,
+                recent_messages=jsonl_sessions.get_recent_messages_sync,
+            ),
+            dispatch_event=bv2._dispatch_event,
+            evt_done=bv2._evt_done,
+            log=bv2.log,
+        )
 
-        assert bv2._register_jsonl_session(str(path)) is True
-        result = bv2.build_sessions_list()
+        assert jsonl_sessions._register_jsonl_session(str(path)) is True
+        result = bv2.session_registry.build_sessions_list(
+            sessions,
+            recent_messages=jsonl_sessions.get_recent_messages_sync,
+        )
 
         assert len(result["sessions"]) == 1
         summary = result["sessions"][0]
         assert summary["backend"] == "codex"
         assert summary["cwd"] == "/tmp/lucky3"
         assert summary["name"] == "檢查 Lucky3 solver 狀態"
-        session = bv2._SESSIONS[summary["id"]]
+        session = sessions[summary["id"]]
         assert session.resume_id == uid
 
     def test_codex_history_skips_commentary_phase(self, tmp_path):

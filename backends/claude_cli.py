@@ -28,6 +28,9 @@ from .history import (
     HISTORY_INDEX_TTL_SECONDS, DEFAULT_HISTORY_LIMIT,
 )
 from .history_sqlite import sqlite_load, sqlite_save_background
+from interactions import REGISTRY as INTERACTIONS, normalize_questions
+from push_registry import notify_fcm_user_input as _notify_fcm_user_input
+from push_registry import notify_fcm_session_died as _notify_fcm_session_died
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
@@ -92,6 +95,46 @@ class ClaudeCliBackend(Backend, _StatesMixin):
 
     def _state_factory(self) -> _ClaudeState:
         return _ClaudeState()
+
+    async def _write_stream_json(self, session: "Session", payload: dict) -> None:
+        state = self._get_state(session)
+        if state.proc is None or state.proc.returncode is not None or state.proc.stdin is None:
+            await self._spawn_proc(session, allow_resume_fallback=True)
+        if state.proc is None or state.proc.returncode is not None or state.proc.stdin is None:
+            raise RuntimeError("Claude process is not running")
+        state.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+        await state.proc.stdin.drain()
+        session.last_activity = time.time()
+
+    async def handle_user_input_response(self, session: "Session", interaction: Any, response: dict) -> None:
+        answers = response.get("answers") if isinstance(response.get("answers"), dict) else {}
+        if not answers:
+            answers = {
+                k: v for k, v in response.items()
+                if k not in {"type", "response_type", "request_id", "session_id"}
+            }
+        output = json.dumps({
+            "request_id": interaction.request_id,
+            "answers": answers,
+            "cancelled": bool(response.get("cancelled") or response.get("canceled")),
+        }, ensure_ascii=False)
+        content_block: dict
+        if interaction.tool_use_id:
+            content_block = {
+                "type": "tool_result",
+                "tool_use_id": interaction.tool_use_id,
+                "content": output,
+            }
+        else:
+            content_block = {
+                "type": "text",
+                "text": f"Structured user input response:\n{output}",
+            }
+        await self._write_stream_json(session, {
+            "type": "user",
+            "message": {"role": "user", "content": [content_block]},
+        })
+        session.is_streaming = True
 
     # ------------------------------------------------------------------
     # Public Backend interface
@@ -1247,6 +1290,31 @@ console.log(JSON.stringify(data));
                         input_data = block.get("input", {})
                         command = input_data.get("command", json.dumps(input_data))
                         state.tool_blocks[tool_id] = {"name": name}
+                        if name == "AskUserQuestion":
+                            try:
+                                _questions = normalize_questions(input_data)
+                                _header = str(input_data.get("header") or input_data.get("title") or "Question")
+                                interaction = await INTERACTIONS.create(
+                                    session_id=session.session_id,
+                                    source="claude",
+                                    kind="ask_user_question",
+                                    questions=_questions,
+                                    header=_header,
+                                    tool_use_id=tool_id,
+                                    requesting_agent=name,
+                                    raw_command=input_data,
+                                    broadcast_json=self._broadcast_fn,
+                                )
+                                _q_text = _questions[0].get("text", "") if _questions else ""
+                                asyncio.create_task(_notify_fcm_user_input(
+                                    session_name=session.name,
+                                    header=_header,
+                                    question_text=_q_text,
+                                    session_id=session.session_id,
+                                    request_id=interaction.request_id,
+                                ))
+                            except Exception as exc:
+                                log.warning("[%s] AskUserQuestion bridge conversion failed: %s", session.session_id, exc)
                         await send_event(session, _evt_tool_start(tool_id, name, command))
 
             elif etype == "tool_result":
@@ -1491,6 +1559,10 @@ console.log(JSON.stringify(data));
             log.error("[%s] Session died after %d restart(s)", session.session_id, state.restart_count)
             await send_event(session, _evt_session_died(
                 f"Claude process exited (rc={rc}) and will not restart."
+            ))
+            asyncio.create_task(_notify_fcm_session_died(
+                session_name=session.name,
+                session_id=session.session_id,
             ))
 
     async def _agent_tree_poller(self, session: "Session") -> None:

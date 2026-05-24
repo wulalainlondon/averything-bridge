@@ -151,12 +151,12 @@ def test_send_event_buffers_when_only_stale_clients_exist(monkeypatch):
 
 
 def test_file_push_ack_deletes_when_no_original_targets(monkeypatch):
-    import bridge_v2 as bv2
+    import push_registry
 
     saves = []
-    monkeypatch.setattr(bv2, "_save_inbox", lambda: saves.append(dict(bv2._PUSH_FILE_REGISTRY)))
-    monkeypatch.setattr(bv2, "_firebase_storage_app", None)
-    bv2._PUSH_FILE_REGISTRY = {
+    monkeypatch.setattr(push_registry, "save_inbox", lambda: saves.append(dict(push_registry._PUSH_FILE_REGISTRY)))
+    monkeypatch.setattr(push_registry, "_firebase_storage_app", None)
+    push_registry._PUSH_FILE_REGISTRY = {
         "file_1": {
             "blob_path": None,
             "filename": "a.txt",
@@ -165,19 +165,19 @@ def test_file_push_ack_deletes_when_no_original_targets(monkeypatch):
         }
     }
 
-    asyncio.run(bv2._handle_file_push_ack("file_1", "phone_1"))
+    asyncio.run(push_registry.handle_file_push_ack("file_1", "phone_1"))
 
-    assert "file_1" not in bv2._PUSH_FILE_REGISTRY
+    assert "file_1" not in push_registry._PUSH_FILE_REGISTRY
     assert len(saves) == 2
 
 
 def test_file_push_ack_persists_partial_ack_until_all_targets(monkeypatch):
-    import bridge_v2 as bv2
+    import push_registry
 
     saves = []
-    monkeypatch.setattr(bv2, "_save_inbox", lambda: saves.append(dict(bv2._PUSH_FILE_REGISTRY)))
-    monkeypatch.setattr(bv2, "_firebase_storage_app", None)
-    bv2._PUSH_FILE_REGISTRY = {
+    monkeypatch.setattr(push_registry, "save_inbox", lambda: saves.append(dict(push_registry._PUSH_FILE_REGISTRY)))
+    monkeypatch.setattr(push_registry, "_firebase_storage_app", None)
+    push_registry._PUSH_FILE_REGISTRY = {
         "file_1": {
             "blob_path": None,
             "filename": "a.txt",
@@ -186,7 +186,7 @@ def test_file_push_ack_persists_partial_ack_until_all_targets(monkeypatch):
         }
     }
 
-    asyncio.run(bv2._handle_file_push_ack("file_1", "phone_1"))
+    asyncio.run(push_registry.handle_file_push_ack("file_1", "phone_1"))
 
-    assert bv2._PUSH_FILE_REGISTRY["file_1"]["acked_device_ids"] == ["phone_1"]
+    assert push_registry._PUSH_FILE_REGISTRY["file_1"]["acked_device_ids"] == ["phone_1"]
     assert saves

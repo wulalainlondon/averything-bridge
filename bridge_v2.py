@@ -10,14 +10,11 @@ Default port: 8766 (v1 keeps 8765).
 
 import argparse
 import asyncio
-import http
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-import mimetypes
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import time
@@ -33,7 +30,6 @@ except ImportError:
 # macOS launchd default is 256; plist HardResourceLimits may cap at 8192.
 # Strategy: always attempt to raise to _WANT_FDS; try relaxing hard limit too.
 _WANT_FDS = 65536
-_TURN_ABORTED_RE = re.compile(r"<turn_aborted>.*?</turn_aborted>", re.IGNORECASE | re.DOTALL)
 if resource is not None:
     try:
         _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -54,15 +50,18 @@ if resource is not None:
         except (ValueError, OSError):
             pass
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, NotRequired, Optional, TYPE_CHECKING, TypedDict
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import client_manager
 import session_registry
 from client_manager import ClientConn
 from session_registry import QueuedCommand, Session
 from websockets.asyncio.server import serve, ServerConnection
-from websockets.http11 import Response as WsResponse
-from websockets.datastructures import Headers as WsHeaders
+from handlers.feed_ops import (
+    configure as configure_feed_ops,
+    load_feed_index as _load_feed_index,
+    feed_gc_deleted as _feed_gc_deleted,
+)
 from handlers.file_ops import handle_file_msg, preload_sessions_cache, invalidate_sessions_cache
 from handlers.perf import PerfTracker
 from handlers.runtime_ops import handle_runtime_msg
@@ -72,6 +71,7 @@ from handlers.webrtc_signaling import (
     cleanup_for_ws as _webrtc_cleanup_for_ws,
     handle_webrtc_message,
 )
+from handlers.interactions_ws import handle_interaction_message, send_pending_interactions
 from message_router import RouterContext, handle_low_coupling_message
 from offline_replay import replay_offline_buffers
 from queue_runner import log_prompt_lifecycle as _log_prompt_lifecycle
@@ -80,14 +80,43 @@ from task_manager import cancel_all as _cancel_tasks
 from task_manager import spawn as _spawn_task
 from utils.uuid_helper import is_valid_uuid
 from permission_manager import PermissionManager
+from protocol import _KNOWN_MSG_TYPES, validate_client_msg
+from push_registry import (
+    configure as configure_push_registry,
+    handle_file_push_ack as _handle_file_push_ack,
+    handle_push_file as _handle_push_file,
+    init_firebase,
+    load_inbox as _load_inbox,
+    notify_fcm,
+    notify_fcm_tunnel_with_retry as _notify_fcm_tunnel_with_retry,
+    pending_file_push_items,
+    send_tunnel_fcm_once as _do_send_tunnel_fcm,
+)
+from jsonl_sessions import (
+    configure as configure_jsonl_sessions,
+    ensure_local_session_dirs as _ensure_local_session_dirs,
+    get_recent_messages_sync as _get_recent_messages_sync,
+    jsonl_watcher_task as _jsonl_watcher_task,
+    strip_turn_aborted_notice as _strip_turn_aborted_notice,
+)
+from network_services import (
+    configure as configure_network_services,
+    get_current_tunnel_url,
+    is_cloudflared_running as _is_cloudflared_running,
+    is_tunnel_url_delivered,
+    mark_tunnel_url_delivered,
+    media_request_handler as _media_request_handler,
+    set_current_tunnel_url,
+    start_cloudflared_tunnel as _start_cloudflared_tunnel,
+    start_mdns as _start_mdns,
+    tunnel_url_file_watcher as _tunnel_url_file_watcher,
+)
 from discovery_broadcaster import DiscoveryBroadcaster
 
 try:
     import socket
-    from zeroconf import ServiceInfo, Zeroconf
-    _ZEROCONF_AVAILABLE = True
 except ImportError:
-    _ZEROCONF_AVAILABLE = False
+    socket = None  # type: ignore[assignment]
 
 try:
     from config import get_config
@@ -113,13 +142,6 @@ from backends.events import (
 )
 from backends.history import DEFAULT_HISTORY_LIMIT, clamp_history_limit
 from backends.history_sqlite import init_cache_db
-
-try:
-    import firebase_admin
-    from firebase_admin import credentials, messaging as fb_messaging, storage as fb_storage
-    _FIREBASE_AVAILABLE = True
-except ImportError:
-    _FIREBASE_AVAILABLE = False
 
 BRIDGE_DIR           = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE             = os.path.join(BRIDGE_DIR, "bridge_v2.log")
@@ -408,191 +430,6 @@ async def _dispatch_ws_message(ws, msg: dict) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Inbound message schema (TypedDict = IDE hints; validate_client_msg = runtime)
-# ---------------------------------------------------------------------------
-
-class PingMsg(TypedDict):
-    type: Literal["ping"]
-
-class MessageMsg(TypedDict):
-    type: Literal["message"]
-    session_id: str
-    content: NotRequired[str]
-    images: NotRequired[list]
-    files: NotRequired[list]
-
-class NewSessionMsg(TypedDict):
-    type: Literal["new_session"]
-    session_id: str
-    name: str
-    cwd: NotRequired[str]
-    resume_claude_id: NotRequired[str]
-    backend: NotRequired[str]
-    model: NotRequired[str]
-    sandbox: NotRequired[str]
-    image_dir: NotRequired[str]
-
-class StopMsg(TypedDict):
-    type: Literal["stop"]
-    session_id: str
-
-class CloseSessionMsg(TypedDict):
-    type: Literal["close_session"]
-    session_id: str
-
-class RenameSessionMsg(TypedDict):
-    type: Literal["rename_session"]
-    session_id: str
-    name: str
-
-class ClearSessionMsg(TypedDict):
-    type: Literal["clear_session"]
-    session_id: str
-
-class GetUsageMsg(TypedDict):
-    type: Literal["get_usage"]
-
-class GetResumableSessionsMsg(TypedDict):
-    type: Literal["get_resumable_sessions"]
-
-class ShellCreateMsg(TypedDict):
-    type: Literal["shell_create"]
-    cwd: NotRequired[str]
-
-class ShellInputMsg(TypedDict):
-    type: Literal["shell_input"]
-    shell_id: str
-    data: str
-
-class ShellCloseMsg(TypedDict):
-    type: Literal["shell_close"]
-    shell_id: str
-
-class GetTasksMsg(TypedDict):
-    type: Literal["get_tasks"]
-
-class KillTaskMsg(TypedDict):
-    type: Literal["kill_task"]
-    id: str
-
-class GetProcessesMsg(TypedDict):
-    type: Literal["get_processes"]
-
-class KillProcessMsg(TypedDict):
-    type: Literal["kill_process"]
-    pid: int
-    force: NotRequired[bool]
-
-class FcmTokenMsg(TypedDict):
-    type: Literal["fcm_token"]
-    token: str
-
-class RequestSessionsListMsg(TypedDict):
-    type: Literal["request_sessions_list"]
-
-class BrowseDirMsg(TypedDict):
-    type: Literal["browse_dir"]
-    path: NotRequired[str]
-
-class HelloMsg(TypedDict):
-    type: Literal["hello"]
-    device_id: NotRequired[str]
-    device_name: NotRequired[str]
-    auth_token: NotRequired[str]
-
-class SetSessionMetaMsg(TypedDict):
-    type: Literal["set_session_meta"]
-    session_id: str
-    pinned: NotRequired[bool]
-    hidden: NotRequired[bool]
-
-class SwitchSessionConfigMsg(TypedDict):
-    type: Literal["switch_session_config"]
-    session_id: str
-    backend: NotRequired[str]
-    model: NotRequired[str]
-    effort: NotRequired[str]
-    sandbox: NotRequired[str]
-    image_dir: NotRequired[str]
-
-class PermissionResponseMsg(TypedDict):
-    type: Literal["permission_response"]
-    request_id: str
-    decision: str
-
-class RequestStatusMsg(TypedDict):
-    type: Literal["request_status"]
-    session_id: NotRequired[str]
-
-
-# Required fields (name → [(field, type), ...]) — checked at runtime
-_INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
-    "new_session":     [("session_id", str), ("name", str)],
-    "message":         [("session_id", str)],
-    "stop":            [("session_id", str)],
-    "close_session":   [("session_id", str)],
-    "rename_session":  [("session_id", str), ("name", str)],
-    "clear_session":   [("session_id", str)],
-    "shell_input":     [("shell_id", str), ("data", str)],
-    "shell_close":     [("shell_id", str)],
-    "kill_task":       [("id", str)],
-    "kill_process":    [("pid", int)],
-    "browse_dir":      [],
-    "request_history": [("session_id", str)],
-    "set_effort":      [("session_id", str), ("effort", str)],
-    "set_session_meta":[("session_id", str)],
-    "switch_session_config":[("session_id", str)],
-    "permission_response":[("request_id", str), ("decision", str)],
-    "request_status": [],
-    "claim_bridge":   [],   # auth_token validated at handler level
-    "unclaim_bridge": [],   # auth_token validated at handler level
-    "get_agent_tree": [("session_id", str)],
-    "fork_session":   [("session_id", str)],
-    "get_git_diff":   [("session_id", str)],
-}
-
-_KNOWN_MSG_TYPES: frozenset[str] = frozenset({
-    "ping", "message", "new_session", "stop", "close_session",
-    "rename_session", "clear_session", "get_usage", "get_resumable_sessions",
-    "shell_create", "shell_input", "shell_close", "get_tasks", "kill_task",
-    "get_processes", "kill_process",
-    "fcm_token", "tunnel_url_ack", "request_sessions_list", "browse_dir", "request_history",
-    "set_effort", "hello", "set_session_meta", "switch_session_config",
-    "permission_response",
-    "request_status",
-    "claim_bridge", "unclaim_bridge",
-    "restart_bridge",
-    "push_file", "file_push_ack", "get_inbox",
-    "get_all_sessions",
-    # search subsystem
-    "request_search", "request_search_health", "request_session_list",
-    "request_search_context",
-    # WebRTC P2P signaling (handled by handlers.webrtc_signaling)
-    "webrtc_offer", "webrtc_answer", "webrtc_ice",
-    "get_agent_tree",
-    "fork_session",
-    "get_git_diff",
-})
-
-def validate_client_msg(msg: object) -> str | None:
-    """Return an error description, or None if the message is valid."""
-    if not isinstance(msg, dict):
-        return "message must be a JSON object"
-    mtype = msg.get("type")
-    if not isinstance(mtype, str):
-        return "missing or non-string 'type' field"
-    if mtype not in _KNOWN_MSG_TYPES:
-        return f"unknown message type '{mtype}'"
-    for field_name, expected_type in _INBOUND_REQUIRED.get(mtype, []):
-        val = msg.get(field_name)
-        if val is None:
-            return f"'{mtype}' missing required field '{field_name}'"
-        if not isinstance(val, expected_type):
-            return f"'{mtype}.{field_name}' must be {expected_type.__name__}, got {type(val).__name__}"
-    return None
-
-
 def _is_auth_token_valid(msg: dict) -> bool:
     # Environment variable takes priority (advanced users, manual override).
     expected = os.environ.get("BRIDGE_AUTH_TOKEN", "").strip()
@@ -835,380 +672,6 @@ def _build_handoff_prompt(history: list[dict], user_request: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Firebase Admin init
-# ---------------------------------------------------------------------------
-_firebase_app = None
-_firebase_storage_app = None  # separate app for Storage (may use different project)
-
-_PUSH_FILE_REGISTRY: dict[str, dict] = {}  # file_id → {blob_path, filename, url, size, mime_type, target_device_ids, acked_device_ids}
-
-_STORAGE_KEY_FILE = os.environ.get(
-    "BRIDGE_STORAGE_KEY",
-    os.path.expanduser("~/.config/claude-bridge/storage-serviceAccountKey.json"),
-)
-
-def init_firebase() -> None:
-    global _firebase_app, _firebase_storage_app
-    if not _FIREBASE_AVAILABLE:
-        log.warning("firebase-admin not installed — FCM disabled. Run: pip install firebase-admin")
-        return
-
-    # FCM app
-    if os.path.exists(SERVICE_ACCOUNT_FILE):
-        try:
-            cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
-            _firebase_app = firebase_admin.initialize_app(cred)
-            log.info("Firebase FCM initialized")
-        except Exception as exc:
-            log.warning("Firebase FCM init failed: %s", exc)
-    else:
-        log.warning("serviceAccountKey.json not found at %s — FCM disabled", SERVICE_ACCOUNT_FILE)
-
-    # Storage app — use separate storage key if available, otherwise fall back to FCM key
-    storage_key = _STORAGE_KEY_FILE if os.path.exists(_STORAGE_KEY_FILE) else SERVICE_ACCOUNT_FILE
-    if os.path.exists(storage_key):
-        try:
-            with open(storage_key) as f:
-                sk = json.load(f)
-            bucket_name = f"{sk['project_id']}.firebasestorage.app"
-            storage_cred = credentials.Certificate(storage_key)
-            _firebase_storage_app = firebase_admin.initialize_app(storage_cred, {"storageBucket": bucket_name}, name="storage")
-            log.info("Firebase Storage initialized (bucket: %s)", bucket_name)
-        except Exception as exc:
-            log.warning("Firebase Storage init failed: %s", exc)
-
-
-_PUSH_INLINE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
-
-
-_INBOX_TTL_SECONDS = 7 * 24 * 3600  # 7 days
-
-
-def _inbox_file_path() -> str:
-    return os.path.join(_DATA_DIR, "inbox.json")
-
-
-def _save_inbox() -> None:
-    try:
-        with open(_inbox_file_path(), "w", encoding="utf-8") as f:
-            json.dump(_PUSH_FILE_REGISTRY, f)
-    except Exception as exc:
-        log.warning("inbox save failed: %s", exc)
-
-
-def _load_inbox() -> None:
-    global _PUSH_FILE_REGISTRY
-    path = _inbox_file_path()
-    if not os.path.isfile(path):
-        return
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        now = time.time()
-        _PUSH_FILE_REGISTRY = {
-            fid: entry for fid, entry in data.items()
-            if now - entry.get("pushed_at", 0) < _INBOX_TTL_SECONDS
-        }
-        log.info("Loaded inbox: %d entries", len(_PUSH_FILE_REGISTRY))
-    except Exception as exc:
-        log.warning("inbox load failed: %s", exc)
-
-
-async def _handle_push_file(ws: Any, path: str, sender_device_id: str = "") -> None:
-    if _ROOT_DIR:
-        from utils.path_jail import resolve_jailed, JailEscape
-        try:
-            path = resolve_jailed(path, _ROOT_DIR)
-        except JailEscape as e:
-            log.warning("[jail] push_file escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
-            try:
-                await ws.send(json.dumps({"type": "error", "message": f"Path outside instance root: {e.req_path}"}))
-            except Exception:
-                pass
-            return
-    expanded = os.path.expanduser(path)
-    if not os.path.isfile(expanded):
-        try:
-            await ws.send(json.dumps({"type": "error", "message": f"File not found: {path}"}))
-        except Exception:
-            pass
-        return
-
-    filename = os.path.basename(expanded)
-    size = os.path.getsize(expanded)
-    file_id = f"push_{uuid.uuid4().hex[:12]}"
-
-    import mimetypes
-    mime_type, _ = mimetypes.guess_type(filename)
-    if not mime_type:
-        mime_type = "application/octet-stream"
-
-    target_device_ids = [
-        device_id
-        for device_id in client_manager.connected_device_ids()
-        if device_id != sender_device_id
-    ]
-
-    # Inline path: base64-encode and send directly over WebSocket (no Firebase)
-    if size <= _PUSH_INLINE_MAX_BYTES:
-        try:
-            import base64 as _b64
-            with open(expanded, "rb") as fh:
-                data_b64 = _b64.b64encode(fh.read()).decode("ascii")
-            _PUSH_FILE_REGISTRY[file_id] = {
-                "blob_path": None,
-                "filename": filename,
-                "size": size,
-                "mime_type": mime_type,
-                "data": data_b64,
-                "target_device_ids": target_device_ids,
-                "acked_device_ids": [],
-                "pushed_at": time.time(),
-            }
-            _save_inbox()
-            log.info("push_file inline: %s (%d bytes)", filename, size)
-            broadcast_payload = {
-                "type": "file_push",
-                "file_id": file_id,
-                "filename": filename,
-                "size": size,
-                "mime_type": mime_type,
-                "data": data_b64,
-            }
-            # Ack to pusher immediately before the slow broadcast
-            try:
-                await ws.send(json.dumps({
-                    "type": "push_ack",
-                    "file_id": file_id,
-                    "filename": filename,
-                    "size": size,
-                }))
-            except Exception:
-                pass
-            _spawn_task(f"broadcast-push:{file_id}", _broadcast_json(broadcast_payload))
-            _spawn_task(f"notify-fcm:push-file:{file_id}", notify_fcm_file_push(file_id, filename))
-        except Exception as exc:
-            log.warning("push_file inline failed: %s", exc)
-            try:
-                await ws.send(json.dumps({"type": "error", "message": f"Push failed: {exc}"}))
-            except Exception:
-                pass
-        return
-
-    # Large file fallback: Firebase Storage
-    if _firebase_storage_app is None:
-        try:
-            await ws.send(json.dumps({"type": "error", "message": "File too large for inline transfer and Firebase Storage not available"}))
-        except Exception:
-            pass
-        return
-
-    blob_path = f"bridge_pushes/{file_id}/{filename}"
-    try:
-        loop = asyncio.get_event_loop()
-        bucket = fb_storage.bucket(app=_firebase_storage_app)
-
-        def _upload() -> str:
-            blob = bucket.blob(blob_path)
-            blob.upload_from_filename(expanded, content_type=mime_type)
-            import datetime
-            url = blob.generate_signed_url(
-                expiration=datetime.timedelta(days=7),
-                method="GET",
-                version="v4",
-            )
-            return url
-
-        url = await loop.run_in_executor(None, _upload)
-        _PUSH_FILE_REGISTRY[file_id] = {
-            "blob_path": blob_path,
-            "filename": filename,
-            "url": url,
-            "size": size,
-            "mime_type": mime_type,
-            "target_device_ids": target_device_ids,
-            "acked_device_ids": [],
-            "pushed_at": time.time(),
-        }
-        _save_inbox()
-        log.info("push_file uploaded: %s → %s", filename, blob_path)
-
-        await _broadcast_json({
-            "type": "file_push",
-            "file_id": file_id,
-            "filename": filename,
-            "url": url,
-            "size": size,
-            "mime_type": mime_type,
-        })
-        _spawn_task(f"notify-fcm:push-file:{file_id}", notify_fcm_file_push(file_id, filename))
-    except Exception as exc:
-        log.warning("push_file upload failed: %s", exc)
-        try:
-            await ws.send(json.dumps({"type": "error", "message": f"Upload failed: {exc}"}))
-        except Exception:
-            pass
-
-
-async def _handle_file_push_ack(file_id: str, device_id: str = "") -> None:
-    entry = _PUSH_FILE_REGISTRY.get(file_id)
-    if not entry:
-        log.debug("file_push_ack: unknown file_id %s", file_id)
-        return
-    target = set(entry.get("target_device_ids") or [])
-    acked = set(entry.get("acked_device_ids") or [])
-    if device_id:
-        acked.add(device_id)
-        entry["acked_device_ids"] = sorted(acked)
-        _save_inbox()
-    should_delete = target.issubset(acked) if target else bool(acked)
-    if not should_delete:
-        return
-    _PUSH_FILE_REGISTRY.pop(file_id, None)
-    _save_inbox()
-    blob_path = entry.get("blob_path")
-    if not blob_path or _firebase_storage_app is None:
-        return
-    try:
-        loop = asyncio.get_event_loop()
-        bucket = fb_storage.bucket(app=_firebase_storage_app)
-
-        def _delete() -> None:
-            blob = bucket.blob(blob_path)
-            blob.delete()
-
-        await loop.run_in_executor(None, _delete)
-        log.info("push_file deleted from storage: %s", blob_path)
-    except Exception as exc:
-        log.warning("push_file delete failed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# FCM notification
-# ---------------------------------------------------------------------------
-async def _do_send_tunnel_fcm(ws_url: str) -> bool:
-    """Send one FCM tunnel_url notification. Returns True on success."""
-    if _firebase_app is None:
-        return False
-    try:
-        with open(FCM_TOKEN_FILE) as f:
-            token = f.read().strip()
-    except FileNotFoundError:
-        log.warning("FCM tunnel notify: no token on file")
-        return False
-    try:
-        message = fb_messaging.Message(
-            data={"type": "tunnel_url", "url": ws_url, "instance_id": _INSTANCE_ID},
-            token=token,
-        )
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, fb_messaging.send, message)
-        log.info("FCM tunnel URL pushed to device: %s", ws_url)
-        return True
-    except Exception as exc:
-        log.warning("FCM tunnel notify failed: %s", exc)
-        return False
-
-
-async def _notify_fcm_tunnel_with_retry(ws_url: str) -> None:
-    """Send tunnel URL via FCM, retrying every 60s (max 5 total attempts) until ACK."""
-    global _TUNNEL_URL_DELIVERED
-    for attempt in range(5):
-        if _TUNNEL_URL_DELIVERED:
-            log.info("FCM tunnel URL delivery confirmed — stopping retry after %d attempt(s)", attempt)
-            return
-        await _do_send_tunnel_fcm(ws_url)
-        if attempt < 4:
-            await asyncio.sleep(60)
-    log.info("FCM tunnel URL retry exhausted (5 attempts)")
-
-
-async def notify_fcm(session_name: str, last_text: str, session_id: str = "") -> None:
-    if _firebase_app is None:
-        log.warning("FCM not ready, skipping notification")
-        return
-    try:
-        with open(FCM_TOKEN_FILE) as f:
-            token = f.read().strip()
-    except FileNotFoundError:
-        log.warning("No FCM token on file — skipping notification")
-        return
-
-    # Extract a concise summary from the LAST paragraph of the turn (the completion
-    # summary), not the first sentence (which is typically "Let me look at...").
-    import re as _re
-
-    def _clean_md(s: str) -> str:
-        s = _re.sub(r'[*`#_~>]+', '', s)
-        s = _re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', s)  # markdown links
-        return _re.sub(r'\s+', ' ', s).strip()
-
-    # Find last non-empty paragraph; fall back to entire text if no paragraph breaks.
-    paragraphs = [p for p in last_text.split('\n\n') if p.strip()]
-    source = paragraphs[-1] if paragraphs else last_text
-    clean = _clean_md(source)
-
-    # Within that paragraph, take the first complete sentence.
-    sentence_parts = _re.split(r'(?<=[。！？!?\.])\s+', clean, maxsplit=1)
-    summary = sentence_parts[0].strip() if sentence_parts else clean
-    if not summary:
-        summary = _clean_md(last_text)
-    if len(summary) > 120:
-        summary = summary[:120].rstrip() + "…"
-
-    message = fb_messaging.Message(
-        notification=fb_messaging.Notification(
-            title=f"✓ {session_name}",
-            body=summary,
-        ),
-        data={"session_id": session_id},
-        token=token,
-    )
-    loop = asyncio.get_event_loop()
-    for attempt in range(3):
-        try:
-            await loop.run_in_executor(None, fb_messaging.send, message)
-            log.info("FCM notification sent")
-            return
-        except Exception as exc:
-            if attempt < 2:
-                wait = 2 ** attempt
-                log.warning("FCM send failed (attempt %d/3): %s — retrying in %ds", attempt + 1, exc, wait)
-                await asyncio.sleep(wait)
-            else:
-                log.error("FCM send failed after 3 attempts: %s", exc)
-
-
-async def notify_fcm_file_push(file_id: str, filename: str) -> None:
-    if _firebase_app is None:
-        return
-    try:
-        with open(FCM_TOKEN_FILE) as f:
-            token = f.read().strip()
-    except FileNotFoundError:
-        return
-    message = fb_messaging.Message(
-        notification=fb_messaging.Notification(
-            title="📎 新檔案",
-            body=filename,
-        ),
-        data={
-            "type": "file_push",
-            "file_id": file_id,
-            "filename": filename,
-            "deep_link": "bridge://inbox",
-        },
-        token=token,
-    )
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, fb_messaging.send, message)
-        log.info("FCM file_push notification sent: %s", filename)
-    except Exception as exc:
-        log.warning("FCM file_push notify failed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
 # Saved sessions (persistence helpers — used by _persist_session, _restore_sessions_from_disk)
 # ---------------------------------------------------------------------------
 def _load_saved_sessions() -> dict:
@@ -1336,490 +799,6 @@ async def _dispatch_event(payload: dict, session: "Session") -> bool:
 
 
 
-
-
-
-# ---------------------------------------------------------------------------
-# JSONL recent-message helpers + live directory watcher
-# ---------------------------------------------------------------------------
-CODEX_SESSIONS_DIR = str(Path.home() / ".codex" / "sessions")
-_WATCHER_LAST_MAX_MTIME: float = 0.0
-
-
-_recent_msgs_cache: dict[str, tuple[float, list]] = {}
-
-
-def _ensure_local_session_dirs() -> None:
-    """Create expected local session source dirs (first-run friction reduction)."""
-    for p in (CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR):
-        try:
-            Path(p).mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            log.warning("Failed to create local session dir %s: %s", p, exc)
-
-def _codex_session_id_from_stem(stem: str) -> str:
-    """Codex JSONL files are named rollout-<timestamp>-<uuid>.jsonl.
-
-    The native Codex history loader indexes files by the trailing UUID, not by
-    the full rollout filename stem.
-    """
-    candidate = stem[-36:]
-    return candidate if is_valid_uuid(candidate) else stem
-
-
-def _extract_codex_text(content: object) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        text = item.get("text")
-        if isinstance(text, str) and text.strip():
-            parts.append(text.strip())
-    return "\n".join(parts).strip()
-
-
-def _is_session_title_noise(text: str) -> bool:
-    stripped = text.strip()
-    return (
-        not stripped
-        or stripped.startswith("<turn_aborted>")
-        or stripped.startswith("# AGENTS.md instructions")
-        or stripped.startswith("<permissions instructions>")
-        or stripped.startswith("<environment_context>")
-    )
-
-
-def _strip_turn_aborted_notice(text: str) -> str:
-    cleaned = _TURN_ABORTED_RE.sub("", text or "")
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
-
-
-def _read_recent_msgs(path: str, fmt: str, n: int = 2) -> list:
-    """Parse last n user+assistant messages — reads only the final 32KB of the file."""
-    try:
-        mtime = os.path.getmtime(path)
-        cache_key = f"{path}:{fmt}:{n}"
-        if cache_key in _recent_msgs_cache:
-            cached_mtime, cached_msgs = _recent_msgs_cache[cache_key]
-            if cached_mtime == mtime:
-                return cached_msgs
-    except Exception:
-        pass
-    messages: list = []
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 32768))
-            chunk = f.read()
-        nl = chunk.find(b"\n")
-        lines = chunk[nl + 1:].decode("utf-8", errors="ignore").splitlines()
-        for raw in lines:
-            try:
-                d = json.loads(raw)
-                role = text = None
-                if fmt == "claude":
-                    if d.get("isSidechain") or d.get("type") not in ("user", "assistant"):
-                        continue
-                    role = d["type"]
-                    content = d.get("message", {}).get("content", "")
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        parts = [blk.get("text", "") for blk in content
-                                 if isinstance(blk, dict) and blk.get("type") == "text"]
-                        text = "\n".join(p for p in parts if p)
-                elif fmt == "codex":
-                    if d.get("type") != "response_item":
-                        continue
-                    payload = d.get("payload", {})
-                    if not isinstance(payload, dict) or payload.get("type") != "message":
-                        continue
-                    role = payload.get("role")
-                    if role not in ("user", "assistant"):
-                        continue
-                    content = payload.get("content", "")
-                    text = _extract_codex_text(content)
-                if role and text and not text.startswith("<") and not text.startswith("[Request interrupted"):
-                    messages.append({"role": role, "text": text[:80]})
-            except Exception:
-                pass
-    except Exception:
-        pass
-    result = messages[-n:] if len(messages) > n else messages
-    try:
-        mtime = os.path.getmtime(path)
-        cache_key = f"{path}:{fmt}:{n}"
-        _recent_msgs_cache[cache_key] = (mtime, result)
-    except Exception:
-        pass
-    return result
-
-
-def _get_recent_messages_sync(session: "Session", n: int = 2) -> list:
-    try:
-        if not session.resume_id:
-            return []
-        backend = _session_backend(session)
-        path = backend.find_session_file(session.resume_id)
-        if not path:
-            return []
-        fmt = "codex" if session.backend_name == "codex" else "claude"
-        return _read_recent_msgs(path, fmt, n)
-    except Exception:
-        return []
-
-
-def _register_jsonl_session(path: str) -> bool:
-    """Register a single JSONL file as a session in _SESSIONS if not already present.
-    Returns True if a new session was added."""
-    try:
-        fn = os.path.basename(path)
-        if not fn.endswith(".jsonl"):
-            return False
-        stem = fn[:-6]
-
-        # Determine backend from path
-        if CODEX_SESSIONS_DIR and path.startswith(CODEX_SESSIONS_DIR):
-            backend_name = "codex"
-            resume_id = _codex_session_id_from_stem(stem)
-            if not is_valid_uuid(resume_id):
-                return False
-            sid = f"jl_x_{resume_id[:12]}"
-        else:
-            backend_name = "claude"
-            resume_id = stem
-            if len(resume_id) < 8:
-                return False
-            sid = f"jl_c_{resume_id[:12]}"
-
-        existing_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
-        if resume_id in existing_uuids:
-            return False
-
-        if sid in _SESSIONS:
-            return False
-
-        # Read name + cwd from the JSONL itself
-        name = ""
-        cwd = DEFAULT_CWD
-        fmt = "codex" if backend_name == "codex" else "claude"
-        try:
-            with open(path, encoding="utf-8", errors="ignore") as f:
-                for raw in f:
-                    try:
-                        d = json.loads(raw)
-                        if fmt == "claude":
-                            if not cwd or cwd == DEFAULT_CWD:
-                                raw_cwd = d.get("cwd")
-                                if isinstance(raw_cwd, str) and raw_cwd.strip():
-                                    cwd = raw_cwd.strip()
-                            if not name and d.get("type") == "user":
-                                content = d.get("message", {}).get("content", "")
-                                t = content if isinstance(content, str) else next(
-                                    (blk.get("text","") for blk in content
-                                     if isinstance(blk, dict) and blk.get("type") == "text"), "")
-                                if t and not t.startswith("<"):
-                                    name = t[:50].strip()
-                        elif fmt == "codex":
-                            if d.get("type") == "session_meta":
-                                pl = d.get("payload", {})
-                                if isinstance(pl, dict) and (not cwd or cwd == DEFAULT_CWD):
-                                    c = pl.get("cwd") or pl.get("workingDirectory", "")
-                                    if c:
-                                        cwd = c
-                            if not name and d.get("type") == "response_item":
-                                payload = d.get("payload", {})
-                                if (
-                                    isinstance(payload, dict)
-                                    and payload.get("type") == "message"
-                                    and payload.get("role") == "user"
-                                ):
-                                    t = _extract_codex_text(payload.get("content"))
-                                    if t and not _is_session_title_noise(t):
-                                        name = t[:50].strip()
-                        if name and cwd != DEFAULT_CWD:
-                            break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        if not name:
-            name = resume_id[:8]
-
-        mtime = 0.0
-        try:
-            mtime = os.stat(path).st_mtime
-        except OSError:
-            pass
-
-        _SESSIONS[sid] = Session(
-            session_id=sid,
-            name=name,
-            created_at=mtime or time.time(),
-            last_activity=mtime or time.time(),
-            cwd=os.path.expanduser(cwd),
-            backend_name=backend_name,
-            resume_id=resume_id,
-        )
-        return True
-    except Exception as exc:
-        log.warning("_register_jsonl_session(%s) failed: %s", path, exc)
-        return False
-
-
-def _session_for_jsonl_path(path: str) -> "Session | None":
-    fn = os.path.basename(path)
-    if not fn.endswith(".jsonl"):
-        return None
-    stem = fn[:-6]
-    if CODEX_SESSIONS_DIR and path.startswith(CODEX_SESSIONS_DIR):
-        resume_id = _codex_session_id_from_stem(stem)
-    else:
-        resume_id = stem
-    for session in _SESSIONS.values():
-        if session.resume_id == resume_id:
-            return session
-    return None
-
-
-def _merge_jsonl_sessions_into_state() -> bool:
-    """Initial scan: register all JSONL sessions not yet in _SESSIONS."""
-    added = False
-    existing_uuids = {s.resume_id for s in _SESSIONS.values() if s.resume_id}
-
-    for base, backend_name in ((CLAUDE_PROJECTS_DIR, "claude"), (CODEX_SESSIONS_DIR, "codex")):
-        if not os.path.isdir(base):
-            log.info("JSONL initial scan (%s): source dir missing, skipped: %s", backend_name, base)
-            continue
-        try:
-            for root, _dirs, files in os.walk(base):
-                for fn in files:
-                    if not fn.endswith(".jsonl"):
-                        continue
-                    uuid = fn[:-6]
-                    if len(uuid) < 8 or uuid in existing_uuids:
-                        continue
-                    if _register_jsonl_session(os.path.join(root, fn)):
-                        existing_uuids.add(uuid)
-                        added = True
-        except FileNotFoundError:
-            log.info("JSONL initial scan (%s): source dir disappeared during scan, skipped", backend_name)
-        except Exception as exc:
-            log.warning("JSONL initial scan (%s) error: %s", backend_name, exc)
-
-    return added
-
-
-_JSONL_TURN_END_STOP_REASONS: frozenset[str] = frozenset(
-    {"end_turn", "max_tokens", "stop_sequence"}
-)
-
-
-def _read_new_jsonl_lines(path: str, from_offset: int) -> tuple[list[dict], int]:
-    """Read lines appended to a JSONL file since `from_offset` bytes.
-
-    Returns (parsed_lines, new_offset).  Skips malformed JSON silently.
-    """
-    try:
-        size = os.path.getsize(path)
-        if size <= from_offset:
-            return [], from_offset
-        with open(path, "rb") as fh:
-            fh.seek(from_offset)
-            raw = fh.read(size - from_offset)
-        lines = raw.decode("utf-8", errors="ignore").splitlines()
-        parsed: list[dict] = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed.append(json.loads(line))
-            except Exception:
-                pass
-        return parsed, size
-    except OSError:
-        return [], from_offset
-
-
-def _jsonl_lines_contain_turn_end(lines: list[dict], fmt: str) -> bool:
-    """Return True if any line signals that an assistant turn has completed."""
-    if fmt == "claude":
-        for d in lines:
-            if (
-                d.get("type") == "assistant"
-                and not d.get("isSidechain")
-                and d.get("message", {}).get("stop_reason") in _JSONL_TURN_END_STOP_REASONS
-            ):
-                return True
-    # Codex format: response_item with role=assistant and stop_reason
-    elif fmt == "codex":
-        for d in lines:
-            if d.get("type") != "response_item":
-                continue
-            payload = d.get("payload", {})
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("role") == "assistant" and payload.get("stop_reason") in _JSONL_TURN_END_STOP_REASONS:
-                return True
-    return False
-
-
-async def _jsonl_watcher_task() -> None:
-    """Use watchdog FSEvents to watch Claude + Codex JSONL dirs.
-    Falls back to 5-second polling if watchdog is unavailable."""
-    loop = asyncio.get_event_loop()
-    _merge_jsonl_sessions_into_state()
-
-    # Debounce: accumulate changed paths, flush after 0.8s of quiet
-    _pending: dict[str, float] = {}
-    _flush_handle: list = [None]
-
-    # Track last-known file size per JSONL path so we only inspect new bytes.
-    # Seeded at current size on first encounter so historical lines are skipped.
-    _jsonl_known_size: dict[str, int] = {}
-
-    def _seed_known_size(path: str) -> None:
-        """Record current file size so the next flush only sees new appends."""
-        if path not in _jsonl_known_size:
-            try:
-                _jsonl_known_size[path] = os.path.getsize(path)
-            except OSError:
-                _jsonl_known_size[path] = 0
-
-    async def _flush_changes() -> None:
-        paths = list(_pending.keys())
-        _pending.clear()
-        changed_sessions: dict[str, Session] = {}
-        for p in paths:
-            _seed_known_size(p)  # no-op if already seeded; seeds before register
-            _register_jsonl_session(p)
-            session = _session_for_jsonl_path(p)
-            if session is None:
-                continue
-            try:
-                mtime = os.stat(p).st_mtime
-                session.last_activity = max(session.last_activity, mtime)
-            except OSError:
-                pass
-            changed_sessions[session.session_id] = session
-
-            # --- External-session done detection ---
-            # Only check when the session is marked as streaming (meaning the app
-            # is waiting for a done signal) but has no live bridge-spawned process
-            # managing it.  Bridge-spawned sessions emit done themselves via
-            # claude_cli.py; we must not double-emit.
-            if not session.is_streaming:
-                # Advance the known-size cursor even when not streaming, so that
-                # if the session later becomes streaming we don't re-scan old lines.
-                try:
-                    _jsonl_known_size[p] = os.path.getsize(p)
-                except OSError:
-                    pass
-                continue
-
-            fmt = "codex" if session.backend_name == "codex" else "claude"
-            prior_offset = _jsonl_known_size.get(p, 0)
-            new_lines, new_size = _read_new_jsonl_lines(p, prior_offset)
-            _jsonl_known_size[p] = new_size
-
-            if not new_lines:
-                continue
-
-            if _jsonl_lines_contain_turn_end(new_lines, fmt):
-                log.info(
-                    "emit external done for session %s (jsonl=%s, new_lines=%d)",
-                    session.session_id, os.path.basename(p), len(new_lines),
-                )
-                session.is_streaming = False
-                # Reuse _dispatch_event so unread + history_sync_hint are handled
-                # identically to bridge-spawned sessions.
-                await _dispatch_event(
-                    {**_evt_done(), "session_id": session.session_id, "request_id": session.current_request_id or "external"},
-                    session,
-                )
-
-        if client_manager.has_clients():
-            await _broadcast_json(build_sessions_list())
-            for session in changed_sessions.values():
-                await _broadcast_json({
-                    "type": "history_sync_hint",
-                    "session_id": session.session_id,
-                    "reason": "file_changed",
-                })
-
-    def _on_file_event(path: str) -> None:
-        if not path.endswith(".jsonl"):
-            return
-        _pending[path] = time.time()
-        if _flush_handle[0]:
-            _flush_handle[0].cancel()
-        _flush_handle[0] = loop.call_later(0.8, lambda: asyncio.ensure_future(_flush_changes()))
-
-    try:
-        from watchdog.observers import Observer
-        from watchdog.events import FileSystemEventHandler
-
-        class _Handler(FileSystemEventHandler):
-            def on_modified(self, event):
-                if not event.is_directory:
-                    loop.call_soon_threadsafe(_on_file_event, event.src_path)
-            def on_created(self, event):
-                if not event.is_directory:
-                    loop.call_soon_threadsafe(_on_file_event, event.src_path)
-
-        observer = Observer()
-        handler = _Handler()
-        for d in (CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR):
-            if os.path.isdir(d):
-                observer.schedule(handler, d, recursive=True)
-        observer.start()
-        log.info("JSONL watcher: FSEvents observer started")
-        try:
-            await asyncio.Future()  # run forever alongside the observer thread
-        finally:
-            observer.stop()
-            observer.join()
-
-    except ImportError:
-        log.warning("watchdog not installed — falling back to 5s polling")
-        import hashlib
-
-        def _dir_fingerprint() -> str:
-            parts = []
-            for base in (CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR):
-                if not os.path.isdir(base):
-                    continue
-                for root, _dirs, files in os.walk(base):
-                    for fn in sorted(files):
-                        if fn.endswith(".jsonl"):
-                            try:
-                                parts.append(f"{fn}:{os.stat(os.path.join(root,fn)).st_mtime:.0f}")
-                            except OSError:
-                                pass
-            return hashlib.md5("|".join(parts).encode()).hexdigest()
-
-        last_fp = _dir_fingerprint()
-        while True:
-            await asyncio.sleep(5)
-            try:
-                fp = _dir_fingerprint()
-                if fp == last_fp:
-                    continue
-                last_fp = fp
-                _merge_jsonl_sessions_into_state()
-                if client_manager.has_clients():
-                    await _broadcast_json(build_sessions_list())
-            except Exception as exc:
-                log.warning("JSONL polling error: %s", exc)
-
-
 def _session_has_valid_resume(s: "Session") -> bool:
     return session_registry.session_has_valid_resume(s)
 
@@ -1847,10 +826,6 @@ async def _send_all_sessions(ws: Any, batch_size: int = 50) -> None:
 # Active WebSocket clients — multi-client design
 # ---------------------------------------------------------------------------
 _AUTO_TUNNEL_TASK: "asyncio.Task | None" = None
-_CLOUDFLARED_PROC: "asyncio.subprocess.Process | None" = None
-_CURRENT_TUNNEL_URL: "str | None" = None  # set after cloudflared reports its URL
-_TUNNEL_RETRY_TASK: "asyncio.Task | None" = None   # FCM retry loop for tunnel URL
-_TUNNEL_URL_DELIVERED: bool = False                 # True after app sends tunnel_url_ack
 # Path to the file written by cloudflared_launcher.sh (external tunnel management).
 # Set from BRIDGE_TUNNEL_URL_FILE env var in main().  Empty = self-managed mode.
 _TUNNEL_URL_FILE: str = ""
@@ -1993,8 +968,9 @@ async def handler(ws: ServerConnection) -> None:
     try:
         _paired_token = _PAIRING.get("paired_token", "").strip()
         _provided_token = str(first_msg.get("auth_token") or "").strip()
+        tunnel_url = get_current_tunnel_url()
         log.info("hello_ack → client=%s instance_id=%s tunnel=%s",
-                 client.client_id, _INSTANCE_ID, bool(_CURRENT_TUNNEL_URL))
+                 client.client_id, _INSTANCE_ID, bool(tunnel_url))
         await ws.send(json.dumps({
             "type": "hello_ack",
             "instance_id": _INSTANCE_ID,
@@ -2007,7 +983,7 @@ async def handler(ws: ServerConnection) -> None:
             "root_dir": _ROOT_DIR,
             "data_dir": _DATA_DIR,
             **({"lan_ip": _LAN_IP} if _LAN_IP else {}),
-            **({"tunnel_url": _CURRENT_TUNNEL_URL} if _CURRENT_TUNNEL_URL else {}),
+            **({"tunnel_url": tunnel_url} if tunnel_url else {}),
         }))
         await ws.send(json.dumps(build_sessions_list()))
 
@@ -2020,29 +996,8 @@ async def handler(ws: ServerConnection) -> None:
         _spawn_task(f"unread-snapshot:connect:{client.client_id}", _send_unread_snapshot_deferred(ws, client))
         # Re-deliver any file pushes that were broadcast before this client connected
         device_id = client.device_id or ""
-        _reconnect_now = time.time()
-        for fid, entry in list(_PUSH_FILE_REGISTRY.items()):
-            if _reconnect_now - entry.get("pushed_at", 0) > _INBOX_TTL_SECONDS:
-                continue
-            acked = set(entry.get("acked_device_ids") or [])
-            target = set(entry.get("target_device_ids") or [])
-            if target and device_id and device_id not in target:
-                continue
-            if device_id and device_id in acked:
-                continue
-            payload: dict = {
-                "type": "file_push",
-                "file_id": fid,
-                "filename": entry["filename"],
-                "size": entry["size"],
-                "mime_type": entry["mime_type"],
-            }
-            if "data" in entry:
-                payload["data"] = entry["data"]
-            elif "url" in entry:
-                payload["url"] = entry["url"]
-            else:
-                continue
+        for item in pending_file_push_items(device_id):
+            payload = {"type": "file_push", **item}
             try:
                 await ws.send(json.dumps(payload))
             except Exception:
@@ -2085,8 +1040,8 @@ async def handler(ws: ServerConnection) -> None:
             "fcm_token_file": FCM_TOKEN_FILE,
             "log": log,
             "root_dir": _ROOT_DIR,
-            "get_tunnel_url": lambda: _CURRENT_TUNNEL_URL,
-            "is_tunnel_delivered": lambda: _TUNNEL_URL_DELIVERED,
+            "get_tunnel_url": get_current_tunnel_url,
+            "is_tunnel_delivered": is_tunnel_url_delivered,
             "notify_tunnel_fcm_once": _do_send_tunnel_fcm,
         }
         router_ctx = RouterContext(
@@ -2188,8 +1143,9 @@ async def handler(ws: ServerConnection) -> None:
                     "root_dir": _ROOT_DIR,
                     "data_dir": _DATA_DIR,
                     **({"lan_ip": _LAN_IP} if _LAN_IP else {}),
-                    **({"tunnel_url": _CURRENT_TUNNEL_URL} if _CURRENT_TUNNEL_URL else {}),
+                    **({"tunnel_url": get_current_tunnel_url()} if get_current_tunnel_url() else {}),
                 }))
+                await send_pending_interactions(ws)
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
             op_started = time.perf_counter()
@@ -2231,29 +1187,7 @@ async def handler(ws: ServerConnection) -> None:
             if mtype == "get_inbox":
                 _inbox_conn = client_manager.CLIENTS.get(ws)
                 inbox_device_id = (_inbox_conn.device_id if _inbox_conn else "") or ""
-                inbox_now = time.time()
-                inbox_items = []
-                for fid, entry in list(_PUSH_FILE_REGISTRY.items()):
-                    if inbox_now - entry.get("pushed_at", 0) > _INBOX_TTL_SECONDS:
-                        continue
-                    acked = set(entry.get("acked_device_ids") or [])
-                    target = set(entry.get("target_device_ids") or [])
-                    if target and inbox_device_id and inbox_device_id not in target:
-                        continue
-                    if inbox_device_id and inbox_device_id in acked:
-                        continue
-                    item = {
-                        "file_id": fid,
-                        "filename": entry["filename"],
-                        "size": entry["size"],
-                        "mime_type": entry["mime_type"],
-                        "pushed_at": entry.get("pushed_at", 0),
-                    }
-                    if "data" in entry:
-                        item["data"] = entry["data"]
-                    elif "url" in entry:
-                        item["url"] = entry["url"]
-                    inbox_items.append(item)
+                inbox_items = pending_file_push_items(inbox_device_id, include_pushed_at=True)
                 try:
                     await ws.send(json.dumps({"type": "inbox_list", "items": inbox_items}))
                 except Exception:
@@ -2262,12 +1196,20 @@ async def handler(ws: ServerConnection) -> None:
                 continue
 
             if mtype == "tunnel_url_ack":
-                global _TUNNEL_URL_DELIVERED, _TUNNEL_RETRY_TASK
-                _TUNNEL_URL_DELIVERED = True
-                if _TUNNEL_RETRY_TASK and not _TUNNEL_RETRY_TASK.done():
-                    _TUNNEL_RETRY_TASK.cancel()
-                    _TUNNEL_RETRY_TASK = None
+                mark_tunnel_url_delivered()
                 log.info("tunnel_url_ack received — FCM retry cancelled")
+                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
+                continue
+
+            if await handle_interaction_message(
+                mtype=mtype,
+                msg=msg,
+                ws=ws,
+                sessions=_SESSIONS,
+                session_backend=_session_backend,
+                broadcast_json=_broadcast_json,
+                msg_error=_msg_error,
+            ):
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
 
@@ -2339,176 +1281,6 @@ async def handler(ws: ServerConnection) -> None:
             _AUTO_TUNNEL_TASK = _spawn_task("auto-tunnel-delayed", _auto_tunnel_after_delay(120))
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# HTTP media handler — serves local media files via /media/<abs-path>
-# ---------------------------------------------------------------------------
-
-_ALLOWED_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".m4v", ".avi"}
-
-
-async def _media_request_handler(connection, request):
-    if not request.path.startswith("/media/"):
-        return None  # proceed with WebSocket upgrade
-    from urllib.parse import unquote
-    file_path = unquote(request.path[6:])  # strip "/media", keep leading "/"
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in _ALLOWED_MEDIA_EXTS:
-        return connection.respond(http.HTTPStatus.FORBIDDEN, "Forbidden\n")
-    real_path = os.path.realpath(file_path)
-    if _ROOT_DIR:
-        from utils.path_jail import resolve_jailed, JailEscape
-        try:
-            resolve_jailed(file_path, _ROOT_DIR)
-        except JailEscape:
-            return connection.respond(
-                http.HTTPStatus.FORBIDDEN,
-                json.dumps({"error": "path outside instance root"}) + "\n",
-            )
-    if not os.path.isfile(real_path):
-        return connection.respond(http.HTTPStatus.NOT_FOUND, "Not found\n")
-    try:
-        loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, lambda: open(real_path, "rb").read())
-    except OSError:
-        return connection.respond(http.HTTPStatus.INTERNAL_SERVER_ERROR, "Read error\n")
-    mime_type, _ = mimetypes.guess_type(real_path)
-    return WsResponse(
-        status_code=200,
-        reason_phrase="OK",
-        headers=WsHeaders([
-            ("Content-Type", mime_type or "application/octet-stream"),
-            ("Content-Length", str(len(data))),
-            ("Cache-Control", "no-cache"),
-        ]),
-        body=data,
-    )
-
-
-# ---------------------------------------------------------------------------
-# mDNS / Bonjour discovery
-# ---------------------------------------------------------------------------
-
-def _start_mdns(port: int) -> "Zeroconf | None":
-    if os.environ.get("BRIDGE_DISABLE_MDNS", "0") == "1":
-        log.info("mDNS disabled by BRIDGE_DISABLE_MDNS=1")
-        return None
-    if not _ZEROCONF_AVAILABLE:
-        log.warning("zeroconf not installed — mDNS disabled. Run: pip install zeroconf")
-        return None
-    try:
-        local_ip = socket.gethostbyname(socket.gethostname())
-        info = ServiceInfo(
-            "_bridge._tcp.local.",
-            "bridge._bridge._tcp.local.",
-            addresses=[socket.inet_aton(local_ip)],
-            port=port,
-            properties={"version": "2"},
-        )
-        zc = Zeroconf()
-        zc.register_service(info)
-        log.info("mDNS: bridge.local advertised at %s:%d", local_ip, port)
-        return zc
-    except Exception as exc:
-        log.warning("mDNS registration failed: %s", exc)
-        return None
-
-
-# cloudflared tunnel helpers
-# ---------------------------------------------------------------------------
-async def _drain_proc_stderr(proc) -> None:
-    try:
-        async for _ in proc.stderr:
-            pass
-    except Exception:
-        pass
-
-
-def _is_cloudflared_running() -> bool:
-    return _CLOUDFLARED_PROC is not None and _CLOUDFLARED_PROC.returncode is None
-
-
-async def _start_cloudflared_tunnel(port: int) -> None:
-    global _CLOUDFLARED_PROC, _CURRENT_TUNNEL_URL, _TUNNEL_RETRY_TASK, _TUNNEL_URL_DELIVERED
-    if _is_cloudflared_running():
-        log.info("cloudflared already running, skipping")
-        return
-    cfd = shutil.which("cloudflared")
-    if not cfd:
-        print("WARNING: cloudflared not installed, skipping tunnel")
-        print("   Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
-        return
-    proc = await asyncio.create_subprocess_exec(
-        cfd, "tunnel", "--url", f"http://localhost:{port}",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _CLOUDFLARED_PROC = proc
-    print("Waiting for cloudflared tunnel...")
-    async for line_bytes in proc.stderr:
-        line = line_bytes.decode(errors="replace")
-        m = re.search(r'https://[\w.-]+\.trycloudflare\.com', line)
-        if m:
-            url = m.group(0)
-            ws_url = url.replace("https://", "wss://")
-            print(f"\n{'='*56}")
-            print(f"Tunnel URL (fill in app Settings):")
-            print(f"   {ws_url}")
-            print(f"{'='*56}\n")
-            log.info("Cloudflared tunnel: %s", ws_url)
-            _CURRENT_TUNNEL_URL = ws_url
-            _TUNNEL_URL_DELIVERED = False
-            if _TUNNEL_RETRY_TASK and not _TUNNEL_RETRY_TASK.done():
-                _TUNNEL_RETRY_TASK.cancel()
-            _TUNNEL_RETRY_TASK = _spawn_task("notify-fcm:tunnel", _notify_fcm_tunnel_with_retry(ws_url))
-            set_media_base_url(url)
-            _spawn_task("cloudflared-drain-stderr", _drain_proc_stderr(proc))
-            # Push URL to any clients already connected (e.g. on WiFi when tunnel starts)
-            _spawn_task("broadcast-tunnel-url", _broadcast_json({"type": "tunnel_url", "url": ws_url, "instance_id": _INSTANCE_ID}))
-            return
-    log.warning("cloudflared tunnel URL not detected")
-    _CLOUDFLARED_PROC = None
-    _CURRENT_TUNNEL_URL = None
-
-
-async def _tunnel_url_file_watcher() -> None:
-    """Poll _TUNNEL_URL_FILE every 30 s; broadcast + FCM-notify when URL changes."""
-    global _CURRENT_TUNNEL_URL, _TUNNEL_RETRY_TASK
-    log.info("[tunnel-watcher] started, watching %s", _TUNNEL_URL_FILE)
-    while True:
-        await asyncio.sleep(30)
-        try:
-            if not _TUNNEL_URL_FILE:
-                break
-            if os.path.isfile(_TUNNEL_URL_FILE):
-                candidate = open(_TUNNEL_URL_FILE).read().strip()
-            else:
-                candidate = ""
-            if candidate == (_CURRENT_TUNNEL_URL or ""):
-                continue
-            _CURRENT_TUNNEL_URL = candidate or None
-            if _CURRENT_TUNNEL_URL:
-                log.info("[tunnel-watcher] URL changed → %s", _CURRENT_TUNNEL_URL)
-                https_url = _CURRENT_TUNNEL_URL.replace("wss://", "https://")
-                set_media_base_url(https_url)
-                if _TUNNEL_RETRY_TASK and not _TUNNEL_RETRY_TASK.done():
-                    _TUNNEL_RETRY_TASK.cancel()
-                _TUNNEL_RETRY_TASK = _spawn_task(
-                    "notify-fcm:tunnel", _notify_fcm_tunnel_with_retry(_CURRENT_TUNNEL_URL)
-                )
-            else:
-                log.info("[tunnel-watcher] URL cleared (cloudflared restarting?)")
-            _spawn_task(
-                "broadcast-tunnel-url",
-                _broadcast_json({
-                    "type": "tunnel_url",
-                    "url": _CURRENT_TUNNEL_URL or "",
-                    "instance_id": _INSTANCE_ID,
-                }),
-            )
-        except Exception as exc:
-            log.warning("[tunnel-watcher] error: %s", exc)
-
 
 async def _warmup_history_cache_background() -> None:
     """啟動後延遲 8 秒，趁空閒預建所有 backend 的 session history index。"""
@@ -2543,12 +1315,12 @@ async def main(port: int, tunnel: bool = False,
     _init_paths(resolved_data_dir)
 
     # Load tunnel URL from external file if cloudflared is managed by launchd.
-    global _TUNNEL_URL_FILE, _CURRENT_TUNNEL_URL
+    global _TUNNEL_URL_FILE
     _TUNNEL_URL_FILE = os.environ.get("BRIDGE_TUNNEL_URL_FILE", "")
     if _TUNNEL_URL_FILE and os.path.isfile(_TUNNEL_URL_FILE):
         _stored = open(_TUNNEL_URL_FILE).read().strip()
         if _stored:
-            _CURRENT_TUNNEL_URL = _stored
+            set_current_tunnel_url(_stored)
             log.info("Loaded tunnel URL from file: %s", _stored)
 
     global _PAIRING
@@ -2593,6 +1365,17 @@ async def main(port: int, tunnel: bool = False,
     _DEFAULT_BACKEND_NAME = _normalize_backend_name(backend_name)
     _DEFAULT_OLLAMA_MODEL = model or "llama3.2"
     _OLLAMA_HOST = ollama_host
+    configure_jsonl_sessions(
+        sessions=_SESSIONS,
+        default_cwd=DEFAULT_CWD,
+        claude_projects_dir=CLAUDE_PROJECTS_DIR,
+        session_backend=_session_backend,
+        broadcast_json=_broadcast_json,
+        build_sessions_list=build_sessions_list,
+        dispatch_event=_dispatch_event,
+        evt_done=_evt_done,
+        log=log,
+    )
     _ensure_local_session_dirs()
     _PERMISSION_MANAGER = PermissionManager(
         _broadcast_json,
@@ -2610,8 +1393,36 @@ async def main(port: int, tunnel: bool = False,
         _get_or_create_backend("codex")
     except Exception:
         pass
+    configure_network_services(
+        root_dir=_ROOT_DIR,
+        instance_id=_INSTANCE_ID,
+        log=log,
+        broadcast_json=_broadcast_json,
+        spawn_task=_spawn_task,
+        notify_tunnel_with_retry=_notify_fcm_tunnel_with_retry,
+        set_media_base_url=set_media_base_url,
+    )
+    configure_push_registry(
+        data_dir=_DATA_DIR,
+        root_dir=_ROOT_DIR,
+        fcm_token_file=FCM_TOKEN_FILE,
+        service_account_file=SERVICE_ACCOUNT_FILE,
+        instance_id=_INSTANCE_ID,
+        log=log,
+        broadcast_json=_broadcast_json,
+        spawn_task=_spawn_task,
+        is_tunnel_delivered=is_tunnel_url_delivered,
+    )
     init_firebase()
     _load_inbox()
+    configure_feed_ops(
+        data_dir=_DATA_DIR,
+        fcm_token_file=FCM_TOKEN_FILE,
+        broadcast_json=_broadcast_json,
+        spawn_task=_spawn_task,
+    )
+    _load_feed_index()
+    _feed_gc_deleted()
     _migrate_codex_saved_sessions()
     _restore_sessions_from_disk()
     _apply_session_meta()
@@ -2671,7 +1482,7 @@ async def main(port: int, tunnel: bool = False,
             # External tunnel management: cloudflared_launcher.sh owns the process.
             # Bridge just polls the URL file and broadcasts changes.
             log.info("External tunnel mode: watching %s", _TUNNEL_URL_FILE)
-            _spawn_task("tunnel-url-watcher", _tunnel_url_file_watcher())
+            _spawn_task("tunnel-url-watcher", _tunnel_url_file_watcher(_TUNNEL_URL_FILE))
         else:
             # Self-managed tunnel (legacy / manual --tunnel flag).
             if tunnel:

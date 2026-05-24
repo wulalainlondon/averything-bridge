@@ -186,7 +186,19 @@ def test_validate_client_msg_covers_prompt_message_contract():
     import bridge_v2 as bv2
 
     assert bv2.validate_client_msg({"type": "message", "session_id": "s1"}) is None
+    assert bv2.validate_client_msg({"type": "user_input_response", "request_id": "ui_1"}) is None
+    assert bv2.validate_client_msg({"type": "request_user_input_response", "request_id": "ui_1"}) is None
+    assert bv2.validate_client_msg({"type": "choice_response", "request_id": "ui_1"}) is None
+    assert bv2.validate_client_msg({"type": "form_response", "request_id": "ui_1"}) is None
+    assert bv2.validate_client_msg({"type": "questions_response", "request_id": "ui_1"}) is None
+    assert bv2.validate_client_msg({"type": "pending_decision_result", "request_id": "ui_1"}) is None
+    assert bv2.validate_client_msg({"type": "request_user_input"}) is None
+    assert bv2.validate_client_msg({"type": "choice_request"}) is None
+    assert bv2.validate_client_msg({"type": "pending_interactions_list"}) is None
     assert bv2.validate_client_msg({"type": "message"}) == "'message' missing required field 'session_id'"
+    assert bv2.validate_client_msg({"type": "user_input_response"}) == (
+        "'user_input_response' missing required field 'request_id'"
+    )
     assert bv2.validate_client_msg({"type": "message", "session_id": 123}) == (
         "'message.session_id' must be str, got int"
     )
