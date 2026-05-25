@@ -265,7 +265,7 @@ def _msg_agent_tree(session_id: str, tree_data: dict) -> dict:
 async def send_event(session: "Session", event: dict) -> None:
     payload = {**event, "session_id": session.session_id}
     if session.current_request_id and "request_id" not in payload and event.get("type") in {
-        "text_chunk", "tool_start", "tool_result", "tool_end", "media", "done", "stopped", "error",
+        "text_chunk", "thinking_chunk", "tool_start", "tool_result", "tool_end", "media", "done", "stopped", "error",
     }:
         payload["request_id"] = session.current_request_id
     if _EVENT_DISPATCHER is not None:

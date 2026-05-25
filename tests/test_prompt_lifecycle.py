@@ -168,6 +168,7 @@ def test_send_event_injects_current_request_id_for_prompt_events():
 
         set_event_dispatcher(dispatcher)
         try:
+            await send_event(session, {"type": "thinking_chunk", "content": "thinking"})
             await send_event(session, {"type": "text_chunk", "content": "hi"})
             await send_event(session, {"type": "done"})
         finally:
@@ -177,6 +178,7 @@ def test_send_event_injects_current_request_id_for_prompt_events():
     delivered = asyncio.run(run())
 
     assert delivered == [
+        {"type": "thinking_chunk", "content": "thinking", "session_id": "s_prompt", "request_id": "r_active"},
         {"type": "text_chunk", "content": "hi", "session_id": "s_prompt", "request_id": "r_active"},
         {"type": "done", "session_id": "s_prompt", "request_id": "r_active"},
     ]
