@@ -600,6 +600,9 @@ console.log(JSON.stringify(data));
                             text = "\n".join(text_parts)
                         if not text or text.startswith("<") or text.startswith("[Request interrupted"):
                             continue
+                        # Filter system-injected skill instructions (injected as user text by Claude Code harness).
+                        if text.startswith("Base directory for this skill:"):
+                            continue
                         # If no blocks built (e.g. plain-string content), synthesise a text block
                         if not blocks:
                             blocks = [{"type": "text", "text": text}]
