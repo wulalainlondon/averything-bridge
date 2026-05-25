@@ -1,6 +1,7 @@
 """WebSocket message routing entrypoint."""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Coroutine
@@ -13,6 +14,7 @@ from handlers.feed_ops import (
     handle_feed_delete,
 )
 from handlers.fork_ops import handle_fork_message
+from handlers.instance_ops import handle_instance_msg
 from prompt_routes import handle_prompt_message
 from route_utils import safe_send_json as _safe_send_json
 from session_routes import handle_session_message
@@ -142,9 +144,16 @@ async def handle_low_coupling_message(
     if await handle_fork_message(mtype=mtype, msg=msg, ws=ws, client=client, ctx=ctx):
         return True
 
+    if await handle_instance_msg(mtype=mtype, msg=msg, ws=ws, client=client, ctx=ctx):
+        return True
+
     if mtype == "request_history":
         sid = msg["session_id"]
         session = ctx.sessions.get(sid)
+        if session and ctx.root_dir:
+            from utils.path_jail import is_inside_jail
+            if not session.cwd or not is_inside_jail(os.path.realpath(session.cwd), ctx.root_dir):
+                session = None
         if not session:
             await _safe_send_json(
                 ws,

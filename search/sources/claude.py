@@ -50,6 +50,23 @@ def _extract_text(content) -> Optional[str]:
 class ClaudeJsonlSource:
     name = 'claude'
 
+    def __init__(self, root_dir: str = ""):
+        self._root_dir = root_dir
+
+    def _project_matches(self, project_dir: Path) -> bool:
+        if not self._root_dir:
+            return True
+        prefix = self._root_dir.replace('/', '-')
+        name = project_dir.name
+        return name == prefix or name.startswith(prefix + '-')
+
+    def _path_matches(self, path: Path) -> bool:
+        if not self._root_dir:
+            return True
+        if '/subagents/' in str(path):
+            return self._project_matches(path.parents[2])
+        return self._project_matches(path.parent)
+
     @property
     def watch_root(self) -> Path:
         """Return the root directory this source watches (respects module-level override)."""
@@ -61,16 +78,19 @@ class ClaudeJsonlSource:
     def discover(self) -> Iterator[Path]:
         if not _CLAUDE_ROOT.is_dir():
             return
-        # Main session files
-        for p in _CLAUDE_ROOT.glob('*/*.jsonl'):
-            yield p.resolve()
-        # Subagent files
-        for p in _CLAUDE_ROOT.glob('*/*/subagents/agent-*.jsonl'):
-            yield p.resolve()
+        for project in _CLAUDE_ROOT.iterdir():
+            if not project.is_dir() or not self._project_matches(project):
+                continue
+            for p in project.glob('*.jsonl'):
+                yield p.resolve()
+            for p in project.glob('*/subagents/agent-*.jsonl'):
+                yield p.resolve()
 
     def iter_messages(
         self, path: Path, start_offset: int = 0
     ) -> Iterator[tuple[SearchableMessage, int]]:
+        if not self._path_matches(path):
+            return
         is_sub = '/subagents/' in str(path)
         session_id = self.session_id_for(path)
         cwd_cache: Optional[str] = None

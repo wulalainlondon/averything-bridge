@@ -67,6 +67,7 @@ class _ClaudeState:
     timed_out: bool = False
     spawning: bool = False
     tool_blocks: dict = field(default_factory=dict)
+    tool_waiting_events: dict = field(default_factory=dict)  # tool_use_id → asyncio.Event
     restart_count: int = 0
     pending_stop: bool = False
     bad_resume: bool = False
@@ -135,6 +136,11 @@ class ClaudeCliBackend(Backend, _StatesMixin):
             "message": {"role": "user", "content": [content_block]},
         })
         session.is_streaming = True
+        # Unblock the stdout reader that's waiting for this AskUserQuestion response.
+        state = self._get_state(session)
+        ev = state.tool_waiting_events.pop(interaction.tool_use_id, None)
+        if ev is not None:
+            ev.set()
 
     # ------------------------------------------------------------------
     # Public Backend interface
@@ -1273,6 +1279,7 @@ console.log(JSON.stringify(data));
             if etype == "assistant":
                 message = evt.get("message", {})
                 content_blocks = message.get("content", [])
+                _pending_ask_events: list[tuple[str, asyncio.Event]] = []
                 for block in content_blocks:
                     btype = block.get("type", "")
                     if btype == "thinking":
@@ -1313,9 +1320,31 @@ console.log(JSON.stringify(data));
                                     session_id=session.session_id,
                                     request_id=interaction.request_id,
                                 ))
+                                _wait_ev = asyncio.Event()
+                                state.tool_waiting_events[tool_id] = _wait_ev
+                                _pending_ask_events.append((tool_id, _wait_ev))
                             except Exception as exc:
                                 log.warning("[%s] AskUserQuestion bridge conversion failed: %s", session.session_id, exc)
                         await send_event(session, _evt_tool_start(tool_id, name, command))
+                # Pause stdout reader until user answers all AskUserQuestion calls.
+                # This ensures tool_result is written to Claude's stdin BEFORE readline()
+                # is called, preventing Claude Code from timing out the interaction.
+                if _pending_ask_events:
+                    _wait_timeout = 300.0
+                    try:
+                        log.info("[%s] Waiting for %d AskUserQuestion response(s) (timeout=%.0fs)",
+                                 session.session_id, len(_pending_ask_events), _wait_timeout)
+                        await asyncio.wait_for(
+                            asyncio.gather(*[ev.wait() for _, ev in _pending_ask_events]),
+                            timeout=_wait_timeout,
+                        )
+                        log.info("[%s] AskUserQuestion response(s) received, resuming stdout reader",
+                                 session.session_id)
+                    except asyncio.TimeoutError:
+                        log.warning("[%s] AskUserQuestion timed out after %.0fs, resuming stdout reader",
+                                    session.session_id, _wait_timeout)
+                        for tid, _ in _pending_ask_events:
+                            state.tool_waiting_events.pop(tid, None)
 
             elif etype == "tool_result":
                 tool_id = evt.get("tool_use_id", "")

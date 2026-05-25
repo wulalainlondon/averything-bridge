@@ -49,12 +49,17 @@ def _is_codex_bootstrap_text(text: str) -> bool:
 class CodexSessionSource:
     name = 'codex'
 
+    def __init__(self, root_dir: str = ""):
+        self._root_dir = root_dir
+
     @property
     def watch_root(self) -> Path:
         """Return the root directory this source watches (respects module-level override)."""
         return _CODEX_ROOT
 
     def is_enabled(self) -> bool:
+        if self._root_dir:
+            return False  # codex sessions are user-global, not project-scoped
         return _CODEX_ROOT.is_dir()
 
     def discover(self) -> Iterator[Path]:

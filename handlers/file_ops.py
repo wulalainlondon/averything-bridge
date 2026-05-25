@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
 
 from utils.path_jail import resolve_jailed, JailEscape
+
+
+def _dir_hash(entries: list[dict]) -> str:
+    fp = [(e["name"], e["is_dir"], e["modified"]) for e in entries]
+    return hashlib.sha1(json.dumps(fp, separators=(",", ":")).encode()).hexdigest()[:16]
 
 log = logging.getLogger(__name__)
 
@@ -44,21 +50,47 @@ def invalidate_sessions_cache() -> None:
     _ALL_SESSIONS_TIME = 0.0
 
 
+# Directories that are never useful to browse in a file picker
+_SKIP_DIRS = frozenset({
+    "node_modules", ".git", ".hg", ".svn",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".tox", ".ruff_cache",
+    ".next", ".nuxt", ".svelte-kit", ".turbo",
+    "dist", "build", "out", "target", ".gradle",
+    ".venv", "venv", "env", ".env",
+    ".idea", ".vscode",
+    "coverage", ".nyc_output",
+})
+
+# Files/dirs whose names start with these prefixes are hidden by default
+_SKIP_PREFIXES = (".", "~")
+
+_MAX_ENTRIES = 500
+
+
 def _list_entries(path: str) -> list[dict]:
     entries: list[dict] = []
     if os.path.isdir(path):
         try:
             for entry in os.scandir(path):
+                name = entry.name
+                # Skip known noisy dirs
+                if entry.is_dir(follow_symlinks=False) and name in _SKIP_DIRS:
+                    continue
+                # Skip hidden files/dirs (dotfiles, temp)
+                if name.startswith(_SKIP_PREFIXES):
+                    continue
                 try:
                     stat = entry.stat(follow_symlinks=False)
                     entries.append({
-                        "name": entry.name,
+                        "name": name,
                         "is_dir": entry.is_dir(follow_symlinks=True),
                         "size": stat.st_size,
                         "modified": int(stat.st_mtime),
                     })
                 except Exception as exc:
                     log.debug("_list_entries: stat failed for %r: %s", entry.path, exc)
+                if len(entries) >= _MAX_ENTRIES:
+                    break
         except PermissionError as exc:
             log.warning("_list_entries: permission denied scanning %r: %s", path, exc)
     entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
@@ -149,12 +181,21 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
             log.warning("[jail] browse_dir escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
             return True
         entries = _list_entries(path)
+        current_hash = _dir_hash(entries)
+        client_hash = msg.get("client_hash", "")
+        unchanged = bool(client_hash) and client_hash == current_hash
 
         active_items = _active_sessions_for_path(path, ctx["sessions"])
 
+        def _build(send_entries: list[dict], sessions: list[dict]) -> str:
+            payload = ctx["msg_dir_listing"](path, send_entries, sessions)
+            payload["hash"] = current_hash
+            payload["unchanged"] = unchanged
+            return json.dumps(payload)
+
         # Stage 1: return filesystem + active sessions quickly.
         try:
-            await ws.send(json.dumps(ctx["msg_dir_listing"](path, entries, active_items)))
+            await ws.send(_build([] if unchanged else entries, active_items))
         except Exception as exc:
             log.warning("browse_dir: WS send (stage 1) failed: %s", exc)
             return True
@@ -164,7 +205,7 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         resumable = await _resumable_for_path(path, ctx["backends"], active_uuids)
         merged = active_items + resumable
         try:
-            await ws.send(json.dumps(ctx["msg_dir_listing"](path, entries, merged)))
+            await ws.send(_build([] if unchanged else entries, merged))
         except Exception as exc:
             log.warning("browse_dir: WS send (stage 2) failed: %s", exc)
         return True

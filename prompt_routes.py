@@ -1,12 +1,45 @@
 """Prompt and stop WebSocket routes."""
 from __future__ import annotations
 
+import os
+import re
 import uuid
 import time
 from datetime import UTC, datetime
 from typing import Any
 
 from route_utils import safe_send_json
+
+_AT_FILE_RE = re.compile(r'(?<!\S)@((?:\.\.?/|/)?[\w][\w.\-/]*\.\w+)')
+_MAX_INJECT_BYTES = 100 * 1024
+_MAX_INJECT_FILES = 8
+
+
+def _inject_file_refs(text: str, cwd: str) -> str:
+    injections: list[str] = []
+    seen: set[str] = set()
+    for m in _AT_FILE_RE.finditer(text):
+        if len(injections) >= _MAX_INJECT_FILES:
+            break
+        ref = m.group(1)
+        if ref in seen:
+            continue
+        seen.add(ref)
+        full = ref if ref.startswith('/') else os.path.join(cwd, ref)
+        try:
+            with open(full, 'r', encoding='utf-8', errors='replace') as fh:
+                raw = fh.read(_MAX_INJECT_BYTES + 1)
+            truncated = len(raw) > _MAX_INJECT_BYTES
+            if truncated:
+                raw = raw[:_MAX_INJECT_BYTES]
+            lang = os.path.splitext(ref)[1].lstrip('.')
+            suffix = '\n...(truncated)' if truncated else ''
+            injections.append(f"--- @{ref} ---\n```{lang}\n{raw}{suffix}\n```")
+        except OSError:
+            pass
+    if not injections:
+        return text
+    return text + "\n\n" + "\n\n".join(injections)
 
 
 async def handle_prompt_message(
@@ -25,6 +58,9 @@ async def handle_prompt_message(
         if not session:
             await safe_send_json(ws, ctx.msg_error(f"Unknown session: {sid}", sid))
             return True
+
+        if content and session.cwd:
+            content = _inject_file_refs(content, session.cwd)
 
         session.ws_ref = ws
 

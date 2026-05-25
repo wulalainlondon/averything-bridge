@@ -129,7 +129,7 @@ except ImportError as _ie:
     _SEARCH_AVAILABLE = False
     _SEARCH_IMPORT_ERR = str(_ie)
 from backends.events import (
-    send_event, stream_text, scan_for_media, set_media_base_url,
+    send_event, stream_text, scan_for_media, set_media_base_url, set_http_serve_dir,
     _evt_error, _evt_done, _evt_stopped, _evt_session_warning, _evt_session_died, _evt_session_closed,
     _evt_resume_progress,
     _evt_text_chunk, _evt_tool_start, _evt_tool_result, _evt_tool_end, _evt_media,
@@ -388,6 +388,7 @@ async def _init_search() -> None:
         _search_enabled = False
         return
     cfg = get_config()
+    cfg.root_dir = _ROOT_DIR
     if not cfg.search.enabled:
         log.info("[search] disabled via config")
         _search_enabled = False
@@ -464,6 +465,23 @@ _OLLAMA_HOST = "http://localhost:11434"
 # ---------------------------------------------------------------------------
 _SESSIONS = session_registry.SESSIONS
 _SESSIONS_LOCK = session_registry.SESSIONS_LOCK
+
+
+def _session_in_scope(session: "Session") -> bool:
+    """Return True if this session's cwd is inside the instance root_dir jail."""
+    if not _ROOT_DIR:
+        return True
+    if not session.cwd:
+        return False
+    from utils.path_jail import is_inside_jail
+    return is_inside_jail(os.path.realpath(session.cwd), _ROOT_DIR)
+
+
+def _scoped_sessions() -> dict:
+    """Return a filtered snapshot of _SESSIONS restricted to root_dir scope."""
+    if not _ROOT_DIR:
+        return _SESSIONS
+    return {k: v for k, v in _SESSIONS.items() if _session_in_scope(v)}
 
 # ---------------------------------------------------------------------------
 # Shell sessions
@@ -760,7 +778,7 @@ async def _send_unread_snapshot(ws: Any, client: ClientConn) -> None:
     # sessions stay forever and break the dashboard sort (unread > 0 sessions
     # get sticky-pinned at the top by sortSessions). Must explicitly send 0
     # so client setUnread resets the badge.
-    await client_manager.send_unread_snapshot(ws, client, _SESSIONS.values(), _unread_for)
+    await client_manager.send_unread_snapshot(ws, client, _scoped_sessions().values(), _unread_for)
 
 
 async def _send_unread_snapshot_deferred(ws: Any, client: ClientConn, delay: float = 0.5) -> None:
@@ -805,7 +823,7 @@ def _session_has_valid_resume(s: "Session") -> bool:
 
 def build_sessions_list() -> dict:
     return session_registry.build_sessions_list(
-        _SESSIONS,
+        _scoped_sessions(),
         recent_messages=_get_recent_messages_sync,
     )
 
@@ -816,7 +834,7 @@ def _session_to_summary(s: "Session") -> dict:
 async def _send_all_sessions(ws: Any, batch_size: int = 50) -> None:
     await session_registry.send_all_sessions(
         ws,
-        _SESSIONS,
+        _scoped_sessions(),
         recent_messages=_get_recent_messages_sync,
         batch_size=batch_size,
     )
@@ -1354,6 +1372,7 @@ async def main(port: int, tunnel: bool = False,
         _ROOT_DIR = os.environ.get("BRIDGE_ROOT_DIR", "")
         if _ROOT_DIR:
             _ROOT_DIR = os.path.realpath(os.path.expanduser(_ROOT_DIR))
+    set_http_serve_dir(_ROOT_DIR)
 
     global _INSTANCE_NAME, _LAN_IP
     _INSTANCE_NAME = instance_name or os.environ.get("BRIDGE_INSTANCE_NAME", "")

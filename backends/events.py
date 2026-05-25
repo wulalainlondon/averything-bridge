@@ -19,14 +19,21 @@ OFFLINE_BUFFER_MAX = 10000
 _MEDIA_BASE_URL: str = ""
 HTTP_PORT = 9090
 _http_server_proc: "asyncio.subprocess.Process | None" = None
+_http_serve_dir: str = ""
+
+
+def set_http_serve_dir(directory: str) -> None:
+    global _http_serve_dir
+    _http_serve_dir = os.path.realpath(os.path.expanduser(directory)) if directory else ""
 
 
 async def ensure_http_server() -> None:
     global _http_server_proc
     if _http_server_proc is not None and _http_server_proc.returncode is None:
         return
+    serve_dir = _http_serve_dir or os.path.expanduser("~")
     _http_server_proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "http.server", str(HTTP_PORT), "--directory", "/",
+        sys.executable, "-m", "http.server", str(HTTP_PORT), "--directory", serve_dir,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -38,7 +45,12 @@ def set_media_base_url(url: str) -> None:
 _EVENT_DISPATCHER: Callable[[dict, "Session"], Awaitable[bool]] | None = None
 
 MEDIA_RE = re.compile(
-    r'(/(?:[^\s\'"<>]+\.(?:jpg|jpeg|png|gif|webp|mp4|mov|m4v|avi)))',
+    r'(/(?:[^\s\'"<>]+\.(?:jpg|jpeg|png|gif|webp|mp4|mov|m4v|avi|html|htm|pdf)))',
+    re.IGNORECASE,
+)
+# Relative paths: ./img.png  ../dir/img.png
+MEDIA_RE_REL = re.compile(
+    r'(?<![/\w])(\.\.?/[^\s\'"<>]+\.(?:jpg|jpeg|png|gif|webp|mp4|mov|m4v|avi|html|htm|pdf))',
     re.IGNORECASE,
 )
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -335,12 +347,37 @@ async def emit_done(session: "Session") -> None:
     await send_event(session, _evt_done())
 
 
+def _local_media_url(abs_path: str) -> str:
+    """Return http://127.0.0.1:HTTP_PORT/<rel> where <rel> is path relative to _http_serve_dir."""
+    from urllib.parse import quote as urlquote
+    serve_dir = _http_serve_dir or os.path.expanduser("~")
+    try:
+        rel = os.path.relpath(abs_path, serve_dir)
+    except ValueError:
+        rel = abs_path.lstrip("/")
+    # relpath with ".." means file is outside serve_dir — serve anyway but flag
+    return f"http://127.0.0.1:{HTTP_PORT}/{urlquote(rel)}"
+
+
 async def scan_for_media(text: str, session: "Session") -> None:
     from urllib.parse import quote as urlquote
     import logging
     log = logging.getLogger("bridge_v2")
-    matches = MEDIA_RE.findall(text)
-    for path in matches:
+
+    # Collect absolute + relative paths, dedup while preserving order
+    abs_matches = MEDIA_RE.findall(text)
+    rel_matches = [
+        os.path.normpath(os.path.join(session.cwd or ".", p))
+        for p in MEDIA_RE_REL.findall(text)
+    ] if session.cwd else []
+    seen: set[str] = set()
+    all_paths: list[str] = []
+    for p in abs_matches + rel_matches:
+        if p not in seen:
+            seen.add(p)
+            all_paths.append(p)
+
+    for path in all_paths:
         if not os.path.exists(path):
             continue
         ext = os.path.splitext(path)[1].lower()
@@ -349,12 +386,11 @@ async def scan_for_media(text: str, session: "Session") -> None:
         elif ext in VIDEO_EXTS:
             media_type = "video"
         elif ext in DOC_EXTS:
-            encoded = urlquote(path)
             if _MEDIA_BASE_URL:
-                url = f"{_MEDIA_BASE_URL}/media{encoded}"
+                url = f"{_MEDIA_BASE_URL}/media{urlquote(path)}"
             else:
                 await ensure_http_server()
-                url = f"http://127.0.0.1:{HTTP_PORT}{encoded}"
+                url = _local_media_url(path)
             title = _extract_html_title(path) if ext in {".html", ".htm"} else os.path.basename(path)
             if not title:
                 title = os.path.basename(path)
@@ -365,12 +401,11 @@ async def scan_for_media(text: str, session: "Session") -> None:
             continue
         else:
             continue
-        encoded = urlquote(path)
         if _MEDIA_BASE_URL:
-            url = f"{_MEDIA_BASE_URL}/media{encoded}"
+            url = f"{_MEDIA_BASE_URL}/media{urlquote(path)}"
         else:
             await ensure_http_server()
-            url = f"http://127.0.0.1:{HTTP_PORT}{encoded}"
+            url = _local_media_url(path)
         payload = _evt_media(media_type, path, url)
         log.info("Media detected: %s", payload)
         await send_event(session, payload)

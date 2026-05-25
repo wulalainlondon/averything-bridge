@@ -193,6 +193,10 @@ _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
     "feed_fetch": [("feed_id", str)],
     "feed_mark_read": [("feed_id", str)],
     "feed_delete": [("feed_id", str)],
+    "start_instance": [("name", str)],
+    "stop_instance": [("name", str)],
+    "upsert_instance": [("name", str), ("port", int), ("root_dir", str)],
+    "delete_instance": [("name", str)],
 }
 
 
@@ -227,6 +231,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "feed_fetch",
     "feed_mark_read",
     "feed_delete",
+    "list_instances", "start_instance", "stop_instance", "upsert_instance", "delete_instance",
 })
 
 

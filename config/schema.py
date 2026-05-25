@@ -57,3 +57,4 @@ class BridgeConfig:
     sources: SourcesConfig = field(default_factory=SourcesConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     config_file_path: Optional[Path] = None
+    root_dir: str = ""  # filesystem jail root; "" = no filter

@@ -16,9 +16,10 @@ def registered_sources(config: 'BridgeConfig | None' = None) -> List[SearchSourc
     if is_enabled() returns True (path-based auto-detection).
     Pass config with explicit disable flags to suppress specific sources.
     """
+    root_dir = getattr(config, 'root_dir', '') if config is not None else ''
     candidates = [
-        ClaudeJsonlSource(),
-        CodexSessionSource(),
+        ClaudeJsonlSource(root_dir=root_dir),
+        CodexSessionSource(root_dir=root_dir),
         OllamaSource(),
     ]
 
