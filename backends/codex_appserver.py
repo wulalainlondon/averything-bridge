@@ -26,6 +26,7 @@ from .jsonrpc import JsonRpcPlumber
 from .events import (
     send_event, stream_text, emit_done,
     _evt_error, _evt_stopped, _evt_done, _evt_session_warning, _evt_session_closed,
+    _evt_thinking_chunk, _evt_tool_start, _evt_tool_result, _evt_tool_end,
     _msg_session_uuid, _msg_usage_report,
 )
 from .history import complete_history_message, clamp_history_limit, load_indexed_jsonl_messages, slice_history, _JSONL_HISTORY_CACHE, DEFAULT_HISTORY_LIMIT
@@ -82,6 +83,7 @@ class _AppServerState:
     last_rate_limits: dict = field(default_factory=dict)
     usage_updated_at: float = 0.0
     temp_image_paths: list = field(default_factory=list)
+    tool_outputs: dict[str, str] = field(default_factory=dict)
     compact_in_progress: bool = False
     compact_done_event: asyncio.Event = field(default_factory=asyncio.Event)
     compact_error: Optional[str] = None
@@ -184,8 +186,13 @@ class CodexAppServerBackend(Backend, _StatesMixin):
 
     async def _dispatch(self, msg: dict) -> None:
         # --- Notifications (RPC responses are handled by _rpc_plumber in _read_loop) ---
+        msg_id = msg.get("id")
         method = msg.get("method", "")
         params = msg.get("params", {}) or {}
+        if msg_id is not None and method and "result" not in msg and "error" not in msg:
+            await self._handle_server_request(msg_id, method, params)
+            return
+
         thread_id = params.get("threadId")
         session = self._thread_to_session.get(thread_id) if thread_id else None
 
@@ -197,13 +204,98 @@ class CodexAppServerBackend(Backend, _StatesMixin):
 
         elif method == "item/agentMessage/delta" and session:
             phase = params.get("phase") or params.get("messagePhase") or params.get("item", {}).get("phase")
-            if phase == "commentary":
-                return
             delta = params.get("delta", "")
             if delta:
+                if phase == "commentary":
+                    try:
+                        await send_event(session, _evt_thinking_chunk(delta))
+                    except Exception:
+                        pass
+                    return
                 session.accumulated_text = (session.accumulated_text or "") + delta
                 try:
                     await stream_text(delta, session)
+                except Exception:
+                    pass
+
+        elif method == "item/reasoning/textDelta" and session:
+            delta = params.get("delta") or params.get("text") or ""
+            if delta:
+                try:
+                    await send_event(session, _evt_thinking_chunk(str(delta)))
+                except Exception:
+                    pass
+
+        elif method == "item/commandExecution/outputDelta" and session:
+            item_id = str(params.get("itemId") or params.get("callId") or "codex_command")
+            delta = params.get("delta") or params.get("output") or ""
+            if delta:
+                try:
+                    state = self._states.get(session.session_id)
+                    output = str(delta)
+                    if state:
+                        output = state.tool_outputs.get(item_id, "") + output
+                        state.tool_outputs[item_id] = output
+                    await send_event(session, _evt_tool_result(item_id, output))
+                except Exception:
+                    pass
+
+        elif method == "item/fileChange/outputDelta" and session:
+            item_id = str(params.get("itemId") or params.get("callId") or "codex_file_change")
+            delta = params.get("delta") or params.get("output") or ""
+            if delta:
+                try:
+                    state = self._states.get(session.session_id)
+                    output = str(delta)
+                    if state:
+                        output = state.tool_outputs.get(item_id, "") + output
+                        state.tool_outputs[item_id] = output
+                    await send_event(session, _evt_tool_result(item_id, output))
+                except Exception:
+                    pass
+
+        elif method == "item/started" and session:
+            item = params.get("item", {}) if isinstance(params.get("item"), dict) else {}
+            item_id = str(params.get("itemId") or item.get("id") or "codex_item")
+            name = str(params.get("name") or item.get("name") or item.get("type") or "codex")
+            command = params.get("command") or item.get("command") or item.get("input") or ""
+            if isinstance(command, (dict, list)):
+                command = json.dumps(command, ensure_ascii=False)
+            try:
+                state = self._states.get(session.session_id)
+                if state:
+                    state.tool_outputs[item_id] = ""
+                await send_event(session, _evt_tool_start(item_id, name, str(command)))
+            except Exception:
+                pass
+
+        elif method == "item/completed" and session:
+            item = params.get("item", {}) if isinstance(params.get("item"), dict) else {}
+            item_id = str(params.get("itemId") or item.get("id") or "codex_item")
+            output = params.get("output") or item.get("output") or item.get("result") or ""
+            try:
+                state = self._states.get(session.session_id)
+                if output:
+                    if state:
+                        state.tool_outputs[item_id] = str(output)
+                    await send_event(session, _evt_tool_result(item_id, str(output)))
+                await send_event(session, _evt_tool_end(item_id))
+                if state:
+                    state.tool_outputs.pop(item_id, None)
+            except Exception:
+                pass
+
+        elif method == "item/commandExecution/terminalInteraction" and session:
+            item_id = str(params.get("itemId") or params.get("callId") or "codex_terminal")
+            text = params.get("text") or params.get("input") or params.get("message") or ""
+            if text:
+                try:
+                    state = self._states.get(session.session_id)
+                    output = str(text)
+                    if state:
+                        output = state.tool_outputs.get(item_id, "") + output
+                        state.tool_outputs[item_id] = output
+                    await send_event(session, _evt_tool_result(item_id, output))
                 except Exception:
                     pass
 
@@ -273,6 +365,37 @@ class CodexAppServerBackend(Backend, _StatesMixin):
         elif method in ("warning", "error") and not session:
             log.debug("[codex-appserver] %s: %s", method, str(params)[:200])
 
+    async def _handle_server_request(self, request_id, method: str, params: dict) -> None:
+        approval_methods = {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "applyPatchApproval",
+            "execCommandApproval",
+        }
+        if method in approval_methods:
+            result = {"decision": "accept"}
+        elif method == "item/tool/requestUserInput":
+            result = {"answers": []}
+        elif method == "item/tool/call":
+            await self._rpc_plumber.write(self._proc, {
+                "id": request_id,
+                "error": {
+                    "code": -32601,
+                    "message": "item/tool/call is not implemented by claude-bridge",
+                },
+            })
+            return
+        else:
+            log.debug("[codex-appserver] unhandled ServerRequest: %s", method)
+            await self._rpc_plumber.write(self._proc, {
+                "id": request_id,
+                "error": {"code": -32601, "message": f"unknown method: {method}"},
+            })
+            return
+
+        await self._rpc_plumber.write(self._proc, {"id": request_id, "result": result})
+
     # ------------------------------------------------------------------ Backend API
 
     async def spawn(self, session: "Session") -> None:
@@ -303,7 +426,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
 
         if state.thread_id is None:
             result = await self._rpc("thread/start", {
-                "model": CODEX_MODEL,
+                "model": session.model or CODEX_MODEL,
                 "cwd": cwd,
                 "ephemeral": False,
                 "approvalPolicy": "never",
@@ -586,6 +709,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
         # Reset state — a new thread will be created on next send.
         state.thread_id = None
         state.last_usage = {}
+        state.tool_outputs.clear()
         session.resume_id = None
         state.turn_done_event.clear()
         await send_event(session, _evt_session_warning("Session history cleared."))

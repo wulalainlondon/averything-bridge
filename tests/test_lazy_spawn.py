@@ -360,6 +360,187 @@ class TestBuildSessionsListNoSpawn:
         assert history["messages"][-1]["content"] == "目前目錄是 `/tmp/project`。"
         assert all("我先確認" not in m["content"] for m in history["messages"])
 
+    def test_codex_live_commentary_delta_emits_thinking_chunk(self):
+        """Live Codex commentary should render as an AI process block in chat."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+        from backends.events import set_event_dispatcher
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            session = MagicMock()
+            session.session_id = "s_codex"
+            session.current_request_id = "r_codex"
+            session.ws_ref = None
+            session.offline_buffer = []
+            backend._thread_to_session["thread_1"] = session
+
+            delivered: list[dict] = []
+
+            async def dispatcher(payload: dict, session_arg) -> bool:
+                delivered.append(payload)
+                assert session_arg is session
+                return True
+
+            set_event_dispatcher(dispatcher)
+            try:
+                await backend._dispatch({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread_1",
+                        "phase": "commentary",
+                        "delta": "我先檢查目前的 bridge stream。",
+                    },
+                })
+            finally:
+                set_event_dispatcher(None)
+            return delivered
+
+        delivered = asyncio.run(run())
+
+        assert delivered == [{
+            "type": "thinking_chunk",
+            "content": "我先檢查目前的 bridge stream。",
+            "session_id": "s_codex",
+            "request_id": "r_codex",
+        }]
+
+    def test_codex_server_request_approval_is_answered(self):
+        """Codex app-server requests must receive JSON-RPC responses or turns can hang."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            proc = MagicMock()
+            proc.stdin = _fake_stdin()
+            backend._proc = proc
+
+            await backend._dispatch({
+                "id": 42,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread_1"},
+            })
+
+            raw = proc.stdin.write.call_args.args[0].decode()
+            return json.loads(raw)
+
+        assert asyncio.run(run()) == {
+            "id": 42,
+            "result": {"decision": "accept"},
+        }
+
+    def test_codex_server_request_unknown_method_gets_error(self):
+        """Unhandled ServerRequest frames should fail explicitly instead of being dropped."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            proc = MagicMock()
+            proc.stdin = _fake_stdin()
+            backend._proc = proc
+
+            await backend._dispatch({
+                "id": 99,
+                "method": "item/tool/call",
+                "params": {"threadId": "thread_1"},
+            })
+
+            raw = proc.stdin.write.call_args.args[0].decode()
+            return json.loads(raw)
+
+        response = asyncio.run(run())
+        assert response["id"] == 99
+        assert response["error"]["code"] == -32601
+        assert "item/tool/call" in response["error"]["message"]
+
+    def test_codex_output_delta_sends_accumulated_tool_result(self):
+        """Frontend replaces tool_result output, so Codex deltas must be accumulated first."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+        from backends.events import set_event_dispatcher
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            session = MagicMock()
+            session.session_id = "s_codex"
+            session.current_request_id = "r_codex"
+            session.ws_ref = None
+            session.offline_buffer = []
+            backend._states[session.session_id] = backend._state_factory()
+            backend._thread_to_session["thread_1"] = session
+
+            delivered: list[dict] = []
+
+            async def dispatcher(payload: dict, session_arg) -> bool:
+                delivered.append(payload)
+                assert session_arg is session
+                return True
+
+            set_event_dispatcher(dispatcher)
+            try:
+                await backend._dispatch({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_1",
+                        "itemId": "cmd_1",
+                        "name": "shell",
+                        "command": "printf",
+                    },
+                })
+                await backend._dispatch({
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {"threadId": "thread_1", "itemId": "cmd_1", "delta": "hel"},
+                })
+                await backend._dispatch({
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {"threadId": "thread_1", "itemId": "cmd_1", "delta": "lo"},
+                })
+            finally:
+                set_event_dispatcher(None)
+            return delivered
+
+        delivered = asyncio.run(run())
+
+        assert [event["type"] for event in delivered] == [
+            "tool_start",
+            "tool_result",
+            "tool_result",
+        ]
+        assert delivered[-2]["output"] == "hel"
+        assert delivered[-1]["output"] == "hello"
+
+    def test_codex_spawn_uses_session_model(self, tmp_path):
+        """thread/start should respect the model selected on the bridge session."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            session = _make_session("s_codex_model", backend_name="codex")
+            session.cwd = str(tmp_path)
+            session.model = "codex-mini"
+
+            backend._ensure_server = AsyncMock()
+            backend._rpc = AsyncMock(return_value={"thread": {"id": "thread_model"}})
+            await backend.spawn(session)
+            return backend._rpc.call_args.args
+
+        method, params = asyncio.run(run())
+        assert method == "thread/start"
+        assert params["model"] == "codex-mini"
+
     def test_codex_history_strips_turn_aborted_notice(self, tmp_path):
         """Codex history should not render framework abort notices as user text."""
         from backends.codex_appserver import CodexAppServerBackend
