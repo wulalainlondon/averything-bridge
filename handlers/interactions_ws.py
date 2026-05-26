@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Awaitable, Callable
 
-from interactions import REGISTRY
+from interactions import REGISTRY, normalize_questions
 
 BroadcastJson = Callable[[dict], Awaitable[int]]
 SessionBackend = Callable[[Any], Any]
@@ -24,6 +24,18 @@ RESPONSE_TYPES = frozenset({
 LIST_TYPES = frozenset({
     "pending_interactions_list",
     "pending_decisions_list",
+})
+
+# Client can inject a user_input_request to broadcast to all clients (used for testing/tools)
+INJECT_TYPES = frozenset({
+    "user_input_request",
+    "request_user_input",
+    "choice_request",
+    "multi_choice_request",
+    "form_request",
+    "confirmation_request",
+    "question_request",
+    "questions_request",
 })
 
 
@@ -47,6 +59,28 @@ async def handle_interaction_message(
 ) -> bool:
     if mtype in LIST_TYPES:
         await send_pending_interactions(ws, str(msg.get("session_id") or ""))
+        return True
+
+    if mtype in INJECT_TYPES:
+        session_id = str(msg.get("session_id") or "")
+        raw_questions = msg.get("questions") or msg.get("choices") or msg.get("options")
+        if isinstance(raw_questions, list):
+            command: Any = {"questions": raw_questions}
+        elif isinstance(raw_questions, dict):
+            command = raw_questions
+        else:
+            command = msg
+        questions = normalize_questions(command)
+        if not questions:
+            questions = normalize_questions(msg)
+        await REGISTRY.create(
+            session_id=session_id,
+            source=str(msg.get("source") or "client"),
+            kind=str(msg.get("kind") or "choice"),
+            questions=questions,
+            header=str(msg.get("header") or ""),
+            broadcast_json=broadcast_json,
+        )
         return True
 
     if mtype not in RESPONSE_TYPES:

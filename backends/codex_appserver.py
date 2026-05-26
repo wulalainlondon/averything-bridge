@@ -461,6 +461,11 @@ class CodexAppServerBackend(Backend, _StatesMixin):
 
         state = self._get_state(session)
 
+        # User-triggered /compact: route through the proper RPC path, same as auto-compact.
+        if (content or "").strip() == "/compact" and not state.compact_in_progress:
+            asyncio.create_task(self._auto_compact(session, state))
+            return
+
         # Ensure we have an active thread. Also re-spawn if app-server died (proc gone).
         proc_alive = self._proc is not None and self._proc.returncode is None
         if state.thread_id is None or not proc_alive:

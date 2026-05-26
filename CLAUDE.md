@@ -211,7 +211,7 @@ Max concurrent shells: 5
 
 | File | Format | Purpose |
 |------|--------|---------|
-| `saved_sessions.json` | `dict[session_id → metadata]` | name, resume_id, cwd, backend, model, sandbox, last_used; pruned >90d or >200 entries |
+| `saved_sessions.json` | `dict[session_id → metadata]` | name, resume_id, cwd, backend, model, sandbox, last_used; pruned >30d or >500 entries (sessions with resume_id evicted first) |
 | `session_meta.json` | `dict[session_id → {pinned, hidden}]` | UI pin/hide state |
 | `read_cursors.json` | `dict[session_id → {device_id → seq}]` | Per-device unread tracking |
 

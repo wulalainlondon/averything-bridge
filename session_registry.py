@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -15,6 +16,13 @@ from typing import Any, Deque, Optional
 from utils.uuid_helper import is_valid_uuid
 
 log = logging.getLogger(__name__)
+
+# Shared cross-thread lock for saved_sessions.json.  Both the asyncio side
+# (persist_session / remove_saved_session) and the search-ingest worker thread
+# (auto_register.auto_register_session) must hold this lock before touching
+# saved_sessions.json.  The lock is imported by auto_register at runtime to
+# avoid a circular-import; see auto_register._SAVED_LOCK.
+_SAVED_SESSIONS_LOCK = threading.Lock()
 
 
 DEFAULT_CWD = os.path.expanduser(os.environ.get("BRIDGE_DEFAULT_CWD", "") or "~")
@@ -63,6 +71,12 @@ class Session:
     _fts_first_msg_indexed: bool = False
     parent_session_id: str | None = None
     forked_at: float | None = None
+    # Per-session asyncio lock that serialises all ws.send() calls for this session.
+    # Prevents live events from interleaving with offline-buffer replay frames.
+    _ws_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # All prior resume_ids this session has held (UUIDs rotate each Claude turn).
+    # Used by the JSONL watcher to avoid registering ghost sessions for old .jsonl files.
+    historical_resume_ids: set = field(default_factory=set, repr=False)
 
 
 SESSIONS: dict[str, Session] = {}
@@ -106,11 +120,39 @@ def session_to_summary(
 
 
 def sorted_visible_sessions(sessions: Mapping[str, Session], *, limit: int | None = None) -> list[Session]:
-    result = sorted(
+    sorted_all = sorted(
         (session for session in sessions.values() if session_has_valid_resume(session)),
         key=lambda session: session.last_activity or session.created_at,
         reverse=True,
     )
+    # Deduplicate by resume_id: when multiple sessions share the same resume_id
+    # (e.g. a saved s_* session and a ghost jl_* session from an old .jsonl file),
+    # keep only one.  Prefer s_* sessions because they carry user-set name/sandbox
+    # metadata.  Among jl_* duplicates keep the most-recently-active one (already
+    # first in the sorted order).  Sessions with resume_id=None are never deduped.
+    seen_resume_ids: set[str] = set()
+    result: list[Session] = []
+    for session in sorted_all:
+        rid = session.resume_id
+        if rid is None:
+            result.append(session)
+            continue
+        if rid in seen_resume_ids:
+            # Already have a winner for this resume_id — check if this entry is a
+            # non-jl_ session that should displace the previously chosen jl_ one.
+            if not session.session_id.startswith("jl_"):
+                # Replace the jl_ winner that snuck in earlier.
+                result = [
+                    s for s in result
+                    if s.resume_id != rid or not s.session_id.startswith("jl_")
+                ]
+                result.append(session)
+            # else: skip this duplicate
+        else:
+            seen_resume_ids.add(rid)
+            result.append(session)
+    # Re-sort after potential displacement (non-jl_ sessions appended at end).
+    result.sort(key=lambda s: s.last_activity or s.created_at, reverse=True)
     return result[:limit] if limit is not None else result
 
 
@@ -215,35 +257,59 @@ def persist_session(
     saved_sessions_file: str,
     log_warning: Callable[..., None] | None = None,
 ) -> None:
-    saved = load_saved_sessions(saved_sessions_file)
-    saved[session.session_id] = {
-        "name": session.name,
-        # Both keys written for human-readability and forward/backward compat.
-        # Authoritative field is resume_id; claude_uuid is legacy alias.
-        "resume_id": session.resume_id,
-        "claude_uuid": session.resume_id,
-        "last_used": int(time.time()),
-        "cwd": session.cwd,
-        "backend": session.backend_name,
-        "model": session.model,
-        "sandbox": session.sandbox,
-        "image_dir": session.image_dir,
-        "parent_session_id": session.parent_session_id,
-        "forked_at": session.forked_at,
-    }
-    cutoff = int(time.time()) - 90 * 24 * 3600
-    saved = {
-        key: value for key, value in saved.items()
-        if value.get("last_used", 0) > cutoff
-    }
-    if len(saved) > 200:
-        saved = dict(sorted(saved.items(), key=lambda item: item[1].get("last_used", 0), reverse=True)[:200])
-    try:
-        with open(saved_sessions_file, "w") as f:
-            json.dump(saved, f, indent=2, ensure_ascii=False)
-    except Exception as exc:
-        if log_warning:
-            log_warning("Failed to persist session: %s", exc)
+    import tempfile
+    with _SAVED_SESSIONS_LOCK:
+        saved = load_saved_sessions(saved_sessions_file)
+        saved[session.session_id] = {
+            "name": session.name,
+            # Both keys written for human-readability and forward/backward compat.
+            # Authoritative field is resume_id; claude_uuid is legacy alias.
+            "resume_id": session.resume_id,
+            "claude_uuid": session.resume_id,
+            "last_used": int(time.time()),
+            "cwd": session.cwd,
+            "backend": session.backend_name,
+            "model": session.model,
+            "sandbox": session.sandbox,
+            "image_dir": session.image_dir,
+            "parent_session_id": session.parent_session_id,
+            "forked_at": session.forked_at,
+            # JSON does not support sets; serialise as a sorted list for stability.
+            "historical_resume_ids": sorted(session.historical_resume_ids),
+        }
+        cutoff = int(time.time()) - 30 * 24 * 3600
+        saved = {
+            key: value for key, value in saved.items()
+            if value.get("last_used", 0) > cutoff
+        }
+        if len(saved) > 500:
+            # Prefer evicting sessions that have a resume_id (recoverable via JSONL).
+            # Sessions with resume_id=None are unique and cannot be recovered.
+            with_resume = sorted(
+                [(k, v) for k, v in saved.items() if v.get("resume_id")],
+                key=lambda item: item[1].get("last_used", 0),
+            )
+            evict_count = len(saved) - 500
+            to_evict = {k for k, _v in with_resume[:evict_count]}
+            saved = {k: v for k, v in saved.items() if k not in to_evict}
+        path = Path(saved_sessions_file)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
+            tmp = Path(tmp_str)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(saved, f, indent=2, ensure_ascii=False)
+                tmp.replace(path)
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        except Exception as exc:
+            if log_warning:
+                log_warning("Failed to persist session: %s", exc)
 
 
 def remove_saved_session(
@@ -252,16 +318,30 @@ def remove_saved_session(
     saved_sessions_file: str,
     log_warning: Callable[..., None] | None = None,
 ) -> None:
-    saved = load_saved_sessions(saved_sessions_file)
-    if session_id not in saved:
-        return
-    del saved[session_id]
-    try:
-        with open(saved_sessions_file, "w") as f:
-            json.dump(saved, f, indent=2, ensure_ascii=False)
-    except Exception as exc:
-        if log_warning:
-            log_warning("Failed to remove session from disk: %s", exc)
+    import tempfile
+    with _SAVED_SESSIONS_LOCK:
+        saved = load_saved_sessions(saved_sessions_file)
+        if session_id not in saved:
+            return
+        del saved[session_id]
+        path = Path(saved_sessions_file)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
+            tmp = Path(tmp_str)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(saved, f, indent=2, ensure_ascii=False)
+                tmp.replace(path)
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        except Exception as exc:
+            if log_warning:
+                log_warning("Failed to remove session from disk: %s", exc)
 
 
 def restore_sessions_from_disk(
@@ -330,6 +410,9 @@ def restore_sessions_from_disk(
             session.last_activity = saved_last_used
             session.parent_session_id = data.get("parent_session_id") or None
             session.forked_at = float(data["forked_at"]) if data.get("forked_at") is not None else None
+            raw_hist = data.get("historical_resume_ids")
+            if isinstance(raw_hist, list):
+                session.historical_resume_ids = set(str(x) for x in raw_hist if x)
             sessions[sid] = session
             count += 1
         except Exception as exc:

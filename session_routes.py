@@ -55,6 +55,9 @@ async def handle_session_message(
             if sid in ctx.sessions:
                 existing = ctx.sessions[sid]
                 existing.ws_ref = ws
+                if existing.resume_id is None and resume_claude_id:
+                    existing.resume_id = resume_claude_id
+                    ctx.persist_session(existing)
                 await safe_send_json(
                     ws,
                     ctx.msg_session_created(

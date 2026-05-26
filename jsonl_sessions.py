@@ -210,7 +210,11 @@ def _register_jsonl_session(path: str) -> bool:
                 return False
             sid = f"jl_c_{resume_id[:12]}"
 
-        existing_uuids = {s.resume_id for s in _sessions.values() if s.resume_id}
+        existing_uuids: set[str] = set()
+        for s in _sessions.values():
+            if s.resume_id:
+                existing_uuids.add(s.resume_id)
+            existing_uuids.update(getattr(s, "historical_resume_ids", set()))
         if resume_id in existing_uuids or sid in _sessions:
             return False
 
@@ -299,7 +303,11 @@ def _session_for_jsonl_path(path: str) -> Session | None:
 
 def merge_jsonl_sessions_into_state() -> bool:
     added = False
-    existing_uuids = {s.resume_id for s in _sessions.values() if s.resume_id}
+    existing_uuids: set[str] = set()
+    for s in _sessions.values():
+        if s.resume_id:
+            existing_uuids.add(s.resume_id)
+        existing_uuids.update(getattr(s, "historical_resume_ids", set()))
 
     for base, backend_name in ((_claude_projects_dir, "claude"), (CODEX_SESSIONS_DIR, "codex")):
         if not os.path.isdir(base):

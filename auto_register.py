@@ -35,7 +35,13 @@ def parse_iso8601_to_epoch(ts: str) -> Optional[float]:
     except Exception:
         return None
 
-_SAVED_LOCK = threading.Lock()
+# _SAVED_LOCK kept as an alias for backward compatibility (nothing external imports it,
+# but keeping it avoids surprises if someone references it in tests).
+# The authoritative lock lives in session_registry._SAVED_SESSIONS_LOCK; we import it
+# lazily to avoid a circular import at module load time.
+def _get_saved_lock() -> threading.Lock:
+    from session_registry import _SAVED_SESSIONS_LOCK
+    return _SAVED_SESSIONS_LOCK
 
 # Only register sessions whose last activity is within this window.  Sessions
 # older than this stay in search.db (searchable) but are NOT added to
@@ -79,7 +85,7 @@ def auto_register_session(
     if age_sec > cutoff_seconds:
         return False  # silently skip; still indexed in search.db
 
-    with _SAVED_LOCK:
+    with _get_saved_lock():
         if not saved_path.exists():
             data: dict = {}
         else:
@@ -128,36 +134,37 @@ def prune_old_saved_sessions(saved_path: Path, days: int = 30) -> int:
     """
     if not saved_path.exists():
         return 0
-    try:
-        with saved_path.open(encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception:
-        return 0
-
-    cutoff = time.time() - days * 86400
-    before = len(data)
-    pruned = {sid: m for sid, m in data.items() if (m.get('last_used') or 0) > cutoff}
-    removed = before - len(pruned)
-    if removed > 0:
-        import os
-        import tempfile
-        fd, tmp_str = tempfile.mkstemp(dir=saved_path.parent, prefix='.tmp_', suffix='.json')
-        tmp = Path(tmp_str)
+    with _get_saved_lock():
         try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(pruned, f, indent=2, ensure_ascii=False)
-            tmp.replace(saved_path)
-            log.info(
-                'pruned %d stale sessions from saved_sessions.json (kept %d)',
-                removed, len(pruned),
-            )
-        except Exception as exc:
-            log.warning('Failed to write pruned saved_sessions.json: %s', exc)
+            with saved_path.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            return 0
+
+        cutoff = time.time() - days * 86400
+        before = len(data)
+        pruned = {sid: m for sid, m in data.items() if (m.get('last_used') or 0) > cutoff}
+        removed = before - len(pruned)
+        if removed > 0:
+            import os
+            import tempfile
+            fd, tmp_str = tempfile.mkstemp(dir=saved_path.parent, prefix='.tmp_', suffix='.json')
+            tmp = Path(tmp_str)
             try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-    return removed
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(pruned, f, indent=2, ensure_ascii=False)
+                tmp.replace(saved_path)
+                log.info(
+                    'pruned %d stale sessions from saved_sessions.json (kept %d)',
+                    removed, len(pruned),
+                )
+            except Exception as exc:
+                log.warning('Failed to write pruned saved_sessions.json: %s', exc)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return removed
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:

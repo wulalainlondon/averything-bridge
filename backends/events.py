@@ -289,7 +289,8 @@ async def send_event(session: "Session", event: dict) -> None:
             pass
     if session.ws_ref is not None:
         try:
-            await session.ws_ref.send(json.dumps(payload))
+            async with session._ws_send_lock:
+                await session.ws_ref.send(json.dumps(payload))
             return
         except Exception:
             session.ws_ref = None
