@@ -1333,21 +1333,11 @@ console.log(JSON.stringify(data));
                 # This ensures tool_result is written to Claude's stdin BEFORE readline()
                 # is called, preventing Claude Code from timing out the interaction.
                 if _pending_ask_events:
-                    _wait_timeout = 300.0
-                    try:
-                        log.info("[%s] Waiting for %d AskUserQuestion response(s) (timeout=%.0fs)",
-                                 session.session_id, len(_pending_ask_events), _wait_timeout)
-                        await asyncio.wait_for(
-                            asyncio.gather(*[ev.wait() for _, ev in _pending_ask_events]),
-                            timeout=_wait_timeout,
-                        )
-                        log.info("[%s] AskUserQuestion response(s) received, resuming stdout reader",
-                                 session.session_id)
-                    except asyncio.TimeoutError:
-                        log.warning("[%s] AskUserQuestion timed out after %.0fs, resuming stdout reader",
-                                    session.session_id, _wait_timeout)
-                        for tid, _ in _pending_ask_events:
-                            state.tool_waiting_events.pop(tid, None)
+                    log.info("[%s] Waiting for %d AskUserQuestion response(s) (no timeout)",
+                             session.session_id, len(_pending_ask_events))
+                    await asyncio.gather(*[ev.wait() for _, ev in _pending_ask_events])
+                    log.info("[%s] AskUserQuestion response(s) received, resuming stdout reader",
+                             session.session_id)
 
             elif etype == "tool_result":
                 tool_id = evt.get("tool_use_id", "")
