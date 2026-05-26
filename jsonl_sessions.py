@@ -420,7 +420,12 @@ async def jsonl_watcher_task() -> None:
             jsonl_known_size[p] = new_size
             if not new_lines:
                 continue
-            if _jsonl_lines_contain_turn_end(new_lines, fmt) and _dispatch_event is not None and _evt_done is not None:
+            if (
+                _jsonl_lines_contain_turn_end(new_lines, fmt)
+                and _dispatch_event is not None
+                and _evt_done is not None
+                and session.session_id.startswith(("jl_c_", "jl_x_"))
+            ):
                 _info(
                     "emit external done for session %s (jsonl=%s, new_lines=%d)",
                     session.session_id, os.path.basename(p), len(new_lines),
