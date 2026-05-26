@@ -129,6 +129,7 @@ class DiscoveryBroadcaster:
         self._protocol: Optional[_BroadcastProtocol] = None
         self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
         self._last_warn_ts: float = 0.0
+        self._v6_disabled: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -212,15 +213,27 @@ class DiscoveryBroadcaster:
 
     def _send_v6_best_effort(self, payload: bytes) -> None:
         """Send to ff02::1 (all-nodes multicast) on all link-local interfaces."""
+        if self._v6_disabled:
+            return
         v6_addrs = _get_local_v6_addrs()
         if not v6_addrs:
             return
-        try:
-            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
-                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
-                s.sendto(payload, ("ff02::1", self._discovery_port))
-        except Exception as exc:
-            self._rate_limited_warn("v6 multicast send failed: %s", exc)
+        sent = False
+        for addr in v6_addrs:
+            scope_id = addr.split("%")[1] if "%" in addr else ""
+            try:
+                with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
+                    if scope_id:
+                        iface_idx = socket.if_nametoindex(scope_id)
+                        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, iface_idx)
+                    s.sendto(payload, ("ff02::1", self._discovery_port))
+                    sent = True
+            except Exception:
+                pass
+        if not sent:
+            self._v6_disabled = True
+            log.debug("DiscoveryBroadcaster: v6 multicast unavailable, disabling")
 
     def _rate_limited_warn(self, msg: str, *args: object) -> None:
         now = time.monotonic()

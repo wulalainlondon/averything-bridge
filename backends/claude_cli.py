@@ -207,6 +207,10 @@ class ClaudeCliBackend(Backend, _StatesMixin):
             "message": {"role": "user", "content": content_blocks},
         }) + "\n"
 
+        if content.strip() == "/compact" and not state.compact_in_progress:
+            state.compact_in_progress = True
+            log.info("[%s] user-triggered /compact, setting compact_in_progress", session.session_id)
+
         try:
             state.proc.stdin.write(payload.encode("utf-8"))
             await state.proc.stdin.drain()
@@ -256,6 +260,9 @@ class ClaudeCliBackend(Backend, _StatesMixin):
             state.tree_poll_task = None
         session.accumulated_text = ""
         state.tool_blocks = {}
+        for ev in state.tool_waiting_events.values():
+            ev.set()
+        state.tool_waiting_events.clear()
         await send_event(session, _evt_stopped())
         await self._spawn_proc(session)
 
@@ -269,6 +276,9 @@ class ClaudeCliBackend(Backend, _StatesMixin):
         session.resume_id = None
         session.accumulated_text = ""
         state.tool_blocks = {}
+        for ev in state.tool_waiting_events.values():
+            ev.set()
+        state.tool_waiting_events.clear()
         session.is_streaming = False
         if state.tree_poll_task and not state.tree_poll_task.done():
             state.tree_poll_task.cancel()
@@ -1375,6 +1385,8 @@ console.log(JSON.stringify(data));
                     log.info("[%s] result success, claude_uuid=%s, context_used=%d/%d", session.session_id, new_uuid, session.context_used, session.context_max)
                     if new_uuid:
                         first_uuid = session.resume_id is None
+                        if session.resume_id and session.resume_id != new_uuid:
+                            session.historical_resume_ids.add(session.resume_id)
                         session.resume_id = new_uuid
                         if self._persist_session_fn is not None:
                             self._persist_session_fn(session)
@@ -1466,6 +1478,8 @@ console.log(JSON.stringify(data));
                     init_uuid = evt.get("session_id")
                     if init_uuid and init_uuid != session.resume_id:
                         first_uuid = session.resume_id is None
+                        if session.resume_id and session.resume_id != init_uuid:
+                            session.historical_resume_ids.add(session.resume_id)
                         session.resume_id = init_uuid
                         if self._persist_session_fn is not None:
                             self._persist_session_fn(session)
@@ -1481,6 +1495,9 @@ console.log(JSON.stringify(data));
 
             elif etype == "rate_limit_event":
                 log.debug("[%s] rate_limit_event", session.session_id)
+
+            elif etype == "user":
+                pass
 
             else:
                 log.debug("[%s] Unhandled event type: %s", session.session_id, etype)
