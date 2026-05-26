@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 _SESSIONS_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _SESSIONS_TTL_SEC = 3.0
 
+_ENTRIES_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_ENTRIES_TTL_SEC = 2.0
+
 # ---------------------------------------------------------------------------
 # Global preload cache — populated at bridge startup, invalidated on session
 # create/close, refreshed every _ALL_TTL seconds as a safety net.
@@ -65,6 +68,16 @@ _SKIP_DIRS = frozenset({
 _SKIP_PREFIXES = (".", "~")
 
 _MAX_ENTRIES = 500
+
+
+def _list_entries_cached(path: str) -> list[dict]:
+    now = time.time()
+    cached = _ENTRIES_CACHE.get(path)
+    if cached and cached[0] > now:
+        return cached[1]
+    entries = _list_entries(path)
+    _ENTRIES_CACHE[path] = (now + _ENTRIES_TTL_SEC, entries)
+    return entries
 
 
 def _list_entries(path: str) -> list[dict]:
@@ -180,7 +193,7 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
                 pass
             log.warning("[jail] browse_dir escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
             return True
-        entries = _list_entries(path)
+        entries = _list_entries_cached(path)
         current_hash = _dir_hash(entries)
         client_hash = msg.get("client_hash", "")
         unchanged = bool(client_hash) and client_hash == current_hash
