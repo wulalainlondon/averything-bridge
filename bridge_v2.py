@@ -1301,8 +1301,14 @@ async def handler(ws: ServerConnection) -> None:
 
 
 async def _warmup_history_cache_background() -> None:
-    """啟動後延遲 8 秒，趁空閒預建所有 backend 的 session history index。"""
+    """啟動後延遲 8 秒，趁空閒預建所有 session 的 history index。
+
+    依 last_activity 排序（最近用的先跑），用 semaphore 控制 4 路並行，
+    讓重連後 request_history 能直接命中記憶體 cache，無須重新解析 JSONL。
+    """
     await asyncio.sleep(8)
+
+    # Legacy per-backend warmup (each backend's own get_resumable_sessions call)
     for name, backend in _BACKENDS.items():
         if not hasattr(backend, "warmup_history_cache"):
             continue
@@ -1310,6 +1316,57 @@ async def _warmup_history_cache_background() -> None:
             await backend.warmup_history_cache()
         except Exception as exc:
             log.warning("warmup_history_cache_background [%s] failed: %s", name, exc)
+
+    # Extended warmup: cover ALL sessions in _SESSIONS (not just the 30 from Claude CLI)
+    from backends.history import _JSONL_HISTORY_CACHE
+    sessions_sorted = sorted(
+        _SESSIONS.values(),
+        key=lambda s: s.last_activity,
+        reverse=True,
+    )
+    loop = asyncio.get_event_loop()
+    sem = asyncio.Semaphore(4)
+    warmed = skipped = 0
+
+    async def _warm_one(session: "Session") -> None:
+        nonlocal warmed, skipped
+        if not session.resume_id:
+            return
+        backend = _session_backend(session)
+        if not hasattr(backend, "_load_session_history_sync"):
+            return
+        cache_key = f"claude:{session.resume_id}"
+        if cache_key in _JSONL_HISTORY_CACHE:
+            # Cache already warm — still update latest_source_line if missing.
+            if not session.latest_source_line:
+                idx = _JSONL_HISTORY_CACHE.get(cache_key)
+                if idx and idx.messages:
+                    lsl = str(idx.messages[-1].get("source_message_id") or "")
+                    if lsl:
+                        session.latest_source_line = lsl
+            skipped += 1
+            return
+        async with sem:
+            try:
+                await loop.run_in_executor(
+                    None,
+                    backend._load_session_history_sync,
+                    session.resume_id, DEFAULT_HISTORY_LIMIT, "", "snapshot", "",
+                )
+                warmed += 1
+                # Back-fill latest_source_line from freshly built cache entry.
+                idx = _JSONL_HISTORY_CACHE.get(cache_key)
+                if idx and idx.messages:
+                    lsl = str(idx.messages[-1].get("source_message_id") or "")
+                    if lsl:
+                        session.latest_source_line = lsl
+                await asyncio.sleep(0.02)
+            except Exception:
+                pass
+
+    await asyncio.gather(*[_warm_one(s) for s in sessions_sorted], return_exceptions=True)
+    if warmed or skipped:
+        log.info("history-cache-warmup: warmed=%d skipped=%d of %d sessions", warmed, skipped, len(sessions_sorted))
 
 
 # ---------------------------------------------------------------------------
@@ -1472,7 +1529,7 @@ async def main(port: int, tunnel: bool = False,
     _BRIDGE_PORT = port
     log.info("Bridge v2 starting on port %d (default_backend=%s)", port, _DEFAULT_BACKEND_NAME)
     await _init_search()
-    zc = _start_mdns(port)
+    zc = await _start_mdns(port)
     broadcaster: "DiscoveryBroadcaster | None" = None
     if not no_discovery:
         broadcaster = DiscoveryBroadcaster(

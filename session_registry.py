@@ -77,6 +77,9 @@ class Session:
     # All prior resume_ids this session has held (UUIDs rotate each Claude turn).
     # Used by the JSONL watcher to avoid registering ghost sessions for old .jsonl files.
     historical_resume_ids: set = field(default_factory=set, repr=False)
+    # source_message_id of the last message in this session's JSONL history.
+    # Used by request_history fast-path and sessions_list cursor broadcast.
+    latest_source_line: str = ""
 
 
 SESSIONS: dict[str, Session] = {}
@@ -116,6 +119,7 @@ def session_to_summary(
         "hidden": session.hidden,
         "queue_length": len(session.queue),
         "recent_messages": recent_messages(session, 2),
+        "latest_source_line": session.latest_source_line,
     }
 
 
@@ -276,6 +280,7 @@ def persist_session(
             "forked_at": session.forked_at,
             # JSON does not support sets; serialise as a sorted list for stability.
             "historical_resume_ids": sorted(session.historical_resume_ids),
+            "latest_source_line": session.latest_source_line,
         }
         cutoff = int(time.time()) - 30 * 24 * 3600
         saved = {
@@ -410,6 +415,7 @@ def restore_sessions_from_disk(
             session.last_activity = saved_last_used
             session.parent_session_id = data.get("parent_session_id") or None
             session.forked_at = float(data["forked_at"]) if data.get("forked_at") is not None else None
+            session.latest_source_line = str(data.get("latest_source_line") or "")
             raw_hist = data.get("historical_resume_ids")
             if isinstance(raw_hist, list):
                 session.historical_resume_ids = set(str(x) for x in raw_hist if x)

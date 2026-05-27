@@ -1388,6 +1388,18 @@ console.log(JSON.stringify(data));
                         if session.resume_id and session.resume_id != new_uuid:
                             session.historical_resume_ids.add(session.resume_id)
                         session.resume_id = new_uuid
+                        # Update latest_source_line from the freshly written JSONL cache.
+                        # The cache entry for new_uuid is populated during streaming,
+                        # so by turn-complete time it reflects the full turn.
+                        try:
+                            from backends.history import _JSONL_HISTORY_CACHE
+                            _idx = _JSONL_HISTORY_CACHE.get(f"claude:{new_uuid}")
+                            if _idx and _idx.messages:
+                                _lsl = str(_idx.messages[-1].get("source_message_id") or "")
+                                if _lsl:
+                                    session.latest_source_line = _lsl
+                        except Exception:
+                            pass
                         if self._persist_session_fn is not None:
                             self._persist_session_fn(session)
                         if first_uuid:

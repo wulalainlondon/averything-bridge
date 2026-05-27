@@ -168,44 +168,80 @@ async def handle_low_coupling_message(
             return True
         ctx.mark_read(sid, client.device_id, session.message_seq)
         ctx.persist_read_cursors()
-        await ctx.send_unread_for_client_session(ws, client, session)
-        if session.resume_id:
-            await ctx.emit_resume_progress(session, "resume_started", 5, "Resume started")
-            await ctx.emit_resume_progress(session, "resume_loading_history", 35, "Loading history")
-            try:
-                await ctx.send_session_history_response(
-                    ws,
-                    session,
-                    limit=msg.get("limit"),
-                    known_last_source_message_id=str(msg.get("known_last_source_message_id") or ""),
-                    mode=str(msg.get("mode") or "auto"),
-                    before_source_message_id=str(msg.get("before_source_message_id") or ""),
-                )
-            except Exception as exc:
-                ctx.log_warning("history response error sid=%s: %s", sid, exc)
+
+        # Capture message args before the async task runs (msg dict may be reused)
+        _limit = msg.get("limit")
+        _known_last_id = str(msg.get("known_last_source_message_id") or "")
+        _mode = str(msg.get("mode") or "auto")
+        _before_id = str(msg.get("before_source_message_id") or "")
+
+        # Fast-path: if the client's cursor matches our known latest, there is
+        # nothing new to return.  Skip all JSONL work and reply with an empty
+        # history_delta immediately.  We still need to send the unread snapshot
+        # so the client's badge count is accurate.
+        if (
+            _known_last_id
+            and not _before_id
+            and session.latest_source_line
+            and _known_last_id == session.latest_source_line
+        ):
+            async def _fast_delta() -> None:
+                await ctx.send_unread_for_client_session(ws, client, session)
+                await _safe_send_json(ws, {
+                    "type": "history_delta",
+                    "session_id": sid,
+                    "after_source_message_id": _known_last_id,
+                    "messages": [],
+                    "source_count": 0,
+                })
+            ctx.spawn_task(f"request-history-fast:{sid}", _fast_delta())
+            return True
+
+        async def _load_and_send() -> None:
+            await ctx.send_unread_for_client_session(ws, client, session)
+            if session.resume_id:
+                await ctx.emit_resume_progress(session, "resume_started", 5, "Resume started")
+                await ctx.emit_resume_progress(session, "resume_loading_history", 35, "Loading history")
+                try:
+                    await ctx.send_session_history_response(
+                        ws,
+                        session,
+                        limit=_limit,
+                        known_last_source_message_id=_known_last_id,
+                        mode=_mode,
+                        before_source_message_id=_before_id,
+                    )
+                except Exception as exc:
+                    ctx.log_warning("history response error sid=%s: %s", sid, exc)
+                    await _safe_send_json(
+                        ws,
+                        ctx.msg_session_history(
+                            sid,
+                            [],
+                            source_count=0,
+                            has_more_before=False,
+                            runtime=ctx.history_runtime_payload(session),
+                        ),
+                    )
+                # Lazy spawn: do NOT pre-warm here. Claude/Codex spawn on first user message.
+                await ctx.emit_resume_progress(session, "resume_ready", 100, "Resume ready")
+            else:
                 await _safe_send_json(
                     ws,
                     ctx.msg_session_history(
-                        sid,
+                        session.session_id,
                         [],
                         source_count=0,
                         has_more_before=False,
                         runtime=ctx.history_runtime_payload(session),
                     ),
                 )
-            # Lazy spawn: do NOT pre-warm here. Claude/Codex spawn on first user message.
-            await ctx.emit_resume_progress(session, "resume_ready", 100, "Resume ready")
-        else:
-            await _safe_send_json(
-                ws,
-                ctx.msg_session_history(
-                    session.session_id,
-                    [],
-                    source_count=0,
-                    has_more_before=False,
-                    runtime=ctx.history_runtime_payload(session),
-                ),
-            )
+
+        # Spawn as a concurrent task so the WebSocket handler immediately proceeds
+        # to the next message instead of waiting for the JSONL parse to finish.
+        # Multiple request_history messages (e.g. 40+ on reconnect) now run in
+        # parallel via the thread pool executor rather than serially.
+        ctx.spawn_task(f"request-history:{sid}", _load_and_send())
         return True
 
     if mtype == "set_session_meta":
