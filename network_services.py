@@ -17,7 +17,7 @@ from websockets.http11 import Response as WsResponse
 
 try:
     import socket
-    from zeroconf import ServiceInfo, Zeroconf
+    from zeroconf import NonUniqueNameException, ServiceInfo, Zeroconf
     _ZEROCONF_AVAILABLE = True
 except ImportError:
     socket = None  # type: ignore[assignment]
@@ -130,7 +130,8 @@ async def media_request_handler(connection, request):
     )
 
 
-def start_mdns(port: int):
+def _start_mdns_blocking(port: int):
+    """Blocking mDNS registration — must run in a thread, not on the event loop."""
     if os.environ.get("BRIDGE_DISABLE_MDNS", "0") == "1":
         _info("mDNS disabled by BRIDGE_DISABLE_MDNS=1")
         return None
@@ -138,7 +139,13 @@ def start_mdns(port: int):
         _warning("zeroconf not installed — mDNS disabled. Run: pip install zeroconf")
         return None
     try:
-        local_ip = socket.gethostbyname(socket.gethostname())
+        try:
+            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _s.connect(("8.8.8.8", 80))
+            local_ip = _s.getsockname()[0]
+            _s.close()
+        except Exception:
+            local_ip = socket.gethostbyname(socket.gethostname())
         info = ServiceInfo(
             "_bridge._tcp.local.",
             "bridge._bridge._tcp.local.",
@@ -147,12 +154,21 @@ def start_mdns(port: int):
             properties={"version": "2"},
         )
         zc = Zeroconf()
-        zc.register_service(info)
+        try:
+            zc.register_service(info)
+        except NonUniqueNameException:
+            # Stale cache or another instance holds the name; allow Zeroconf to pick a variant.
+            zc.register_service(info, allow_name_change=True)
         _info("mDNS: bridge.local advertised at %s:%d", local_ip, port)
         return zc
     except Exception as exc:
         _warning("mDNS registration failed: %s", exc)
         return None
+
+
+async def start_mdns(port: int):
+    """Async wrapper: Zeroconf registration is blocking, so run it off the event loop."""
+    return await asyncio.to_thread(_start_mdns_blocking, port)
 
 
 async def _drain_proc_stderr(proc) -> None:

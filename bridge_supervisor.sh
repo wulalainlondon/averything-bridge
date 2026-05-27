@@ -115,6 +115,23 @@ spawn_instance() {
 
   mkdir -p "$data_dir"
 
+  # Adopt an already-running supervisor_instance.sh if it holds the lock.
+  # This prevents a launchd restart from spawning a competing instance.
+  local lock_pid_file="$data_dir/.supervisor.lock/pid"
+  if [[ -f "$lock_pid_file" ]]; then
+    local existing_sup_pid
+    existing_sup_pid="$(cat "$lock_pid_file" 2>/dev/null || true)"
+    if [[ -n "$existing_sup_pid" ]] && kill -0 "$existing_sup_pid" 2>/dev/null; then
+      local _cmd
+      _cmd="$(ps -p "$existing_sup_pid" -o command= 2>/dev/null || true)"
+      if [[ "$_cmd" == *"supervisor_instance.sh"* ]]; then
+        echo "[supervisor] adopting existing instance '$name' on port $port (supervisor pid=$existing_sup_pid)"
+        CHILD_PIDS[$idx]=$existing_sup_pid
+        return
+      fi
+    fi
+  fi
+
   args=(--name "$name" --port "$port" --data-dir "$data_dir")
   if [[ -n "$root_dir" ]]; then
     args+=(--root-dir "$root_dir")

@@ -152,7 +152,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
             try:
                 result = await self._rpc("initialize", {
                     "clientInfo": {"name": "claude-bridge", "version": "1.0"}
-                }, timeout=10.0)
+                }, timeout=30.0)
                 await self._send_notification("initialized")
                 log.info("[codex-appserver] initialized: %s", result.get("userAgent", "?"))
             except Exception as exc:

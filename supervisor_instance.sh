@@ -105,7 +105,17 @@ while ! mkdir "$LOCK_DIR" 2>/dev/null; do
   # Stale lock: old holder is dead. Clear it and retry mkdir.
   echo "[supervisor:$NAME] stale lock (pid=${OLD_LOCK_PID:-?} dead), clearing"
   # If an orphan bridge is healthy, keep it alive and adopt it.
-  ORPHAN_PIDS="$(pgrep -f "${BRIDGE_DIR}/bridge_v2\.py" 2>/dev/null || true)"
+  # Only consider processes that own OUR port — never kill bridges on other ports.
+  _port_pids="$(lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  _pidfile_orphan=""
+  if [[ -f "$PID_FILE" ]]; then
+    _op="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$_op" ]] && kill -0 "$_op" 2>/dev/null; then
+      _cmd="$(ps -p "$_op" -o command= 2>/dev/null || true)"
+      [[ "$_cmd" == *"bridge_v2.py"* ]] && _pidfile_orphan="$_op"
+    fi
+  fi
+  ORPHAN_PIDS="$(printf '%s\n%s\n' "$_port_pids" "$_pidfile_orphan" | sort -u | grep -v '^$' || true)"
   HEALTHY_ORPHAN=""
   if [[ -n "$ORPHAN_PIDS" ]]; then
     for opid in $ORPHAN_PIDS; do
@@ -116,7 +126,7 @@ while ! mkdir "$LOCK_DIR" 2>/dev/null; do
       fi
     done
     if [[ -z "$HEALTHY_ORPHAN" ]]; then
-      echo "[supervisor:$NAME] killing orphan bridge_v2.py pids: $ORPHAN_PIDS"
+      echo "[supervisor:$NAME] killing orphan pids on port $PORT: $ORPHAN_PIDS"
       kill $ORPHAN_PIDS 2>/dev/null || true
       sleep 1
       kill -9 $ORPHAN_PIDS 2>/dev/null || true
@@ -358,7 +368,7 @@ while true; do
     fi
 
     sleep 5
-    _lock_owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    _lock_owner="$(read_lock_owner)"
     if [[ "${_lock_owner}" != "$$" ]]; then
       echo "[supervisor:$NAME] lock taken by pid=${_lock_owner:-?}, self-exiting"
       exit 0

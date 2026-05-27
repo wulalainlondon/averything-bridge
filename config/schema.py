@@ -18,9 +18,9 @@ class SearchConfig:
     )
     max_index_size_mb: int = 1024
     ingest_on_startup: bool = True
-    ingest_startup_delay_sec: float = 2.0
-    ingest_bulk_pause_every_files: int = 50
-    ingest_bulk_pause_sec: float = 0.01
+    ingest_startup_delay_sec: float = 15.0
+    ingest_bulk_pause_every_files: int = 25
+    ingest_bulk_pause_sec: float = 0.05
     ingest_idle_recent_window_sec: float = 3.0
     ingest_idle_pause_sec: float = 0.05
     watch_enabled: bool = True

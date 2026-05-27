@@ -83,6 +83,32 @@ check_not_inside_bridge
 # ============================================================================
 echo "==> Sync runtime files"
 mkdir -p "$RUNTIME_DIR"
+
+# Dynamically exclude instance data subdirectories defined in instances.json
+# so rsync --delete doesn't warn about non-empty dirs it can't remove.
+_INSTANCE_EXCLUDES=()
+if [[ -f "$RUNTIME_DIR/instances.json" ]]; then
+  while IFS= read -r _subdir; do
+    [[ -n "$_subdir" ]] && _INSTANCE_EXCLUDES+=("--exclude" "$_subdir/")
+  done < <(python3 - "$RUNTIME_DIR" <<'PYEOF'
+import json, os, sys
+runtime = os.path.realpath(sys.argv[1])
+try:
+    data = json.load(open(os.path.join(runtime, "instances.json")))
+    seen = set()
+    for inst in data.get("instances", []):
+        dd = os.path.realpath(os.path.expanduser(inst.get("data_dir", "")))
+        if dd.startswith(runtime + "/"):
+            rel = dd[len(runtime)+1:].split("/")[0]
+            if rel and rel not in seen:
+                seen.add(rel)
+                print(rel)
+except Exception as e:
+    print(str(e), file=sys.stderr)
+PYEOF
+)
+fi
+
 rsync -a --delete \
   --exclude '.git' \
   --exclude '__pycache__' \
@@ -109,6 +135,7 @@ rsync -a --delete \
   --exclude 'install.sh' \
   --exclude 'tunnel_url.txt' \
   --exclude 'bridge_identity.json' \
+  "${_INSTANCE_EXCLUDES[@]}" \
   "$SRC_DIR/" "$RUNTIME_DIR/"
 cd "$RUNTIME_DIR"
 
