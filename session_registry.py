@@ -445,9 +445,9 @@ def persist_session_meta(
     log_warning: Callable[..., None] | None = None,
 ) -> None:
     payload = {
-        sid: {"pinned": bool(session.pinned), "hidden": bool(session.hidden)}
+        sid: {"hidden": bool(session.hidden)}
         for sid, session in sessions.items()
-        if session.pinned or session.hidden
+        if session.hidden
     }
     try:
         with open(session_meta_file, "w") as f:
@@ -469,7 +469,6 @@ def apply_session_meta(
         session = sessions.get(sid)
         if not session or not isinstance(val, dict):
             continue
-        session.pinned = bool(val.get("pinned", False))
         session.hidden = bool(val.get("hidden", False))
         applied += 1
     if applied and log_info:

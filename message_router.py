@@ -249,18 +249,14 @@ async def handle_low_coupling_message(
         session = ctx.sessions.get(sid)
         if not session:
             return True
-        if "pinned" in msg:
-            session.pinned = bool(msg["pinned"])
         if "hidden" in msg:
             session.hidden = bool(msg["hidden"])
         ctx.persist_session_meta()
         await ctx.broadcast_json({
             "type": "session_meta_updated",
             "session_id": sid,
-            "pinned": session.pinned,
             "hidden": session.hidden,
         })
-        await ctx.broadcast_json(ctx.build_sessions_list())
         return True
 
     if await handle_prompt_message(mtype=mtype, msg=msg, ws=ws, client=client, ctx=ctx):
