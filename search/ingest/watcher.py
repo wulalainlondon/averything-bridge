@@ -100,6 +100,8 @@ class _JsonlEventHandler:
         self._loop = loop
         # Coalesce: path_str → scheduled_time
         self._pending: Dict[str, float] = {}
+        # Overflow: paths dropped due to QueueFull, retried on next enqueue opportunity
+        self._overflow: set = set()
 
     def _schedule(self, path_str: str) -> None:
         """Thread-safe: called from watchdog thread, enqueues into asyncio loop."""
@@ -112,6 +114,15 @@ class _JsonlEventHandler:
 
     def _enqueue_after_coalesce(self, path_str: str, scheduled_at: float) -> None:
         """Runs in asyncio thread; checks coalesce window before enqueuing."""
+        # Drain overflow set first: attempt to push any previously-dropped paths.
+        # Iteration over a copy so we can mutate the set safely.
+        for overflow_path in list(self._overflow):
+            try:
+                self._queue.put_nowait(Path(overflow_path))
+                self._overflow.discard(overflow_path)
+            except asyncio.QueueFull:
+                break  # Queue still full; leave remainder in overflow for next round
+
         scheduled_fire = self._pending.get(path_str)
         if scheduled_fire is None:
             return
@@ -126,7 +137,9 @@ class _JsonlEventHandler:
         try:
             self._queue.put_nowait(Path(path_str))
         except asyncio.QueueFull:
-            log.warning("WatchdogWatcher: queue full, dropping event for %s", path_str)
+            self._overflow.add(path_str)
+            log.warning("WatchdogWatcher: queue full, buffering event for %s (overflow size: %d)",
+                        path_str, len(self._overflow))
 
     # watchdog callback interface (duck-typed, no inheritance needed for testing)
     def dispatch(self, event) -> None:

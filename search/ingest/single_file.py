@@ -28,8 +28,8 @@ from .display_name import is_framework_noise
 
 log = logging.getLogger(__name__)
 
-_BATCH_SIZE = 500          # max messages before commit
-_BATCH_MAX_BYTES = 2 << 20  # 2 MB content before commit
+_BATCH_SIZE = 2000         # max messages before commit
+_BATCH_MAX_BYTES = 8 << 20  # 8 MB content before commit
 
 # For files smaller than this threshold, use a full-file sha to detect rotation.
 # For larger files, use the head-bytes sha (fast append detection).
@@ -311,10 +311,12 @@ async def ingest_file(
                         _saved_path = Path.home() / '.claude-bridge-runtime' / 'saved_sessions.json'
                         # Prefer the real last message timestamp stored in the
                         # sessions table (last_ts column, ISO8601) over file mtime.
-                        _fp_last_ts_row = conn.execute(
-                            "SELECT last_ts FROM sessions WHERE session_id = ?",
-                            (_fp_session_id,),
-                        ).fetchone()
+                        _fp_last_ts_row = await asyncio.to_thread(
+                            lambda: conn.execute(
+                                "SELECT last_ts FROM sessions WHERE session_id = ?",
+                                (_fp_session_id,),
+                            ).fetchone()
+                        )
                         _fp_last_ts_str = (_fp_last_ts_row[0] if _fp_last_ts_row else None) or ''
                         _fp_epoch = parse_iso8601_to_epoch(_fp_last_ts_str)
                         _fp_last_used = _fp_epoch if _fp_epoch is not None else current_mtime

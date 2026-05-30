@@ -61,6 +61,10 @@ class IngestWorker:
         self._activity_probe = activity_probe
         # full_index from config takes precedence over module-level env var
         self._full_index: bool = getattr(config.search, 'full_index', _FULL_INDEX)
+        # Event that is set when no ingest_file call is in progress (idle).
+        # Starts set (idle); cleared while an incremental ingest is running.
+        self._inflight_event: asyncio.Event = asyncio.Event()
+        self._inflight_event.set()
 
     # ----------------------------------------------------------------
     # Lifecycle
@@ -123,6 +127,17 @@ class IngestWorker:
             self._watcher.stop()
             self._watcher = None
 
+        # Wait for any in-flight incremental ingest_file call to finish before
+        # cancelling tasks and closing the connection.  This prevents SQLite
+        # "closed database" errors when stop() races with an active write.
+        try:
+            await asyncio.wait_for(self._inflight_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            log.warning(
+                "IngestWorker: timed out waiting for in-flight ingest to finish; "
+                "proceeding with shutdown"
+            )
+
         for task in (self._consumer_task, self._bulk_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -131,12 +146,13 @@ class IngestWorker:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        if self._conn is not None:
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
             try:
-                self._conn.close()
+                conn.close()
             except Exception:
                 pass
-            self._conn = None
 
         log.info("IngestWorker: stopped")
 
@@ -227,7 +243,8 @@ class IngestWorker:
             except asyncio.CancelledError:
                 break
 
-            if self._conn is None:
+            conn = self._conn
+            if conn is None:
                 break
 
             source = self._find_source_for(path)
@@ -235,18 +252,22 @@ class IngestWorker:
                 self._queue.task_done()
                 continue
 
+            self._inflight_event.clear()
             try:
                 result: IngestResult = await ingest_file(
-                    self._conn, source, path, full_index=self._full_index
+                    conn, source, path, full_index=self._full_index
                 )
                 if result.messages_added:
                     log.debug(
                         "IngestWorker: incremental — %s: +%d msgs",
                         path.name, result.messages_added,
                     )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 log.error("IngestWorker: incremental ingest error for %s: %s", path, exc)
             finally:
+                self._inflight_event.set()
                 self._queue.task_done()
 
     def upsert_session_metadata(

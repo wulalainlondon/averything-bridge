@@ -12,12 +12,18 @@ Per TECH_RESEARCH Q4:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
 
 from .connection_pool import ConnectionPool
+
+logger = logging.getLogger(__name__)
+
+# Dedupe set for LIKE-fallback warnings: avoid spamming the log for repeated queries.
+_like_fallback_warned: set[tuple] = set()
 
 
 @dataclass
@@ -189,8 +195,24 @@ def _run_like_fallback(
     if filters.since is not None:
         extra_where += " AND m.ts >= ?"
         extra_params.append(filters.since)
+    else:
+        # LIKE fallback has no index — prefilter to the last 90 days to bound scan cost.
+        since_ts = int(time.time()) - 90 * 86400
+        extra_where += " AND m.ts >= ?"
+        extra_params.append(since_ts)
 
-    internal_limit = min((offset + limit) * max_per_session * 10, 2000)
+    # Warn once per unique token set so the user knows why results may be limited.
+    _token_key = tuple(sorted(tokens))
+    if _token_key not in _like_fallback_warned:
+        _like_fallback_warned.add(_token_key)
+        logger.warning(
+            "LIKE fallback triggered for tokens %r (CJK short-word path). "
+            "Results capped at 500 rows within the last 90 days. "
+            "Use 3+ character terms for FTS5 performance.",
+            tokens,
+        )
+
+    internal_limit = min((offset + limit) * max_per_session * 10, 500)
 
     sql = f"""
         SELECT
