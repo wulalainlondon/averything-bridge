@@ -637,6 +637,20 @@ async def _send_session_history_response(
         mode=mode,
         before_source_message_id=before_source_message_id,
     )
+    # Post-load: refresh latest_source_line from the cache that was just populated
+    # (or validated) by load_session_history.  After that call returns, the cache
+    # for this resume_id is guaranteed to reflect the current file state, so it is
+    # safe to read it here — unlike at result-event time where the cache can be stale.
+    try:
+        from backends.history import _JSONL_HISTORY_CACHE
+        _rid = session.resume_id or ""
+        _post_idx = _JSONL_HISTORY_CACHE.get(f"claude:{_rid}") or _JSONL_HISTORY_CACHE.get(f"codex:{_rid}")
+        if _post_idx and _post_idx.messages:
+            _post_lsl = str(_post_idx.messages[-1].get("source_message_id") or "")
+            if _post_lsl:
+                session.latest_source_line = _post_lsl
+    except Exception:
+        pass
     runtime = _history_runtime_payload(session)
     if isinstance(history, dict):
         kind = history.get("kind")
@@ -1119,6 +1133,7 @@ async def handler(ws: ServerConnection) -> None:
             pairing=_PAIRING,
         )
         async for raw in ws:
+            op_started = time.perf_counter()
             _mark_client_activity()
             raw_text = str(raw)
             raw_len = len(raw_text.encode("utf-8", errors="ignore"))
@@ -1166,7 +1181,6 @@ async def handler(ws: ServerConnection) -> None:
                 await send_pending_interactions(ws)
                 _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                 continue
-            op_started = time.perf_counter()
 
             if mtype == "claim_bridge":
                 token = str(msg.get("auth_token") or "").strip()
@@ -1180,8 +1194,10 @@ async def handler(ws: ServerConnection) -> None:
                     await ws.send(json.dumps(_msg_error("Bridge already claimed by another device")))
                     _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
                     continue
+                # Synchronous block — asyncio single-thread guarantees atomicity (no await between clear and update).
+                _new_pairing = {"paired_token": token, "paired_device_id": device_id, "paired_at": int(time.time())}
                 _PAIRING.clear()
-                _PAIRING.update({"paired_token": token, "paired_device_id": device_id, "paired_at": int(time.time())})
+                _PAIRING.update(_new_pairing)
                 _save_pairing(_PAIRING)
                 log.info("Bridge claimed by device_id=%s", device_id)
                 await ws.send(json.dumps({"type": "claim_ack", "is_locked": True, "locked_to_me": True}))
@@ -1393,7 +1409,8 @@ async def main(port: int, tunnel: bool = False,
     global _TUNNEL_URL_FILE
     _TUNNEL_URL_FILE = os.environ.get("BRIDGE_TUNNEL_URL_FILE", "")
     if _TUNNEL_URL_FILE and os.path.isfile(_TUNNEL_URL_FILE):
-        _stored = open(_TUNNEL_URL_FILE).read().strip()
+        with open(_TUNNEL_URL_FILE) as _f:
+            _stored = _f.read().strip()
         if _stored:
             set_current_tunnel_url(_stored)
             log.info("Loaded tunnel URL from file: %s", _stored)

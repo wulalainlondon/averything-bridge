@@ -82,7 +82,7 @@ class PermissionManager:
         )
         self._pending[rid] = req
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future[bool] = loop.create_future()
         self._waiters[rid] = fut
 

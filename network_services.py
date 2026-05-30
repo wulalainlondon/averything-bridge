@@ -238,6 +238,11 @@ async def start_cloudflared_tunnel(port: int) -> None:
     _current_tunnel_url = None
 
 
+def _read_file(path: str) -> str:
+    with open(path) as fh:
+        return fh.read().strip()
+
+
 async def tunnel_url_file_watcher(tunnel_url_file: str) -> None:
     global _current_tunnel_url
     _info("[tunnel-watcher] started, watching %s", tunnel_url_file)
@@ -247,7 +252,7 @@ async def tunnel_url_file_watcher(tunnel_url_file: str) -> None:
             if not tunnel_url_file:
                 break
             if os.path.isfile(tunnel_url_file):
-                candidate = open(tunnel_url_file).read().strip()
+                candidate = await asyncio.to_thread(_read_file, tunnel_url_file)
             else:
                 candidate = ""
             if candidate == (_current_tunnel_url or ""):

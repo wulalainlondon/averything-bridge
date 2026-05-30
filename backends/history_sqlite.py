@@ -67,10 +67,11 @@ def sqlite_load(cache_name: str, key: tuple) -> Optional[list]:
     try:
         _, mtime_ns, file_size = key
         conn = _get_conn()
-        row = conn.execute(
-            "SELECT mtime_ns, file_size, messages_json FROM history_cache WHERE cache_name = ?",
-            (cache_name,),
-        ).fetchone()
+        with _lock:
+            row = conn.execute(
+                "SELECT mtime_ns, file_size, messages_json FROM history_cache WHERE cache_name = ?",
+                (cache_name,),
+            ).fetchone()
         if row and row[0] == mtime_ns and row[1] == file_size:
             return json.loads(row[2])
     except Exception:

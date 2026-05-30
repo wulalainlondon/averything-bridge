@@ -223,7 +223,9 @@ def _register_jsonl_session(path: str) -> bool:
         fmt = "codex" if backend_name == "codex" else "claude"
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
-                for raw in f:
+                for line_no, raw in enumerate(f):
+                    if line_no >= 200:
+                        break
                     try:
                         d = json.loads(raw)
                         if fmt == "claude":
@@ -482,28 +484,44 @@ async def jsonl_watcher_task() -> None:
     except ImportError:
         _warning("watchdog not installed — falling back to 5s polling")
 
+        _mtime_cache: dict[str, float] = {}
+
         def _dir_fingerprint() -> str:
-            parts = []
+            changed_parts: list[str] = []
+            seen_paths: set[str] = set()
             for base in (_claude_projects_dir, CODEX_SESSIONS_DIR):
                 if not os.path.isdir(base):
                     continue
                 for root, _dirs, files in os.walk(base):
                     for fn in sorted(files):
-                        if fn.endswith(".jsonl"):
-                            try:
-                                parts.append(f"{fn}:{os.stat(os.path.join(root, fn)).st_mtime:.0f}")
-                            except OSError:
-                                pass
-            return hashlib.md5("|".join(parts).encode()).hexdigest()
+                        if not fn.endswith(".jsonl"):
+                            continue
+                        fp_path = os.path.join(root, fn)
+                        seen_paths.add(fp_path)
+                        try:
+                            mtime = os.stat(fp_path).st_mtime
+                        except OSError:
+                            continue
+                        if _mtime_cache.get(fp_path) != mtime:
+                            _mtime_cache[fp_path] = mtime
+                            changed_parts.append(f"{fn}:{mtime:.0f}")
+            # treat deleted files as a change too
+            deleted = set(_mtime_cache) - seen_paths
+            for p in deleted:
+                del _mtime_cache[p]
+                changed_parts.append(f"DEL:{os.path.basename(p)}")
+            if not changed_parts:
+                return ""
+            return hashlib.md5("|".join(changed_parts).encode()).hexdigest()
 
-        last_fp = _dir_fingerprint()
+        # prime the cache without treating everything as changed
+        _dir_fingerprint()
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
             try:
                 fp = _dir_fingerprint()
-                if fp == last_fp:
+                if not fp:
                     continue
-                last_fp = fp
                 merge_jsonl_sessions_into_state()
                 if client_manager.has_clients() and _broadcast_json is not None and _build_sessions_list is not None:
                     await _broadcast_json(_build_sessions_list())
