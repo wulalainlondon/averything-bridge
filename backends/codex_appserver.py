@@ -979,35 +979,102 @@ class CodexAppServerBackend(Backend, _StatesMixin):
 
     def _load_native_codex_sessions(self, limit: int = 200) -> list[dict]:
         out: list[dict] = []
-        if not os.path.isfile(self._native_session_index_path):
-            return out
-        try:
-            with open(self._native_session_index_path, "r", encoding="utf-8", errors="ignore") as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line:
+        seen_ids: set[str] = set()
+
+        # Legacy path: session_index.jsonl written by Codex versions before ~0.128.
+        if os.path.isfile(self._native_session_index_path):
+            try:
+                with open(self._native_session_index_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        sid = str(row.get("id") or "").strip()
+                        if not sid or sid in seen_ids:
+                            continue
+                        seen_ids.add(sid)
+                        raw_name = str(row.get("thread_name") or sid[:8])
+                        out.append({
+                            "id": f"native_{sid[:12]}",
+                            "name": _sanitize_session_name(raw_name, sid[:8]),
+                            "claude_uuid": sid,
+                            "resume_id": sid,
+                            "last_used": self._parse_iso_to_epoch(str(row.get("updated_at") or "")),
+                            "cwd": self._read_native_session_cwd(sid),
+                        })
+            except Exception:
+                pass
+
+        # Newer path: Codex >=0.128 writes rollout-{DATETIME}-{UUID}.jsonl files
+        # directly under ~/.codex/sessions/YYYY/MM/DD/ and no longer updates
+        # session_index.jsonl.  Scan the directory tree for these files.
+        if os.path.isdir(self._native_sessions_root):
+            rollout_candidates: list[tuple[str, str, str]] = []
+            for root, _dirs, files in os.walk(self._native_sessions_root):
+                for fn in files:
+                    if not (fn.startswith("rollout-") and fn.endswith(".jsonl")):
                         continue
-                    try:
-                        row = json.loads(line)
-                    except Exception:
+                    uid = fn[:-6][-36:]  # last 36 chars of stem = UUID
+                    if uid in seen_ids:
                         continue
-                    sid = str(row.get("id") or "").strip()
-                    if not sid:
-                        continue
-                    raw_name = str(row.get("thread_name") or sid[:8])
-                    out.append({
-                        "id": f"native_{sid[:12]}",
-                        "name": _sanitize_session_name(raw_name, sid[:8]),
-                        "claude_uuid": sid,
-                        "resume_id": sid,
-                        "last_used": self._parse_iso_to_epoch(str(row.get("updated_at") or "")),
-                        "cwd": self._read_native_session_cwd(sid),
-                    })
-                    if len(out) >= limit:
-                        break
-        except Exception:
-            return []
-        return out
+                    rollout_candidates.append((uid, os.path.join(root, fn), fn))
+
+            # Sort by filename descending (filename encodes the creation timestamp).
+            rollout_candidates.sort(key=lambda x: x[2], reverse=True)
+
+            for uid, filepath, fn in rollout_candidates:
+                if uid in seen_ids:
+                    continue
+                # Parse timestamp from filename:
+                # rollout-2026-05-03T22-59-01-<UUID>.jsonl
+                last_used = 0
+                try:
+                    date_part = fn[8:18]           # "2026-05-03"
+                    time_part = fn[19:27].replace("-", ":")  # "22:59:01"
+                    last_used = self._parse_iso_to_epoch(f"{date_part}T{time_part}Z")
+                except Exception:
+                    pass
+
+                cwd = os.path.expanduser("~")
+                name = uid[:8]
+                try:
+                    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                        for raw in f:
+                            raw = raw.strip()
+                            if not raw:
+                                continue
+                            try:
+                                d = json.loads(raw)
+                            except Exception:
+                                continue
+                            t = d.get("type", "")
+                            p = d.get("payload", {})
+                            if t == "session_meta" and isinstance(p, dict):
+                                cwd = str(p.get("cwd") or cwd)
+                            elif t == "event_msg" and isinstance(p, dict) and p.get("type") == "user_message":
+                                msg = p.get("message", "")
+                                if isinstance(msg, str) and msg.strip():
+                                    name = msg.strip()
+                                break
+                except Exception:
+                    pass
+
+                seen_ids.add(uid)
+                out.append({
+                    "id": f"native_{uid[:12]}",
+                    "name": _sanitize_session_name(name, uid[:8]),
+                    "claude_uuid": uid,
+                    "resume_id": uid,
+                    "last_used": last_used,
+                    "cwd": cwd,
+                })
+
+        out.sort(key=lambda x: x.get("last_used", 0), reverse=True)
+        return out[:limit]
 
     def _extract_text_from_content(self, content: object) -> str:
         if isinstance(content, str):
