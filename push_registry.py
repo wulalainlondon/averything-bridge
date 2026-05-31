@@ -358,7 +358,7 @@ async def send_tunnel_fcm_once(ws_url: str) -> bool:
             data={"type": "tunnel_url", "url": ws_url, "instance_id": _INSTANCE_ID},
             token=token,
         )
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, fb_messaging.send, message)
         _info("FCM tunnel URL pushed to device: %s", ws_url)
         return True
@@ -409,10 +409,10 @@ async def notify_fcm(session_name: str, last_text: str, session_id: str = "") ->
             title=f"✓ {session_name}",
             body=summary,
         ),
-        data={"session_id": session_id},
+        data={"type": "task_done", "session_id": session_id},
         token=token,
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for attempt in range(3):
         try:
             await loop.run_in_executor(None, fb_messaging.send, message)
@@ -449,12 +449,17 @@ async def notify_fcm_file_push(file_id: str, filename: str) -> None:
         },
         token=token,
     )
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, fb_messaging.send, message)
-        _info("FCM file_push notification sent: %s", filename)
-    except Exception as exc:
-        _warning("FCM file_push notify failed: %s", exc)
+    loop = asyncio.get_running_loop()
+    for attempt in range(3):
+        try:
+            await loop.run_in_executor(None, fb_messaging.send, message)
+            _info("FCM file_push notification sent: %s", filename)
+            return
+        except Exception as exc:
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                _warning("FCM file_push notify failed after 3 attempts: %s", exc)
 
 
 async def notify_fcm_user_input(
@@ -487,12 +492,17 @@ async def notify_fcm_user_input(
         },
         token=token,
     )
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, fb_messaging.send, message)
-        _info("FCM user_input notification sent for session %s", session_id)
-    except Exception as exc:
-        _warning("FCM user_input notify failed: %s", exc)
+    loop = asyncio.get_running_loop()
+    for attempt in range(3):
+        try:
+            await loop.run_in_executor(None, fb_messaging.send, message)
+            _info("FCM user_input notification sent for session %s", session_id)
+            return
+        except Exception as exc:
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                _warning("FCM user_input notify failed after 3 attempts: %s", exc)
 
 
 async def notify_fcm_session_died(session_name: str, session_id: str = "") -> None:
@@ -518,9 +528,14 @@ async def notify_fcm_session_died(session_name: str, session_id: str = "") -> No
         },
         token=token,
     )
-    loop = asyncio.get_event_loop()
-    try:
-        await loop.run_in_executor(None, fb_messaging.send, message)
-        _info("FCM session_died notification sent for session %s", session_id)
-    except Exception as exc:
-        _warning("FCM session_died notify failed: %s", exc)
+    loop = asyncio.get_running_loop()
+    for attempt in range(3):
+        try:
+            await loop.run_in_executor(None, fb_messaging.send, message)
+            _info("FCM session_died notification sent for session %s", session_id)
+            return
+        except Exception as exc:
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                _warning("FCM session_died notify failed after 3 attempts: %s", exc)

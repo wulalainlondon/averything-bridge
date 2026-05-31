@@ -33,6 +33,7 @@ from .history_sqlite import sqlite_load, sqlite_save_background
 from interactions import REGISTRY as INTERACTIONS, normalize_questions
 from push_registry import notify_fcm_user_input as _notify_fcm_user_input
 from push_registry import notify_fcm_session_died as _notify_fcm_session_died
+import client_manager
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
@@ -1493,7 +1494,7 @@ console.log(JSON.stringify(data));
                                     ))
                             except Exception:
                                 pass
-                    if self._notify_fcm_fn is not None:
+                    if self._notify_fcm_fn is not None and not client_manager.has_clients():
                         asyncio.create_task(self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id))
                     await emit_done(session)
                     state.tool_blocks = {}

@@ -32,6 +32,7 @@ from .events import (
 from .history import complete_history_message, clamp_history_limit, load_indexed_jsonl_messages, slice_history, _JSONL_HISTORY_CACHE, DEFAULT_HISTORY_LIMIT
 from interactions import REGISTRY as INTERACTIONS, normalize_questions
 from push_registry import notify_fcm_user_input as _notify_fcm_user_input
+import client_manager
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
@@ -597,7 +598,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                         ))
                     except Exception as _exc:
                         log.warning("[codex-appserver] AskUserQuestion extraction failed: %s", _exc)
-                if self._notify_fcm_fn is not None:
+                if self._notify_fcm_fn is not None and not client_manager.has_clients():
                     asyncio.create_task(
                         self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id)
                     )
