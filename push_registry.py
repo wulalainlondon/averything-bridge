@@ -19,9 +19,11 @@ import client_manager
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging as fb_messaging, storage as fb_storage
+    from firebase_admin.exceptions import InvalidArgumentError as _FbInvalidArgumentError
     _FIREBASE_AVAILABLE = True
 except ImportError:
     _FIREBASE_AVAILABLE = False
+    _FbInvalidArgumentError = Exception  # type: ignore[assignment,misc]
 
 
 BroadcastJson = Callable[[dict], Awaitable[int]]
@@ -88,6 +90,44 @@ def _debug(message: str, *args: Any) -> None:
         _log.debug(message, *args)
 
 
+def _is_token_fatal_error(exc: Exception) -> bool:
+    """Return True if the FCM error indicates the token is permanently invalid."""
+    if not _FIREBASE_AVAILABLE:
+        return False
+    # UnregisteredError: app uninstalled or token expired
+    # SenderIdMismatchError: token belongs to a different project
+    # InvalidArgumentError: token format is invalid
+    return isinstance(exc, (
+        fb_messaging.UnregisteredError,
+        fb_messaging.SenderIdMismatchError,
+        _FbInvalidArgumentError,
+    ))
+
+
+def _invalidate_fcm_token() -> None:
+    """Remove the FCM token file and broadcast a re-registration request."""
+    import tempfile
+    try:
+        if os.path.isfile(_FCM_TOKEN_FILE):
+            invalid_path = _FCM_TOKEN_FILE + ".invalid"
+            try:
+                os.replace(_FCM_TOKEN_FILE, invalid_path)
+            except Exception:
+                try:
+                    os.remove(_FCM_TOKEN_FILE)
+                except Exception:
+                    pass
+        _warning("FCM token invalidated — app must re-register token")
+    except Exception as exc:
+        _warning("Failed to invalidate FCM token file: %s", exc)
+    # Broadcast event so the app knows to re-register
+    if _broadcast_json is not None and _spawn_task is not None:
+        _spawn_task(
+            "fcm-token-invalid-broadcast",
+            _broadcast_json({"type": "fcm_token_invalid", "reason": "token_expired_or_invalid"}),
+        )
+
+
 def init_firebase() -> None:
     global _firebase_app, _firebase_storage_app
     if not _FIREBASE_AVAILABLE:
@@ -126,9 +166,22 @@ def _inbox_file_path() -> str:
 
 
 def save_inbox() -> None:
+    import tempfile
+    path = Path(_inbox_file_path())
     try:
-        with open(_inbox_file_path(), "w", encoding="utf-8") as f:
-            json.dump(_PUSH_FILE_REGISTRY, f)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
+        tmp = Path(tmp_str)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(_PUSH_FILE_REGISTRY, f)
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
     except Exception as exc:
         _warning("inbox save failed: %s", exc)
 
@@ -363,7 +416,11 @@ async def send_tunnel_fcm_once(ws_url: str) -> bool:
         _info("FCM tunnel URL pushed to device: %s", ws_url)
         return True
     except Exception as exc:
-        _warning("FCM tunnel notify failed: %s", exc)
+        if _is_token_fatal_error(exc):
+            _warning("FCM token permanently invalid (%s) on tunnel notify — clearing token", type(exc).__name__)
+            _invalidate_fcm_token()
+        else:
+            _warning("FCM tunnel notify failed: %s", exc)
         return False
 
 
@@ -419,6 +476,10 @@ async def notify_fcm(session_name: str, last_text: str, session_id: str = "") ->
             _info("FCM notification sent")
             return
         except Exception as exc:
+            if _is_token_fatal_error(exc):
+                _warning("FCM token permanently invalid (%s): %s — clearing token", type(exc).__name__, exc)
+                _invalidate_fcm_token()
+                return
             if attempt < 2:
                 wait = 2 ** attempt
                 _warning("FCM send failed (attempt %d/3): %s — retrying in %ds", attempt + 1, exc, wait)
@@ -456,6 +517,10 @@ async def notify_fcm_file_push(file_id: str, filename: str) -> None:
             _info("FCM file_push notification sent: %s", filename)
             return
         except Exception as exc:
+            if _is_token_fatal_error(exc):
+                _warning("FCM token permanently invalid (%s) on file_push — clearing token", type(exc).__name__)
+                _invalidate_fcm_token()
+                return
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
             else:
@@ -499,6 +564,10 @@ async def notify_fcm_user_input(
             _info("FCM user_input notification sent for session %s", session_id)
             return
         except Exception as exc:
+            if _is_token_fatal_error(exc):
+                _warning("FCM token permanently invalid (%s) on user_input — clearing token", type(exc).__name__)
+                _invalidate_fcm_token()
+                return
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
             else:
@@ -535,6 +604,10 @@ async def notify_fcm_session_died(session_name: str, session_id: str = "") -> No
             _info("FCM session_died notification sent for session %s", session_id)
             return
         except Exception as exc:
+            if _is_token_fatal_error(exc):
+                _warning("FCM token permanently invalid (%s) on session_died — clearing token", type(exc).__name__)
+                _invalidate_fcm_token()
+                return
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
             else:

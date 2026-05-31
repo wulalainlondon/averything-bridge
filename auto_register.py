@@ -85,7 +85,8 @@ def auto_register_session(
     if age_sec > cutoff_seconds:
         return False  # silently skip; still indexed in search.db
 
-    with _get_saved_lock():
+    from session_registry import _saved_sessions_file_lock
+    with _saved_sessions_file_lock(str(saved_path)):
         if not saved_path.exists():
             data: dict = {}
         else:
@@ -134,7 +135,8 @@ def prune_old_saved_sessions(saved_path: Path, days: int = 30) -> int:
     """
     if not saved_path.exists():
         return 0
-    with _get_saved_lock():
+    from session_registry import _saved_sessions_file_lock
+    with _saved_sessions_file_lock(str(saved_path)):
         try:
             with saved_path.open(encoding='utf-8') as f:
                 data = json.load(f)

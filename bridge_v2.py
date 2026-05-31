@@ -224,8 +224,21 @@ def _load_pairing() -> dict:
 
 
 def _save_pairing(data: dict) -> None:
-    with open(PAIRING_FILE, "w") as f:
-        json.dump(data, f)
+    import tempfile
+    path = Path(PAIRING_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
+    tmp = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def _clear_pairing() -> None:
@@ -940,7 +953,14 @@ async def handler(ws: ServerConnection) -> None:
 
     # Proactively start tunnel so client gets the URL while still on WiFi,
     # avoiding FCM dependency on the next reconnect.
-    if os.environ.get("BRIDGE_AUTO_TUNNEL") == "1" and not _is_cloudflared_running():
+    # Skip when external tunnel mode is active (_TUNNEL_URL_FILE set): in that
+    # case cloudflared_launcher.sh (managed by launchd) owns the tunnel lifecycle;
+    # starting an in-process tunnel here would create a second trycloudflare URL.
+    if (
+        os.environ.get("BRIDGE_AUTO_TUNNEL") == "1"
+        and not _TUNNEL_URL_FILE
+        and not _is_cloudflared_running()
+    ):
         _spawn_task("cloudflared-start:on-connect", _start_cloudflared_tunnel(_BRIDGE_PORT))
 
     remote = ws.remote_address
@@ -1309,6 +1329,7 @@ async def handler(ws: ServerConnection) -> None:
 
         if (
             os.environ.get("BRIDGE_AUTO_TUNNEL") == "1"
+            and not _TUNNEL_URL_FILE
             and not client_manager.has_clients()
             and not _is_cloudflared_running()
         ):
@@ -1340,7 +1361,7 @@ async def _warmup_history_cache_background() -> None:
         key=lambda s: s.last_activity,
         reverse=True,
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(4)
     warmed = skipped = 0
 

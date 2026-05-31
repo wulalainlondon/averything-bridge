@@ -2,16 +2,26 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Optional
+
+try:
+    import fcntl as _fcntl
+    _FCNTL_AVAILABLE = True
+except ImportError:
+    _fcntl = None  # type: ignore[assignment]
+    _FCNTL_AVAILABLE = False
 
 from utils.uuid_helper import is_valid_uuid
 
@@ -23,6 +33,56 @@ log = logging.getLogger(__name__)
 # saved_sessions.json.  The lock is imported by auto_register at runtime to
 # avoid a circular-import; see auto_register._SAVED_LOCK.
 _SAVED_SESSIONS_LOCK = threading.Lock()
+
+
+@contextmanager
+def _saved_sessions_file_lock(saved_sessions_file: str):
+    """Acquire both the in-process threading.Lock and a cross-process fcntl.flock.
+
+    Yields inside the combined lock so callers can safely read-modify-write
+    saved_sessions.json without racing against other bridge instances.
+    """
+    lock_path = saved_sessions_file + ".lock"
+    with _SAVED_SESSIONS_LOCK:
+        if _FCNTL_AVAILABLE:
+            lock_fh = open(lock_path, "w")
+            try:
+                _fcntl.flock(lock_fh, _fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    _fcntl.flock(lock_fh, _fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    lock_fh.close()
+                except Exception:
+                    pass
+        else:
+            yield
+
+
+def _atomic_write_saved_sessions(saved_sessions_file: str, saved: dict) -> None:
+    """Atomically write the saved_sessions mapping (tempfile in same dir + os.replace).
+
+    Callers MUST already hold _saved_sessions_file_lock to make the surrounding
+    read-modify-write race-free across instances; this helper only guarantees the
+    on-disk file is never left truncated/partial.
+    """
+    path = Path(saved_sessions_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
+    tmp = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(saved, f, indent=2, ensure_ascii=False)
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 DEFAULT_CWD = os.path.expanduser(os.environ.get("BRIDGE_DEFAULT_CWD", "") or "~")
@@ -232,31 +292,34 @@ def migrate_codex_saved_sessions(
         return
     if not isinstance(legacy, dict):
         return
-    saved = load_saved_sessions(saved_sessions_file)
-    changed = False
-    for sid, entry in legacy.items():
-        if not isinstance(entry, dict):
-            continue
-        current = saved.get(sid, {}) if isinstance(saved.get(sid), dict) else {}
-        saved[sid] = {
-            **current,
-            "name": current.get("name") or entry.get("name") or str(sid)[:8],
-            "claude_uuid": current.get("claude_uuid") or entry.get("resume_id") or entry.get("claude_uuid") or "",
-            "last_used": int(current.get("last_used") or entry.get("last_used") or time.time()),
-            "cwd": current.get("cwd") or entry.get("cwd") or default_cwd,
-            "backend": "codex",
-            "model": current.get("model") or entry.get("model") or "",
-            "sandbox": current.get("sandbox") or entry.get("sandbox") or "danger-full-access",
-            "image_dir": current.get("image_dir") or entry.get("image_dir") or "",
-        }
-        changed = True
-    if changed:
-        try:
-            with open(saved_sessions_file, "w", encoding="utf-8") as f:
-                json.dump(saved, f, indent=2, ensure_ascii=False)
-        except Exception as exc:
-            if log_warning:
-                log_warning("Failed to migrate Codex saved session metadata: %s", exc)
+    # Hold the lock across load→modify→write so the read-modify-write is atomic
+    # against concurrent persist_session from another instance, and write via
+    # tempfile+replace so a crash mid-write can't truncate saved_sessions.json.
+    with _saved_sessions_file_lock(saved_sessions_file):
+        saved = load_saved_sessions(saved_sessions_file)
+        changed = False
+        for sid, entry in legacy.items():
+            if not isinstance(entry, dict):
+                continue
+            current = saved.get(sid, {}) if isinstance(saved.get(sid), dict) else {}
+            saved[sid] = {
+                **current,
+                "name": current.get("name") or entry.get("name") or str(sid)[:8],
+                "claude_uuid": current.get("claude_uuid") or entry.get("resume_id") or entry.get("claude_uuid") or "",
+                "last_used": int(current.get("last_used") or entry.get("last_used") or time.time()),
+                "cwd": current.get("cwd") or entry.get("cwd") or default_cwd,
+                "backend": "codex",
+                "model": current.get("model") or entry.get("model") or "",
+                "sandbox": current.get("sandbox") or entry.get("sandbox") or "danger-full-access",
+                "image_dir": current.get("image_dir") or entry.get("image_dir") or "",
+            }
+            changed = True
+        if changed:
+            try:
+                _atomic_write_saved_sessions(saved_sessions_file, saved)
+            except Exception as exc:
+                if log_warning:
+                    log_warning("Failed to migrate Codex saved session metadata: %s", exc)
 
 
 def persist_session(
@@ -266,7 +329,7 @@ def persist_session(
     log_warning: Callable[..., None] | None = None,
 ) -> None:
     import tempfile
-    with _SAVED_SESSIONS_LOCK:
+    with _saved_sessions_file_lock(saved_sessions_file):
         saved = load_saved_sessions(saved_sessions_file)
         saved[session.session_id] = {
             "name": session.name,
@@ -330,7 +393,7 @@ def remove_saved_session(
     log_warning: Callable[..., None] | None = None,
 ) -> None:
     import tempfile
-    with _SAVED_SESSIONS_LOCK:
+    with _saved_sessions_file_lock(saved_sessions_file):
         saved = load_saved_sessions(saved_sessions_file)
         if session_id not in saved:
             return
@@ -382,8 +445,8 @@ def restore_sessions_from_disk(
                 log_info("dropping saved session %s: invalid UUID %r", sid, claude_uuid)
     if dropped:
         try:
-            with open(saved_sessions_file, "w", encoding="utf-8") as f:
-                json.dump(saved, f, indent=2, ensure_ascii=False)
+            with _saved_sessions_file_lock(saved_sessions_file):
+                _atomic_write_saved_sessions(saved_sessions_file, saved)
             if log_info:
                 log_info("saved_sessions.json: dropped %d invalid session(s): %s", len(dropped), dropped)
         except Exception as exc:
@@ -455,14 +518,27 @@ def persist_session_meta(
     session_meta_file: str,
     log_warning: Callable[..., None] | None = None,
 ) -> None:
+    import tempfile
     payload = {
         sid: {"hidden": bool(session.hidden)}
         for sid, session in sessions.items()
         if session.hidden
     }
+    path = Path(session_meta_file)
     try:
-        with open(session_meta_file, "w") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
+        tmp = Path(tmp_str)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
     except Exception as exc:
         if log_warning:
             log_warning("Failed to persist session metadata: %s", exc)
@@ -514,9 +590,22 @@ def persist_read_cursors(
     read_cursor_file: str,
     log_warning: Callable[..., None] | None = None,
 ) -> None:
+    import tempfile
+    path = Path(read_cursor_file)
     try:
-        with open(read_cursor_file, "w") as f:
-            json.dump(read_cursors, f, indent=2, ensure_ascii=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
+        tmp = Path(tmp_str)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(read_cursors, f, indent=2, ensure_ascii=False)
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
     except Exception as exc:
         if log_warning:
             log_warning("Failed to persist read cursors: %s", exc)

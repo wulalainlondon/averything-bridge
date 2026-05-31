@@ -227,8 +227,22 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         token = msg.get("token", "").strip()
         if token:
             try:
-                with open(ctx["fcm_token_file"], "w") as f:
-                    f.write(token)
+                import tempfile
+                from pathlib import Path as _Path
+                _fcm_path = _Path(ctx["fcm_token_file"])
+                _fcm_path.parent.mkdir(parents=True, exist_ok=True)
+                _fd, _tmp_str = tempfile.mkstemp(dir=_fcm_path.parent, prefix=".tmp_fcm_", suffix=".txt")
+                _tmp = _Path(_tmp_str)
+                try:
+                    with os.fdopen(_fd, "w", encoding="utf-8") as _f:
+                        _f.write(token)
+                    _tmp.replace(_fcm_path)
+                except Exception:
+                    try:
+                        _tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise
                 ctx["log"].info("FCM token registered: %s…", token[:20])
             except Exception as exc:
                 ctx["log"].warning("Failed to save FCM token: %s", exc)

@@ -379,7 +379,7 @@ def _jsonl_lines_contain_turn_end(lines: list[dict], fmt: str) -> bool:
 
 
 async def jsonl_watcher_task() -> None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     merge_jsonl_sessions_into_state()
 
     pending: dict[str, float] = {}
@@ -446,6 +446,11 @@ async def jsonl_watcher_task() -> None:
                     "session_id": session.session_id,
                     "reason": "file_changed",
                 })
+
+        # GC: remove entries for paths that no longer exist to prevent unbounded growth.
+        stale_paths = [p for p in list(jsonl_known_size) if not os.path.exists(p)]
+        for p in stale_paths:
+            del jsonl_known_size[p]
 
     def _on_file_event(path: str) -> None:
         if not path.endswith(".jsonl"):

@@ -140,17 +140,38 @@ echo $$ > "$LOCK_PID_FILE"
 echo "[supervisor:$NAME] start, port=$PORT, data-dir=$DATA_DIR"
 
 # ---------------------------------------------------------------------------
-# Log rotation — keep bridge.err under 5 MB (1 backup)
+# Log rotation helper — keep both bridge.log and bridge.err under 5 MB
 # ---------------------------------------------------------------------------
 _LOG_MAX_BYTES=$((5 * 1024 * 1024))
-if [[ -f "$ERR_FILE_INST" ]]; then
-  _ERR_SIZE=$(wc -c < "$ERR_FILE_INST" 2>/dev/null || echo 0)
-  if [[ "$_ERR_SIZE" -gt "$_LOG_MAX_BYTES" ]]; then
-    mv -f "$ERR_FILE_INST" "${ERR_FILE_INST}.1"
-    : > "$ERR_FILE_INST"
-    echo "[supervisor:$NAME] rotated bridge.err (was ${_ERR_SIZE} bytes)"
+
+_rotate_log_if_large() {
+  local _file="$1"
+  local _label="$2"
+  if [[ -f "$_file" ]]; then
+    local _sz
+    _sz=$(wc -c < "$_file" 2>/dev/null || echo 0)
+    if [[ "$_sz" -gt "$_LOG_MAX_BYTES" ]]; then
+      # copytruncate semantics: the bridge child holds an O_APPEND fd on this
+      # file for its whole lifetime (see redirect at spawn). Renaming with mv
+      # would leave the child writing to the renamed inode while the fresh file
+      # stays empty — rotation silently fails. Instead copy the contents aside,
+      # then truncate the SAME inode the child still holds; O_APPEND writes
+      # continue at the new (small) tail. Slightly more I/O than mv, but correct
+      # for a file held open by another process.
+      cp -f "$_file" "${_file}.1" 2>/dev/null || true
+      : > "$_file"
+      echo "[supervisor:$NAME] rotated ${_label} (was ${_sz} bytes)"
+    fi
   fi
-fi
+}
+
+# Rotate at startup
+_rotate_log_if_large "$ERR_FILE_INST" "bridge.err"
+_rotate_log_if_large "$LOG_FILE_INST" "bridge.log"
+
+# Counter for periodic in-loop log rotation (every ~60 monitor iterations ≈ 5 min)
+_LOG_CHECK_INTERVAL=60
+_LOG_CHECK_COUNTER=0
 
 BACKOFF=1
 MAX_RETRIES=10
@@ -368,6 +389,15 @@ while true; do
     fi
 
     sleep 5
+
+    # Periodic log rotation inside monitor loop (bash 3.2 safe)
+    _LOG_CHECK_COUNTER=$(( _LOG_CHECK_COUNTER + 1 ))
+    if [[ "$_LOG_CHECK_COUNTER" -ge "$_LOG_CHECK_INTERVAL" ]]; then
+      _LOG_CHECK_COUNTER=0
+      _rotate_log_if_large "$ERR_FILE_INST" "bridge.err"
+      _rotate_log_if_large "$LOG_FILE_INST" "bridge.log"
+    fi
+
     _lock_owner="$(read_lock_owner)"
     if [[ "${_lock_owner}" != "$$" ]]; then
       echo "[supervisor:$NAME] lock taken by pid=${_lock_owner:-?}, self-exiting"

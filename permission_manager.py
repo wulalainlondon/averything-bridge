@@ -111,6 +111,7 @@ class PermissionManager:
             )
         finally:
             self._waiters.pop(rid, None)
+            self._pending.pop(rid, None)
         return bool(approved)
 
     async def resolve(
