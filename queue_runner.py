@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Protocol
 
 from backends.events import _evt_error, send_event
@@ -79,10 +80,22 @@ async def run_session_queue(
                 # backend.send() spawns a subprocess and returns immediately;
                 # wait here so session.processing stays True until streaming ends,
                 # preventing the next queued command from seeing is_streaming=True.
+                # W6: watchdog — bound the spin so a zombie subprocess (is_streaming
+                # never cleared, no user stop) doesn't hang the queue forever.
+                _SPIN_TIMEOUT = 7200  # 2 h — generous margin above TOOL_IDLE_TIMEOUT_SECS
+                _spin_start = time.monotonic()
                 while session.is_streaming:
                     if session.is_stopping:
                         return  # stop() is responsible for sending the stopped event
                     await asyncio.sleep(0.15)
+                    if time.monotonic() - _spin_start > _SPIN_TIMEOUT:
+                        log.warning(
+                            "[%s] is_streaming stuck for >%ds — forcing idle (zombie subprocess?)",
+                            session.session_id, _SPIN_TIMEOUT,
+                        )
+                        session.is_streaming = False
+                        await send_event(session, _evt_error("Backend timed out (streaming stuck)"))
+                        break
                 session.recent_request_ids.add(cmd.request_id)
                 if len(session.recent_request_ids) > 500:
                     session.recent_request_ids = set(list(session.recent_request_ids)[-250:])
