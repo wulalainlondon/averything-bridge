@@ -67,6 +67,10 @@ class Session:
     ws_ref: Optional[Any] = field(default=None, repr=False)
     offline_buffer: list = field(default_factory=list)
     recent_request_ids: set[str] = field(default_factory=set)
+    # W5: insertion-ordered list that mirrors recent_request_ids for deterministic
+    # trimming and disk persistence. The set is used for O(1) dedup lookup;
+    # this list tracks insertion order so we evict the oldest entries first.
+    recent_request_ids_seq: list = field(default_factory=list, repr=False)
     # BUG-07: set to True after first user message is indexed into FTS5 search.db
     _fts_first_msg_indexed: bool = False
     parent_session_id: str | None = None
@@ -281,6 +285,8 @@ def persist_session(
             # JSON does not support sets; serialise as a sorted list for stability.
             "historical_resume_ids": sorted(session.historical_resume_ids),
             "latest_source_line": session.latest_source_line,
+            # W5: persist last 250 request IDs in insertion order for cross-restart dedup.
+            "recent_request_ids": session.recent_request_ids_seq[-250:],
         }
         cutoff = int(time.time()) - 30 * 24 * 3600
         saved = {
@@ -419,6 +425,11 @@ def restore_sessions_from_disk(
             raw_hist = data.get("historical_resume_ids")
             if isinstance(raw_hist, list):
                 session.historical_resume_ids = set(str(x) for x in raw_hist if x)
+            raw_recent = data.get("recent_request_ids")
+            if isinstance(raw_recent, list):
+                seq = [str(x) for x in raw_recent if x]
+                session.recent_request_ids = set(seq)
+                session.recent_request_ids_seq = seq
             sessions[sid] = session
             count += 1
         except Exception as exc:

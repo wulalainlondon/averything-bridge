@@ -96,9 +96,13 @@ async def run_session_queue(
                         session.is_streaming = False
                         await send_event(session, _evt_error("Backend timed out (streaming stuck)"))
                         break
-                session.recent_request_ids.add(cmd.request_id)
-                if len(session.recent_request_ids) > 500:
-                    session.recent_request_ids = set(list(session.recent_request_ids)[-250:])
+                if cmd.request_id not in session.recent_request_ids:
+                    session.recent_request_ids.add(cmd.request_id)
+                    session.recent_request_ids_seq.append(cmd.request_id)
+                    if len(session.recent_request_ids_seq) > 500:
+                        to_drop = session.recent_request_ids_seq[:-250]
+                        session.recent_request_ids_seq = session.recent_request_ids_seq[-250:]
+                        session.recent_request_ids -= set(to_drop)
                 log_prompt_lifecycle("done", session, cmd.request_id)
                 await broadcast_json({
                     "type": "session_command_done",
