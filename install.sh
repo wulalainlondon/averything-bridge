@@ -135,7 +135,7 @@ rsync -a --delete \
   --exclude 'install.sh' \
   --exclude 'tunnel_url.txt' \
   --exclude 'bridge_identity.json' \
-  "${_INSTANCE_EXCLUDES[@]}" \
+  ${_INSTANCE_EXCLUDES[@]+"${_INSTANCE_EXCLUDES[@]}"} \
   "$SRC_DIR/" "$RUNTIME_DIR/"
 cd "$RUNTIME_DIR"
 

@@ -1422,7 +1422,7 @@ async def main(port: int, tunnel: bool = False,
     for h in logging.root.handlers[:]:
         logging.root.removeHandler(h)
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
             RotatingFileHandler(
