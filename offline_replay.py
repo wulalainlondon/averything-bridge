@@ -33,13 +33,10 @@ async def replay_offline_buffers(ws: Any, sessions: Iterable[Any]) -> int:
                     sent_count += 1
                     replayed += 1
                 except Exception:
-                    # Remove only the events we already sent from the live buffer,
-                    # then prepend the unsent tail of the snapshot so future
-                    # reconnects get them in order.
-                    unsent_tail = snapshot[idx:]
-                    # The live buffer may have grown; trim only from the front.
+                    # Remove only the events we already sent from the live buffer.
+                    # The remaining front already starts with the unsent tail of
+                    # the snapshot, followed by any events appended during replay.
                     del session.offline_buffer[:sent_count]
-                    session.offline_buffer = unsent_tail + session.offline_buffer
                     return replayed
         # All snapshot events sent successfully.  Remove exactly those entries
         # from the front of the live buffer (new appends stay intact).

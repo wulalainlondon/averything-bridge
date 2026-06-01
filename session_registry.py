@@ -45,6 +45,7 @@ def _saved_sessions_file_lock(saved_sessions_file: str):
     lock_path = saved_sessions_file + ".lock"
     with _SAVED_SESSIONS_LOCK:
         if _FCNTL_AVAILABLE:
+            Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
             lock_fh = open(lock_path, "w")
             try:
                 _fcntl.flock(lock_fh, _fcntl.LOCK_EX)

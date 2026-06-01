@@ -88,6 +88,10 @@ _BROADCAST_FAIL_COUNTS: dict[Any, int] = {}
 _BROADCAST_FAIL_LIMIT = 5
 
 
+def _is_closed_send_error(exc: Exception) -> bool:
+    return "closed" in str(exc).lower()
+
+
 async def broadcast_json(payload: dict) -> int:
     raw = json.dumps(payload)
     clients = list(CLIENTS.items())
@@ -103,6 +107,8 @@ async def broadcast_json(payload: dict) -> int:
         except _WsConnectionClosed:
             return "closed"
         except Exception as exc:
+            if _is_closed_send_error(exc):
+                return "closed"
             log.debug("broadcast_json transient error for %s: %s", client.client_id, exc)
             return "error"
 
@@ -146,6 +152,9 @@ async def send_unread_for_session(session: Any, unread_for: Callable[[Any, str],
         except _WsConnectionClosed:
             dead.append(ws)
         except Exception as exc:
+            if _is_closed_send_error(exc):
+                dead.append(ws)
+                continue
             log.debug("send_unread_for_session transient error for %s: %s", client.client_id, exc)
     for ws in dead:
         remove(ws)

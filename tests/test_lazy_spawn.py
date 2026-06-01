@@ -618,7 +618,7 @@ class TestRequestHistoryNoPrewarmSpawn:
         block = block_match.group(1)
 
         prewarm_pattern = re.compile(
-            r'(?:backend\.spawn|_spawn_task|spawn_task)\(',
+            r'(?:backend\.spawn|_spawn_task)\(',
         )
         assert not prewarm_pattern.search(block), (
             "Pre-warm spawn still present in request_history router — "

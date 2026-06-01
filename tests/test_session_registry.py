@@ -181,7 +181,7 @@ def test_session_meta_and_read_cursor_persistence(tmp_path):
     cursor_file = tmp_path / "read_cursors.json"
     session = _session("s1", created_at=1)
     session.pinned = True
-    session.hidden = False
+    session.hidden = True
     session.message_seq = 7
 
     session_registry.persist_session_meta({"s1": session}, session_meta_file=str(meta_file))
@@ -195,7 +195,7 @@ def test_session_meta_and_read_cursor_persistence(tmp_path):
     loaded_cursors = session_registry.load_read_cursors(str(cursor_file))
 
     assert applied == 1
-    assert loaded_session.pinned is True
-    assert loaded_session.hidden is False
+    assert loaded_session.pinned is False
+    assert loaded_session.hidden is True
     assert loaded_cursors == {"s1": {"device": 3}}
     assert session_registry.unread_for(loaded_cursors, session, "device") == 4

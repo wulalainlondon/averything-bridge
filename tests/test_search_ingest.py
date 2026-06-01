@@ -1020,11 +1020,12 @@ def test_worker_bulk_failure_does_not_mark_ready(tmp_path):
     codex_mod._CODEX_ROOT = tmp_path / 'no_codex'
 
     config = BridgeConfig(
-        search=SearchConfig(
-            index_path=tmp_path / 'fail_bulk.db',
-            ingest_on_startup=True,
-            watch_enabled=False,
-        ),
+            search=SearchConfig(
+                index_path=tmp_path / 'fail_bulk.db',
+                ingest_on_startup=True,
+                ingest_startup_delay_sec=0,
+                watch_enabled=False,
+            ),
         sources=SourcesConfig(claude_enabled='auto', codex_enabled='no', ollama_enabled='no'),
     )
 

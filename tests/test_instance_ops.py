@@ -241,7 +241,13 @@ def test_upsert_instance_port_in_use_returns_error():
 
     handled, sent = asyncio.run(run())
     assert handled is True
-    assert sent[0] == {"type": "instance_upserted", "ok": False, "code": "port_in_use", "instance": None}
+    assert sent[0] == {
+        "type": "instance_upserted",
+        "ok": False,
+        "code": "port_in_use",
+        "instance": None,
+        "name": "delta",
+    }
 
 
 def test_upsert_instance_success_broadcasts_list():

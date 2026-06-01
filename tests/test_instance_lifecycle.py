@@ -165,18 +165,12 @@ class TestStartInstance(unittest.TestCase):
             Path(fake_supervisor).write_text("#!/bin/bash\n")
 
             with patch.object(lc, "SUPERVISOR_SCRIPT", fake_supervisor), \
-                 patch("instance_lifecycle.subprocess.Popen") as mock_popen, \
-                 patch("builtins.open", unittest.mock.mock_open()) as mock_open_fn:
+                 patch("instance_lifecycle.subprocess.Popen") as mock_popen:
                 mock_popen.return_value = MagicMock()
                 lc.start_instance(item)
 
-            # The first open() call targets .bridge_state with "w" mode and writes "enabled".
-            state_path = str(Path(d) / ".bridge_state")
-            write_calls = [
-                c for c in mock_open_fn.call_args_list
-                if len(c.args) >= 1 and ".bridge_state" in str(c.args[0])
-            ]
-            self.assertTrue(len(write_calls) >= 1, ".bridge_state was not opened")
+            state_path = Path(d) / ".bridge_state"
+            self.assertEqual(state_path.read_text(), "enabled")
 
     def test_spawn_failed_returns_error(self):
         import tempfile
@@ -290,11 +284,20 @@ class TestStopInstance(unittest.TestCase):
             def fake_kill(pid, sig):
                 kill_calls.append((pid, sig))
 
+            alive_by_pid = {6666: [True, False], 4321: [False]}
+
+            def fake_pid_alive(pid):
+                seq = alive_by_pid.get(pid, [False])
+                if len(seq) > 1:
+                    return seq.pop(0)
+                return seq[0]
+
             with patch("instance_lifecycle.os.kill", side_effect=fake_kill), \
                  patch("instance_lifecycle.subprocess.run") as mock_run, \
                  patch("instance_lifecycle.time.sleep"), \
                  patch("instance_lifecycle.time.monotonic", return_value=0.0), \
-                 patch("instance_lifecycle._pid_alive", side_effect=[True, False, False]):
+                 patch("instance_lifecycle._pid_alive", side_effect=fake_pid_alive), \
+                 patch("instance_lifecycle._is_bridge_process", return_value=True):
                 # lsof returns a port listener PID.
                 mock_run.return_value = MagicMock(stdout="4321\n", returncode=0)
                 ok, err = lc.stop_instance("test", item)
