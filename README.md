@@ -1,41 +1,84 @@
 # averything-bridge
 
-Control Claude, Codex, or Ollama on your computer from your phone.
+Control desktop AI runtimes from the Averything mobile app.
 
-**[Download Android app (v1.2.1)](https://github.com/wulalainlondon/averything-bridge/releases/latest/download/averything-v1.2.1.apk)**
+If you are an AI coding agent: follow [AGENTS.md](AGENTS.md) exactly. Do not stop after cloning. Install, start the bridge, and report the final connection URL.
 
-For AI agents/Codex auto-setup instructions, see `AGENTS.md`.
+## AI Agent Install
 
-This is the server-side bridge. It runs on your computer (Mac, Windows, or Linux) and connects your mobile app to local AI runtimes via WebSocket. I built this because I wanted to use Claude from my phone while the actual computation runs on my machine — and I use it every day.
+Expected result:
 
-## How it works
+- Bridge dependencies installed.
+- Bridge running on port `8766`.
+- Bridge auto-start configured where supported.
+- Final response includes `ws://<local-ip>:8766`.
+- Mobile app on the same Wi-Fi can discover the bridge automatically.
 
+Run the repo-specific agent instructions:
+
+```text
+Clone https://github.com/wulalainlondon/averything-bridge and follow AGENTS.md.
 ```
-Phone App  ──WebSocket──  bridge (Mac / Windows / Linux)  ──subprocess──  Claude / Codex / Ollama
+
+## Mobile App
+
+Latest Android APK:
+
+```text
+https://github.com/BridgeAverthing/averything-app/releases/latest/download/averything-v1.2.4.apk
 ```
 
-The bridge manages sessions, streams responses back to your phone in real time, and handles reconnects, offline buffering, and push notifications when a long task finishes.
+After installing the app, keep the phone and computer on the same Wi-Fi. The app should find the bridge automatically. Manual connection URL format is:
 
-## Requirements
+```text
+ws://<local-ip>:8766
+```
 
-- **Mac, Windows, or Linux** — anything that runs Python 3.10+
-- Python 3.10+
-- At least one of:
-  - [Claude CLI](https://claude.ai/download) (`npm install -g @anthropic-ai/claude-code`)
-  - [Ollama](https://ollama.com) with a model pulled
-  - Codex CLI
+## What This Runs
 
-## Quick start
+```text
+Phone app --WebSocket--> bridge on your computer --subprocess/API--> Claude, Codex, or Ollama
+```
+
+The bridge manages sessions, streams responses to the phone in real time, restores reconnects, buffers offline events, exposes local files/media, and can send optional push notifications when long tasks finish.
+
+Supported desktop runtimes:
+
+- Claude CLI: `npm install -g @anthropic-ai/claude-code`
+- Codex CLI
+- Ollama with a local model
+
+## Manual Fallback
+
+Use this only if an AI agent is not doing the install.
+
+macOS / Linux:
 
 ```bash
 git clone https://github.com/wulalainlondon/averything-bridge
 cd averything-bridge
+chmod +x install_oneclick.sh
+./install_oneclick.sh
+```
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/wulalainlondon/averything-bridge
+cd averything-bridge
+powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
+powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1
+```
+
+Manual foreground run:
+
+```bash
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 venv/bin/python bridge_v2.py --port 8766
 ```
 
-Windows (PowerShell):
+Windows foreground run:
 
 ```powershell
 py -3 -m venv venv
@@ -43,122 +86,88 @@ py -3 -m venv venv
 .\venv\Scripts\python bridge_v2.py --port 8766
 ```
 
-Then open the companion app on your phone and point it at your computer's IP.
+## Backend Options
 
-## One-click install
-
-macOS / Linux:
+Claude is the default backend:
 
 ```bash
-chmod +x install_oneclick.sh
-./install_oneclick.sh
+venv/bin/python bridge_v2.py --port 8766 --backend claude
 ```
 
-Windows (PowerShell):
+Codex:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install_windows.ps1
+```bash
+venv/bin/python bridge_v2.py --port 8766 --backend codex
 ```
 
-Optional Windows flags:
+Ollama:
+
+```bash
+venv/bin/python bridge_v2.py --port 8766 --backend ollama --model llama3.2
+```
+
+Windows installer backend flags:
 
 ```powershell
-# Codex backend
 powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -Backend codex
-
-# Ollama backend
 powershell -ExecutionPolicy Bypass -File .\install_windows.ps1 -Backend ollama -OllamaModel llama3.2
 ```
 
-## Connection options
+## Connection Options
 
 | Method | URL format | Notes |
-|--------|-----------|-------|
-| Local network | `ws://192.168.x.x:8766` | Fastest |
+|--------|------------|-------|
+| Same Wi-Fi | `ws://192.168.x.x:8766` | Fastest; app discovery should find it automatically |
 | Tailscale | `ws://100.x.x.x:8766` | Works across networks |
-| Cloudflare tunnel | `wss://xxx.trycloudflare.com` | Public, no setup needed |
+| Cloudflare tunnel | `wss://xxx.trycloudflare.com` | Start bridge with `--tunnel` |
 
-For Cloudflare tunnel, start with `--tunnel` flag. The URL will appear in the logs.
+## Optional Security
 
-## Basic security (recommended)
-
-Set a shared auth token before starting bridge:
-
-macOS/Linux:
+Set a shared token before starting the bridge:
 
 ```bash
 export BRIDGE_AUTH_TOKEN="replace-with-a-long-random-string"
 ```
 
-Windows (PowerShell):
+Windows:
 
 ```powershell
 $env:BRIDGE_AUTH_TOKEN="replace-with-a-long-random-string"
 ```
 
-When set, the first client message (`hello`) must include `auth_token`, otherwise the connection is rejected.
+When set, the mobile app must include the token in its first `hello` message.
 
-## Backends
+## Optional Push Notifications
 
-```bash
-# Claude CLI (default)
-venv/bin/python bridge_v2.py --port 8766
+Push notifications need a Firebase service account key at:
 
-# Ollama
-venv/bin/python bridge_v2.py --port 8766 --backend ollama --model llama3.2
-
-# Codex
-venv/bin/python bridge_v2.py --port 8766 --backend codex
-```
-
-## Auto-start
-
-macOS (launchd):
-
-```bash
-bash install.sh
-```
-
-This installs a launchd agent so the bridge starts automatically on login and restarts if it crashes.
-
-Before each release/update, run the mandatory gate checklist:
-- [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)
-
-Windows (Task Scheduler):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1
-```
-
-Optional backend selection:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1 -Backend codex
-powershell -ExecutionPolicy Bypass -File .\install_windows_startup.ps1 -Backend ollama -OllamaModel llama3.2
-```
-
-## Push notifications (optional)
-
-If you want push notifications when Claude finishes a long task, set up Firebase:
-
-```bash
-# Place your Firebase service account key at:
+```text
 ~/.config/claude-bridge/serviceAccountKey.json
+```
 
-# Or set the path via env:
+or:
+
+```bash
 export SERVICE_ACCOUNT_FILE=/path/to/serviceAccountKey.json
 ```
 
-See [docs/FIREBASE_SETUP.md](docs/FIREBASE_SETUP.md) for the full setup guide.
+The bridge works without Firebase; push notifications will simply be disabled.
 
-## Companion app
+## Development
 
-→ [averything-app](https://github.com/BridgeAverthing/averything-app) — Android/iOS app source
-→ [Download latest APK](https://github.com/wulalainlondon/averything-bridge/releases/latest)
+Before releases or behavior-sensitive changes, run:
+
+```bash
+python3 -m pytest
+```
+
+Release checklist:
+
+- [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)
 
 ## Contact
 
-Questions or feedback → open an issue or email wulalainlondon@gmail.com
+Questions or feedback: open an issue or email `wulalainlondon@gmail.com`.
 
 ## License
 
