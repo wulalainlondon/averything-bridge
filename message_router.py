@@ -175,10 +175,13 @@ async def handle_low_coupling_message(
         _mode = str(msg.get("mode") or "auto")
         _before_id = str(msg.get("before_source_message_id") or "")
 
+        # Send unread counts immediately (before the async task) so the client's
+        # badge updates right away regardless of how long history loading takes.
+        await ctx.send_unread_for_client_session(ws, client, session)
+
         # Fast-path: if the client's cursor matches our known latest, there is
         # nothing new to return.  Skip all JSONL work and reply with an empty
-        # history_delta immediately.  We still need to send the unread snapshot
-        # so the client's badge count is accurate.
+        # history_delta immediately.
         if (
             _known_last_id
             and not _before_id
@@ -186,7 +189,6 @@ async def handle_low_coupling_message(
             and _known_last_id == session.latest_source_line
         ):
             async def _fast_delta() -> None:
-                await ctx.send_unread_for_client_session(ws, client, session)
                 await _safe_send_json(ws, {
                     "type": "history_delta",
                     "session_id": sid,
@@ -198,7 +200,6 @@ async def handle_low_coupling_message(
             return True
 
         async def _load_and_send() -> None:
-            await ctx.send_unread_for_client_session(ws, client, session)
             if session.resume_id:
                 await ctx.emit_resume_progress(session, "resume_started", 5, "Resume started")
                 await ctx.emit_resume_progress(session, "resume_loading_history", 35, "Loading history")

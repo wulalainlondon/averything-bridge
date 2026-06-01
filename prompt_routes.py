@@ -87,6 +87,27 @@ async def handle_prompt_message(
                 "status": "duplicate",
             })
             return True
+        # If the backend is blocked waiting on an AskUserQuestion, this plain
+        # message IS the user's answer — feed it back as the dangling tool_use's
+        # tool_result and unblock the turn.  Queueing it here would deadlock:
+        # the turn never ends (the stdout reader is paused), so the queue
+        # runner — which waits on `is_streaming` flipping to False — never runs.
+        backend = ctx.session_backend(session)
+        feed = getattr(backend, "handle_message_during_user_input", None)
+        has_pending = getattr(backend, "has_pending_user_input", None)
+        if feed is not None and has_pending is not None and has_pending(session):
+            if await feed(session, content, images=images, files=files):
+                ctx.log_prompt_lifecycle("ask_answer", session, request_id)
+                session.last_activity = time.time()
+                ctx.persist_session(session)
+                await safe_send_json(ws, {
+                    "type": "message_ack",
+                    "session_id": sid,
+                    "request_id": request_id,
+                    "status": "accepted",
+                })
+                return True
+
         await safe_send_json(ws, {
             "type": "message_ack",
             "session_id": sid,

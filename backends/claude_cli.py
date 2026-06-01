@@ -56,6 +56,12 @@ _AGENT_TREE_CACHE_MAX = 200
 
 TOOL_IDLE_TIMEOUT_SECS = 6000  # kill claude if no stdout for this many seconds (was 300)
 
+# Upper bound on how long the stdout reader will pause waiting for an
+# AskUserQuestion answer.  Generous (a human is in the loop) but bounded so a
+# never-answered question can't pin the reader — and the turn — forever.  On
+# timeout the dangling tool_use is cancelled so --resume history stays clean.
+ASK_USER_QUESTION_MAX_WAIT_SECS = 1800  # 30 minutes
+
 _STREAM_READER_LIMIT = 128 * 1024 * 1024  # 128 MiB — matches codex_appserver; prevents LimitOverrunError on large tool outputs
 
 # Compact when context_used exceeds this fraction of the model's context window.
@@ -86,6 +92,7 @@ class _ClaudeState:
     proc_ready_event: Optional[asyncio.Event] = field(default=None, repr=False)
     tool_blocks: dict = field(default_factory=dict)
     tool_waiting_events: dict = field(default_factory=dict)  # tool_use_id → asyncio.Event
+    tool_waiting_interactions: dict = field(default_factory=dict)  # tool_use_id → request_id
     restart_count: int = 0
     pending_stop: bool = False
     bad_resume: bool = False
@@ -156,9 +163,158 @@ class ClaudeCliBackend(Backend, _StatesMixin):
         session.is_streaming = True
         # Unblock the stdout reader that's waiting for this AskUserQuestion response.
         state = self._get_state(session)
+        state.tool_waiting_interactions.pop(interaction.tool_use_id, None)
         ev = state.tool_waiting_events.pop(interaction.tool_use_id, None)
         if ev is not None:
             ev.set()
+
+    # ------------------------------------------------------------------
+    # AskUserQuestion blocking helpers
+    # ------------------------------------------------------------------
+
+    def has_pending_user_input(self, session: "Session") -> bool:
+        """True if the stdout reader is currently paused on an AskUserQuestion."""
+        state = self._states.get(session.session_id)
+        return bool(state and state.tool_waiting_events)
+
+    @staticmethod
+    def _build_tool_result_content(content: str, images: list | None = None,
+                                   files: list | None = None) -> Any:
+        """Build the `content` field of a tool_result block from a user message.
+
+        Returns a plain string for text-only replies (the simplest valid form),
+        or a list of content blocks when images/files are attached.
+        """
+        blocks: list = []
+        if content:
+            blocks.append({"type": "text", "text": content})
+        for img in (images or []):
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.get("media_type", "image/jpeg"),
+                    "data": img.get("data", ""),
+                },
+            })
+        for f in (files or []):
+            name = f.get("name", "file")
+            file_content = f.get("content", "")
+            media_type = f.get("media_type", "text/plain")
+            if media_type == "application/pdf":
+                blocks.append({"type": "text", "text": f"[File attached (pdf, omitted from answer): {name}]"})
+            else:
+                ext = name.rsplit(".", 1)[-1] if "." in name else ""
+                fence = f"```{ext}\n{file_content}\n```" if ext else file_content
+                blocks.append({"type": "text", "text": f"[File: {name}]\n{fence}"})
+        if not blocks:
+            return ""
+        if len(blocks) == 1 and blocks[0]["type"] == "text":
+            return blocks[0]["text"]
+        return blocks
+
+    async def handle_message_during_user_input(
+        self, session: "Session", content: str,
+        images: list | None = None, files: list | None = None,
+    ) -> bool:
+        """Consume a plain message that arrived while a turn is paused on an
+        AskUserQuestion: feed it back as the dangling tool_use's tool_result and
+        unblock the stdout reader.  Returns False (message untouched) if nothing
+        is actually pending."""
+        state = self._get_state(session)
+        pending_ids = list(state.tool_waiting_events.keys())
+        if not pending_ids:
+            return False
+
+        first_content = self._build_tool_result_content(content, images, files)
+        blocks: list = []
+        for idx, tid in enumerate(pending_ids):
+            blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tid,
+                # The first dangling ask receives the user's free-text reply;
+                # any others (multiple AskUserQuestion in one turn) are cancelled
+                # since a single message can only answer one.
+                "content": first_content if idx == 0
+                else json.dumps({"cancelled": True}, ensure_ascii=False),
+            })
+
+        await self._write_stream_json(session, {
+            "type": "user",
+            "message": {"role": "user", "content": blocks},
+        })
+        session.is_streaming = True
+        session.last_activity = time.time()
+
+        # Drop the resolved interactions from the registry so they no longer
+        # appear as pending (and a stale user_input_response can't double-answer
+        # the same tool_use).
+        for tid in pending_ids:
+            rid = state.tool_waiting_interactions.pop(tid, None)
+            if rid:
+                try:
+                    await INTERACTIONS.resolve(rid)
+                except Exception:
+                    pass
+
+        # Unblock the stdout reader.
+        for tid in pending_ids:
+            ev = state.tool_waiting_events.pop(tid, None)
+            if ev is not None:
+                ev.set()
+
+        log.info("[%s] Plain message consumed as AskUserQuestion answer (%d tool_use resolved)",
+                 session.session_id, len(pending_ids))
+        return True
+
+    async def _cancel_pending_user_input(self, session: "Session") -> None:
+        """Write a {"cancelled": true} tool_result for every dangling
+        AskUserQuestion tool_use so the in-flight process can persist a clean
+        history (no orphan tool_use to poison --resume), then unblock the reader.
+
+        Writes straight to the live stdin — must NOT respawn — and gives Claude a
+        brief beat to flush the tool_result into its JSONL before the caller
+        terminates the process."""
+        state = self._get_state(session)
+        pending_ids = list(state.tool_waiting_events.keys())
+        if not pending_ids:
+            return
+
+        blocks = [{
+            "type": "tool_result",
+            "tool_use_id": tid,
+            "content": json.dumps({"cancelled": True}, ensure_ascii=False),
+        } for tid in pending_ids]
+
+        try:
+            if (state.proc is not None and state.proc.returncode is None
+                    and state.proc.stdin is not None):
+                payload = json.dumps({
+                    "type": "user",
+                    "message": {"role": "user", "content": blocks},
+                }) + "\n"
+                state.proc.stdin.write(payload.encode("utf-8"))
+                await state.proc.stdin.drain()
+                # Let Claude persist the tool_result to its session JSONL.
+                await asyncio.sleep(0.3)
+        except Exception as exc:
+            log.warning("[%s] failed to write cancelled tool_result(s): %s",
+                        session.session_id, exc)
+
+        for tid in pending_ids:
+            rid = state.tool_waiting_interactions.pop(tid, None)
+            if rid:
+                try:
+                    await INTERACTIONS.resolve(rid)
+                except Exception:
+                    pass
+
+        for tid in pending_ids:
+            ev = state.tool_waiting_events.pop(tid, None)
+            if ev is not None:
+                ev.set()
+        log.info("[%s] Cancelled %d dangling AskUserQuestion tool_use(s)",
+                 session.session_id, len(pending_ids))
 
     # ------------------------------------------------------------------
     # Public Backend interface
@@ -265,6 +421,12 @@ class ClaudeCliBackend(Backend, _StatesMixin):
             state.timeout_task.cancel()
         log.info("[%s] Stopping session (pid=%d)", session.session_id, state.proc.pid)
 
+        # Resolve any dangling AskUserQuestion tool_use BEFORE killing the
+        # process, so the session JSONL doesn't keep an orphan tool_use that
+        # would poison the next --resume.
+        if state.tool_waiting_events:
+            await self._cancel_pending_user_input(session)
+
         try:
             state.proc.send_signal(signal.SIGTERM)
         except ProcessLookupError:
@@ -287,6 +449,7 @@ class ClaudeCliBackend(Backend, _StatesMixin):
         for ev in state.tool_waiting_events.values():
             ev.set()
         state.tool_waiting_events.clear()
+        state.tool_waiting_interactions.clear()
         await send_event(session, _evt_stopped())
         await self._spawn_proc(session)
 
@@ -303,6 +466,7 @@ class ClaudeCliBackend(Backend, _StatesMixin):
         for ev in state.tool_waiting_events.values():
             ev.set()
         state.tool_waiting_events.clear()
+        state.tool_waiting_interactions.clear()
         session.is_streaming = False
         if state.tree_poll_task and not state.tree_poll_task.done():
             state.tree_poll_task.cancel()
@@ -1422,6 +1586,7 @@ console.log(JSON.stringify(data));
                                 ))
                                 _wait_ev = asyncio.Event()
                                 state.tool_waiting_events[tool_id] = _wait_ev
+                                state.tool_waiting_interactions[tool_id] = interaction.request_id
                                 _pending_ask_events.append((tool_id, _wait_ev))
                             except Exception as exc:
                                 log.warning("[%s] AskUserQuestion bridge conversion failed: %s", session.session_id, exc)
@@ -1430,11 +1595,22 @@ console.log(JSON.stringify(data));
                 # This ensures tool_result is written to Claude's stdin BEFORE readline()
                 # is called, preventing Claude Code from timing out the interaction.
                 if _pending_ask_events:
-                    log.info("[%s] Waiting for %d AskUserQuestion response(s) (no timeout)",
-                             session.session_id, len(_pending_ask_events))
-                    await asyncio.gather(*[ev.wait() for _, ev in _pending_ask_events])
-                    log.info("[%s] AskUserQuestion response(s) received, resuming stdout reader",
-                             session.session_id)
+                    log.info("[%s] Waiting for %d AskUserQuestion response(s) (max %ds)",
+                             session.session_id, len(_pending_ask_events), ASK_USER_QUESTION_MAX_WAIT_SECS)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*[ev.wait() for _, ev in _pending_ask_events]),
+                            timeout=ASK_USER_QUESTION_MAX_WAIT_SECS,
+                        )
+                        log.info("[%s] AskUserQuestion response(s) received, resuming stdout reader",
+                                 session.session_id)
+                    except asyncio.TimeoutError:
+                        log.warning("[%s] AskUserQuestion wait exceeded %ds — cancelling "
+                                    "dangling tool_use(s) and resuming",
+                                    session.session_id, ASK_USER_QUESTION_MAX_WAIT_SECS)
+                        # Any still-unanswered asks remain in state; cancel them so
+                        # the turn can proceed and --resume history stays clean.
+                        await self._cancel_pending_user_input(session)
 
             elif etype == "tool_result":
                 tool_id = evt.get("tool_use_id", "")

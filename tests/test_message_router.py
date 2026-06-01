@@ -344,7 +344,13 @@ def test_router_request_history_marks_read_and_loads_resumable_history():
             resume_id="12345678-1234-4234-9234-123456789abc",
         )
         session.message_seq = 8
-        ctx, calls = _ctx(sessions={"s1": session})
+        # Override spawn_task to actually execute spawned coroutines so we can
+        # assert on their side-effects (history loading, progress events, ws.sent).
+        spawned_tasks = []
+        def _real_spawn(name, coro):
+            calls["spawned"].append((name, coro))
+            spawned_tasks.append(asyncio.ensure_future(coro))
+        ctx, calls = _ctx(sessions={"s1": session}, spawn_task=_real_spawn)
         handled = await handle_low_coupling_message(
             mtype="request_history",
             msg={
@@ -359,6 +365,8 @@ def test_router_request_history_marks_read_and_loads_resumable_history():
             client=_Client(),
             ctx=ctx,
         )
+        if spawned_tasks:
+            await asyncio.gather(*spawned_tasks, return_exceptions=True)
         return handled, ws.sent, calls
 
     handled, sent, calls = asyncio.run(run())
@@ -383,12 +391,10 @@ def test_router_handles_set_session_meta_and_broadcasts_update():
 
     async def run():
         session = Session(session_id="s1", name="One", created_at=time.time())
-        ctx, calls = _ctx(
-            sessions={"s1": session},
-            build_sessions_list=lambda: {"type": "sessions_list", "sessions": [{"id": "s1"}]},
-        )
+        ctx, calls = _ctx(sessions={"s1": session})
         handled = await handle_low_coupling_message(
             mtype="set_session_meta",
+            # pinned is frontend-only since 1fefe8d; router ignores it silently
             msg={"type": "set_session_meta", "session_id": "s1", "pinned": True, "hidden": True},
             ws=_Ws(),
             client=_Client(),
@@ -399,12 +405,10 @@ def test_router_handles_set_session_meta_and_broadcasts_update():
     handled, session, calls = asyncio.run(run())
 
     assert handled is True
-    assert session.pinned is True
     assert session.hidden is True
     assert calls["persisted"] == 1
     assert calls["broadcasts"] == [
-        {"type": "session_meta_updated", "session_id": "s1", "pinned": True, "hidden": True},
-        {"type": "sessions_list", "sessions": [{"id": "s1"}]},
+        {"type": "session_meta_updated", "session_id": "s1", "hidden": True},
     ]
 
 

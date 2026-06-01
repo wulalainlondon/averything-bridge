@@ -175,25 +175,11 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
     if mtype == "shell_input":
         shell = ctx["shell_sessions"].get(msg["shell_id"])
         if shell and shell.proc.returncode is None:
-            if permission_manager is not None:
-                approved = await permission_manager.request(
-                    requester_device_id=getattr(client, "device_id", ""),
-                    action="shell_input",
-                    title="Allow shell command?",
-                    justification="Execute command in bridge shell session",
-                    command_preview=str(msg.get("data", ""))[:300],
-                    risk_level="high",
-                    session_id="",
-                )
-                if not approved:
-                    try:
-                        await ws.send(json.dumps(ctx["msg_error"]("Permission denied: shell_input")))
-                    except Exception:
-                        pass
-                    return True
-            data = (msg["data"].rstrip("\n") + "\n").encode("utf-8")
-            shell.proc.stdin.write(data)
-            await shell.proc.stdin.drain()
+            # Spawn a background task so the handler loop can process
+            # permission_response on the same connection without deadlock.
+            # (awaiting permission_manager.request() inline blocks recv(),
+            # preventing permission_response from ever being read.)
+            asyncio.create_task(_exec_shell_input(shell, msg, ws, ctx, client, permission_manager))
         return True
 
     if mtype == "shell_close":
@@ -302,3 +288,27 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         return True
 
     return False
+
+
+async def _exec_shell_input(shell, msg, ws, ctx, client, permission_manager) -> None:
+    if permission_manager is not None:
+        approved = await permission_manager.request(
+            requester_device_id=getattr(client, "device_id", ""),
+            action="shell_input",
+            title="Allow shell command?",
+            justification="Execute command in bridge shell session",
+            command_preview=str(msg.get("data", ""))[:300],
+            risk_level="high",
+            session_id="",
+        )
+        if not approved:
+            try:
+                await ws.send(json.dumps(ctx["msg_error"]("Permission denied: shell_input")))
+            except Exception:
+                pass
+            return
+    if shell.proc.returncode is not None:
+        return
+    data = (msg["data"].rstrip("\n") + "\n").encode("utf-8")
+    shell.proc.stdin.write(data)
+    await shell.proc.stdin.drain()
