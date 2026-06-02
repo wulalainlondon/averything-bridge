@@ -144,9 +144,15 @@ def test_send_event_buffers_when_only_stale_clients_exist(monkeypatch):
 
     offline_buffer, clients = asyncio.run(run())
 
-    assert offline_buffer == [
-        {"type": "text_chunk", "content": "buffer me", "session_id": "s1"}
-    ]
+    # send_event now also stamps a per-session `seq` and per-boot `gen` (used by
+    # the client to detect dropped events); assert on the stable fields plus the
+    # presence of the new ones.
+    assert len(offline_buffer) == 1
+    evt = offline_buffer[0]
+    assert {k: evt[k] for k in ("type", "content", "session_id")} == {
+        "type": "text_chunk", "content": "buffer me", "session_id": "s1"
+    }
+    assert evt["seq"] == 1 and isinstance(evt["gen"], str) and evt["gen"]
     assert clients == {}
 
 

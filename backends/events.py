@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import sys
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -16,6 +17,16 @@ if TYPE_CHECKING:
     from bridge_v2 import Session
 
 OFFLINE_BUFFER_MAX = 10000
+
+# Per-BOOT generation id. Stamped on every session event (and hello_ack) so the
+# client can tell a post-restart seq=1 apart from a stale/duplicate pre-restart
+# event (the per-session _event_seq counter resets to 0 on every bridge start).
+# Generated once at import time = process start; changes every restart.
+_GENERATION: str = secrets.token_hex(8)
+
+
+def get_generation() -> str:
+    return _GENERATION
 _MEDIA_BASE_URL: str = ""
 HTTP_PORT = 9090
 _http_server_proc: "asyncio.subprocess.Process | None" = None
@@ -280,6 +291,16 @@ async def send_event(session: "Session", event: dict) -> None:
         "text_chunk", "thinking_chunk", "tool_start", "tool_result", "tool_end", "media", "done", "stopped", "error",
     }:
         payload["request_id"] = session.current_request_id
+    # Stamp a per-session monotonic seq + per-boot gen so the client can detect
+    # dropped/missed events (gap in seq) and trigger a reconcile. Atomic: there
+    # is no `await` between this read-modify-write and payload construction, so
+    # concurrent send_event calls for one session cannot interleave the bump.
+    # Stamped here (before dispatch) so every client sees the SAME seq, and the
+    # offline_buffer stores the already-stamped payload. NOTE: distinct from
+    # session.message_seq (that one is for unread cursors, terminal events only).
+    session._event_seq += 1
+    payload["seq"] = session._event_seq
+    payload["gen"] = _GENERATION
     if _EVENT_DISPATCHER is not None:
         try:
             delivered = await _EVENT_DISPATCHER(payload, session)

@@ -139,6 +139,12 @@ class Session:
     # Per-session asyncio lock that serialises all ws.send() calls for this session.
     # Prevents live events from interleaving with offline-buffer replay frames.
     _ws_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Per-session monotonic event counter stamped onto every _evt_* event by
+    # send_event (paired with the per-boot generation id). Lets the client
+    # detect dropped events. Runtime-only: resets to 0 on restart (the gen id
+    # changes too, so the client reconciles). NOT persisted. Distinct from
+    # message_seq (which counts terminal events for unread cursors).
+    _event_seq: int = field(default=0, repr=False)
     # All prior resume_ids this session has held (UUIDs rotate each Claude turn).
     # Used by the JSONL watcher to avoid registering ghost sessions for old .jsonl files.
     historical_resume_ids: set = field(default_factory=set, repr=False)

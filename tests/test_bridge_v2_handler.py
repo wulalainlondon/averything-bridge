@@ -119,6 +119,7 @@ async def test_handler_sends_hello_ack_sessions_list_and_disconnects_cleanly():
     assert ws.sent[0] == {
         "type": "hello_ack",
         "instance_id": "b_test",
+        "gen": ws.sent[0]["gen"],
         "client_id": ws.sent[0]["client_id"],
         "device_id": "dev1",
         "device_name": "Phone",

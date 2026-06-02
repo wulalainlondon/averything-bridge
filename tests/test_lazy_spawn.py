@@ -400,7 +400,8 @@ class TestBuildSessionsListNoSpawn:
 
         delivered = asyncio.run(run())
 
-        assert delivered == [{
+        stripped = [{k: v for k, v in e.items() if k not in ("seq", "gen")} for e in delivered]
+        assert stripped == [{
             "type": "thinking_chunk",
             "content": "我先檢查目前的 bridge stream。",
             "session_id": "s_codex",

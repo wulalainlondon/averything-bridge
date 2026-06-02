@@ -120,6 +120,7 @@ async def handler(ws: ServerConnection) -> None:
         await ws.send(bv.json.dumps({
             "type": "hello_ack",
             "instance_id": bv._INSTANCE_ID,
+            "gen": bv.get_generation(),
             "client_id": client.client_id,
             "device_id": client.device_id,
             "device_name": client.device_name,
@@ -281,6 +282,7 @@ async def handler(ws: ServerConnection) -> None:
                 await ws.send(bv.json.dumps({
                     "type": "hello_ack",
                     "instance_id": bv._INSTANCE_ID,
+                    "gen": bv.get_generation(),
                     "client_id": client.client_id,
                     "device_id": client.device_id,
                     "device_name": client.device_name,

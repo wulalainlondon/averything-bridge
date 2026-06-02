@@ -177,11 +177,14 @@ def test_send_event_injects_current_request_id_for_prompt_events():
 
     delivered = asyncio.run(run())
 
-    assert delivered == [
+    # strip the additive seq/gen stamp before comparing the meaningful fields
+    stripped = [{k: v for k, v in e.items() if k not in ("seq", "gen")} for e in delivered]
+    assert stripped == [
         {"type": "thinking_chunk", "content": "thinking", "session_id": "s_prompt", "request_id": "r_active"},
         {"type": "text_chunk", "content": "hi", "session_id": "s_prompt", "request_id": "r_active"},
         {"type": "done", "session_id": "s_prompt", "request_id": "r_active"},
     ]
+    assert [e["seq"] for e in delivered] == [1, 2, 3]  # monotonic per session
 
 
 def test_validate_client_msg_covers_prompt_message_contract():
