@@ -395,6 +395,16 @@ class ClaudeCliBackend(Backend, _StatesMixin):
         if content.strip() == "/compact" and not state.compact_in_progress:
             state.compact_in_progress = True
             log.info("[%s] user-triggered /compact, setting compact_in_progress", session.session_id)
+            # Mirror auto-compact: tell the frontend a compact turn started so it renders
+            # the CompactingBanner instead of an ordinary user/assistant exchange. The
+            # matching session_command_done is broadcast from the result handler below.
+            if self._broadcast_fn is not None:
+                asyncio.create_task(self._broadcast_fn({
+                    "type": "session_command_started",
+                    "session_id": session.session_id,
+                    "request_id": f"compact_{session.session_id}",
+                    "queue_length": 0,
+                }))
 
         try:
             state.proc.stdin.write(payload.encode("utf-8"))
@@ -1700,6 +1710,8 @@ console.log(JSON.stringify(data));
                     if self._notify_fcm_fn is not None and not client_manager.has_clients():
                         asyncio.create_task(self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id))
                     await emit_done(session)
+                    if session.ws_ref is not None:
+                        asyncio.create_task(self.fetch_usage(session.ws_ref))
                     state.tool_blocks = {}
 
                     # Auto-compact: if context exceeds threshold and compact not already running,

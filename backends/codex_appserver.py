@@ -608,6 +608,8 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                         self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id)
                     )
                 await emit_done(session)
+                if session.ws_ref is not None:
+                    asyncio.create_task(self.fetch_usage(session.ws_ref))
                 if (session.context_max
                         and session.context_used >= int(session.context_max * _COMPACT_THRESHOLD)
                         and state.thread_id):
@@ -849,7 +851,7 @@ class CodexAppServerBackend(Backend, _StatesMixin):
             utilization = None
             if used_pct is not None:
                 try:
-                    utilization = (100.0 - float(used_pct)) / 100.0
+                    utilization = float(used_pct) / 100.0
                 except (TypeError, ValueError):
                     utilization = None
             resets_at = window.get("resetsAt") or window.get("resets_at")
