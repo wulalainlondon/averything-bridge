@@ -118,6 +118,11 @@ class ClaudeCliBackend(Backend, _StatesMixin):
         self._load_saved_sessions_fn = load_saved_sessions_fn
         self._broadcast_fn = broadcast_fn
         self._states: dict[str, _ClaudeState] = {}
+        # Per-file cache for _scan_local_sessions_sync: path -> (key, file_cwd, content_name)
+        # where key = (st_mtime_ns, st_size). Lets the resumable-sessions scan skip
+        # re-reading unchanged .jsonl files — otherwise every call re-parses thousands
+        # of files / GBs, blocking the executor and starving WS keepalive pings.
+        self._scan_file_cache: dict[str, tuple] = {}
 
     def _state_factory(self) -> _ClaudeState:
         return _ClaudeState()
@@ -1270,6 +1275,12 @@ console.log(JSON.stringify(data));
                 if v.get("resume_id") or v.get("claude_uuid")
             }
         path_overrides = self._load_path_overrides()
+        # Build a fresh cache each scan, reusing entries for unchanged files. Reading
+        # the old cache via .get() is thread-safe; we never mutate the shared dict in
+        # place (multiple scans may run concurrently in the executor). Rebuilding also
+        # naturally prunes entries for deleted session files.
+        old_cache = self._scan_file_cache
+        new_cache: dict[str, tuple] = {}
         try:
             for proj in os.scandir(self._claude_projects_dir):
                 if not proj.is_dir():
@@ -1283,40 +1294,51 @@ console.log(JSON.stringify(data));
                     if not entry.name.endswith(".jsonl") or not entry.is_file():
                         continue
                     uuid = entry.name[:-6]
-                    mtime = int(entry.stat().st_mtime)
-                    name = saved_names.get(uuid, "")
-                    file_cwd: str | None = None
+                    st = entry.stat()
+                    mtime = int(st.st_mtime)
+                    file_key = (st.st_mtime_ns, st.st_size)
 
-                    try:
-                        with open(entry.path, encoding="utf-8", errors="ignore") as f:
-                            for raw in f:
-                                try:
-                                    d = json.loads(raw)
-                                    # Pick up cwd from any record that carries it.
-                                    if file_cwd is None:
-                                        raw_cwd = d.get("cwd")
-                                        if isinstance(raw_cwd, str) and raw_cwd.strip():
-                                            file_cwd = raw_cwd.strip()
-                                    # Pick up session name from first non-empty user text.
-                                    if not name and d.get("type") == "user":
-                                        content = d.get("message", {}).get("content", "")
-                                        text = ""
-                                        if isinstance(content, str):
-                                            text = content
-                                        elif isinstance(content, list):
-                                            for blk in content:
-                                                if isinstance(blk, dict) and blk.get("type") == "text":
-                                                    text = blk.get("text", "")
-                                                    break
-                                        if text and not text.startswith("<"):
-                                            name = text[:50].strip()
-                                    if file_cwd and name:
-                                        break
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                    # Fast path: file unchanged since last scan — reuse the parsed
+                    # cwd/name without opening it. This is the whole point of the cache.
+                    cached = old_cache.get(entry.path)
+                    if cached is not None and cached[0] == file_key:
+                        file_cwd, content_name = cached[1], cached[2]
+                    else:
+                        file_cwd = None
+                        content_name = ""
+                        try:
+                            with open(entry.path, encoding="utf-8", errors="ignore") as f:
+                                for raw in f:
+                                    try:
+                                        d = json.loads(raw)
+                                        # Pick up cwd from any record that carries it.
+                                        if file_cwd is None:
+                                            raw_cwd = d.get("cwd")
+                                            if isinstance(raw_cwd, str) and raw_cwd.strip():
+                                                file_cwd = raw_cwd.strip()
+                                        # Pick up name from first non-empty user text.
+                                        if not content_name and d.get("type") == "user":
+                                            content = d.get("message", {}).get("content", "")
+                                            text = ""
+                                            if isinstance(content, str):
+                                                text = content
+                                            elif isinstance(content, list):
+                                                for blk in content:
+                                                    if isinstance(blk, dict) and blk.get("type") == "text":
+                                                        text = blk.get("text", "")
+                                                        break
+                                            if text and not text.startswith("<"):
+                                                content_name = text[:50].strip()
+                                        if file_cwd and content_name:
+                                            break
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    new_cache[entry.path] = (file_key, file_cwd, content_name)
 
+                    # Saved (user-renamed) name takes precedence over content-derived name.
+                    name = saved_names.get(uuid) or content_name
                     if not name:
                         name = proj.name.split("-")[-1] or uuid[:8]
 
@@ -1344,6 +1366,11 @@ console.log(JSON.stringify(data));
                 log.warning("Failed to scan local sessions: %s", exc)
         except Exception as exc:
             log.warning("Failed to scan local sessions: %s", exc)
+        # Commit the rebuilt cache (atomic reference swap; safe vs. concurrent scans).
+        # On an early exception above, new_cache may be partial — only commit when we
+        # actually walked the tree (i.e. it has entries) to avoid wiping a good cache.
+        if new_cache:
+            self._scan_file_cache = new_cache
         sessions.sort(key=lambda x: x["last_used"], reverse=True)
         return sessions[:limit]
 

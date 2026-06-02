@@ -106,6 +106,11 @@ class CodexAppServerBackend(Backend, _StatesMixin):
         self._native_session_index_path = os.path.join(self._codex_home, "session_index.jsonl")
         self._session_path_index: dict[str, str] | None = None
         self._session_path_index_time: float = 0.0
+        # Per-file cache for _load_native_codex_sessions: path -> (key, cwd, name)
+        # where key = (st_mtime_ns, st_size). Avoids re-opening every rollout file
+        # (1000s of them, GBs) on each resumable-sessions poll, which otherwise
+        # saturates the executor and starves WS keepalive pings.
+        self._codex_scan_cache: dict[str, tuple] = {}
 
         # Singleton app-server
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -1024,12 +1029,23 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                         continue
                     rollout_candidates.append((uid, os.path.join(root, fn), fn))
 
-            # Sort by filename descending (filename encodes the creation timestamp).
+            # Sort by filename descending (filename encodes the creation timestamp),
+            # so the newest sessions come first and we can stop after `limit` of them.
             rollout_candidates.sort(key=lambda x: x[2], reverse=True)
 
+            # Rebuild a fresh per-file cache each scan, reusing entries for unchanged
+            # files (thread-safe: read old via .get(), never mutate it in place).
+            old_cache = self._codex_scan_cache
+            new_cache: dict[str, tuple] = {}
+            collected = 0
             for uid, filepath, fn in rollout_candidates:
                 if uid in seen_ids:
                     continue
+                # Newest-first: once we have `limit` rollout sessions, the rest are
+                # strictly older and cannot enter the top-`limit` result. Stop early
+                # so a poll opens ~limit files instead of every rollout file on disk.
+                if collected >= limit:
+                    break
                 # Parse timestamp from filename:
                 # rollout-2026-05-03T22-59-01-<UUID>.jsonl
                 last_used = 0
@@ -1040,31 +1056,45 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                 except Exception:
                     pass
 
-                cwd = os.path.expanduser("~")
-                name = uid[:8]
+                # Fast path: file unchanged since last scan — reuse parsed cwd/name
+                # without opening it.
                 try:
-                    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                        for raw in f:
-                            raw = raw.strip()
-                            if not raw:
-                                continue
-                            try:
-                                d = json.loads(raw)
-                            except Exception:
-                                continue
-                            t = d.get("type", "")
-                            p = d.get("payload", {})
-                            if t == "session_meta" and isinstance(p, dict):
-                                cwd = str(p.get("cwd") or cwd)
-                            elif t == "event_msg" and isinstance(p, dict) and p.get("type") == "user_message":
-                                msg = p.get("message", "")
-                                if isinstance(msg, str) and msg.strip():
-                                    name = msg.strip()
-                                break
-                except Exception:
-                    pass
+                    st = os.stat(filepath)
+                    file_key: tuple | None = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    file_key = None
+                cached = old_cache.get(filepath) if file_key is not None else None
+                if cached is not None and cached[0] == file_key:
+                    cwd, name = cached[1], cached[2]
+                else:
+                    cwd = os.path.expanduser("~")
+                    name = uid[:8]
+                    try:
+                        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                            for raw in f:
+                                raw = raw.strip()
+                                if not raw:
+                                    continue
+                                try:
+                                    d = json.loads(raw)
+                                except Exception:
+                                    continue
+                                t = d.get("type", "")
+                                p = d.get("payload", {})
+                                if t == "session_meta" and isinstance(p, dict):
+                                    cwd = str(p.get("cwd") or cwd)
+                                elif t == "event_msg" and isinstance(p, dict) and p.get("type") == "user_message":
+                                    msg = p.get("message", "")
+                                    if isinstance(msg, str) and msg.strip():
+                                        name = msg.strip()
+                                    break
+                    except Exception:
+                        pass
+                if file_key is not None:
+                    new_cache[filepath] = (file_key, cwd, name)
 
                 seen_ids.add(uid)
+                collected += 1
                 out.append({
                     "id": f"native_{uid[:12]}",
                     "name": _sanitize_session_name(name, uid[:8]),
@@ -1073,6 +1103,9 @@ class CodexAppServerBackend(Backend, _StatesMixin):
                     "last_used": last_used,
                     "cwd": cwd,
                 })
+
+            if new_cache:
+                self._codex_scan_cache = new_cache
 
         out.sort(key=lambda x: x.get("last_used", 0), reverse=True)
         return out[:limit]
