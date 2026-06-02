@@ -165,7 +165,7 @@ def test_claude_proc_exit_closes_active_stream_before_restart(monkeypatch):
         async def fake_spawn(session_arg) -> None:
             spawn_calls.append(session_arg.session_id)
 
-        monkeypatch.setattr("backends.claude_cli.send_event", fake_send_event)
+        monkeypatch.setattr("backends.claude_stream.send_event", fake_send_event)
         monkeypatch.setattr(backend, "_spawn_proc", fake_spawn)
 
         await backend._watch_proc(session)

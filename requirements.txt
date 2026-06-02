@@ -7,3 +7,6 @@ pyyaml>=6.0          # config system: ~/.claude-bridge/config.yaml loader
 aiortc>=1.6          # WebRTC P2P DataChannel (NAT traversal fallback for Cloudflare Tunnel)
 # pysqlite3-binary is optional — install manually only when stdlib sqlite3 lacks FTS5
 # (Apple-shipped Python, some Homebrew builds). See TECH_RESEARCH.md Q1/Q2.
+
+# --- test-only (not needed at runtime) ---
+pytest-asyncio>=1.4   # async test support; asyncio_mode=auto set in pytest.ini
