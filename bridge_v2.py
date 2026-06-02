@@ -215,123 +215,17 @@ def _init_paths(data_dir: str) -> None:
     print(f"[bridge] stable instance_id={_INSTANCE_ID}")
 
 
-def _load_pairing() -> dict:
-    try:
-        with open(PAIRING_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_pairing(data: dict) -> None:
-    import tempfile
-    path = Path(PAIRING_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp_", suffix=".json")
-    tmp = Path(tmp_str)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        tmp.replace(path)
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
-
-
-def _clear_pairing() -> None:
-    try:
-        os.remove(PAIRING_FILE)
-    except FileNotFoundError:
-        pass
-
+# Pairing persistence (_load_pairing/_save_pairing/_clear_pairing) lives in
+# pairing.py; the in-memory _PAIRING dict stays here.
+from pairing import _load_pairing, _save_pairing, _clear_pairing
+# Binary / Tailscale discovery helpers live in bin_discovery.py.
+from bin_discovery import (
+    _find_claude_bin, _find_bun_bin, _find_codex_bin, _detect_tailscale_ip,
+)
+# Pure client-message helpers live in client_msg_utils.py.
+from client_msg_utils import _short_id, _summarize_client_msg, _build_handoff_prompt
 
 _PAIRING: dict = {}
-
-
-def _find_claude_bin() -> str:
-    env = os.environ.get("CLAUDE_PATH")
-    if env and os.path.isfile(env):
-        return env
-    found = shutil.which("claude")
-    if found:
-        return found
-    candidates = [
-        "~/.npm-global/bin/claude",
-        "~/.local/bin/claude",
-        "~/.bun/bin/claude",
-        r"%APPDATA%\npm\claude.cmd",
-        r"%APPDATA%\npm\claude.exe",
-        r"%USERPROFILE%\AppData\Roaming\npm\claude.cmd",
-        r"%USERPROFILE%\AppData\Roaming\npm\claude.exe",
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-    ]
-    for c in candidates:
-        p = os.path.expanduser(os.path.expandvars(c))
-        if os.path.isfile(p):
-            return p
-    print("ERROR: claude binary not found. Set CLAUDE_PATH env var or ensure claude is on PATH.")
-    sys.exit(1)
-
-
-def _find_bun_bin() -> str:
-    env = os.environ.get("BUN_PATH")
-    if env and os.path.isfile(env):
-        return env
-    found = shutil.which("bun")
-    if found:
-        return found
-    candidates = [
-        "/opt/homebrew/bin/bun",
-        "~/.bun/bin/bun",
-        r"%USERPROFILE%\.bun\bin\bun.exe",
-        "/usr/local/bin/bun",
-    ]
-    for c in candidates:
-        p = os.path.expanduser(os.path.expandvars(c))
-        if os.path.isfile(p):
-            return p
-    return "bun"
-
-
-def _find_codex_bin() -> str:
-    env = os.environ.get("CODEX_PATH")
-    if env and os.path.isfile(env):
-        return env
-    found = shutil.which("codex")
-    if found:
-        return found
-    candidates = [
-        "~/.npm-global/bin/codex",
-        "~/.local/bin/codex",
-        r"%APPDATA%\npm\codex.cmd",
-        r"%APPDATA%\npm\codex.exe",
-        r"%USERPROFILE%\AppData\Roaming\npm\codex.cmd",
-        r"%USERPROFILE%\AppData\Roaming\npm\codex.exe",
-        "/usr/local/bin/codex",
-        "/opt/homebrew/bin/codex",
-    ]
-    for c in candidates:
-        p = os.path.expanduser(os.path.expandvars(c))
-        if os.path.isfile(p):
-            return p
-    print("ERROR: codex binary not found. Set CODEX_PATH env var or ensure codex is on PATH.")
-    sys.exit(1)
-
-
-def _detect_tailscale_ip() -> "str | None":
-    ts = shutil.which("tailscale")
-    if not ts:
-        return None
-    try:
-        result = subprocess.run([ts, "ip", "-4"], capture_output=True, text=True, timeout=3)
-        ip = result.stdout.strip().split("\n")[0]
-        return ip if ip else None
-    except Exception:
-        return None
 
 
 log = logging.getLogger("bridge_v2")
@@ -370,29 +264,6 @@ def _search_ingest_should_yield_to_activity() -> bool:
     except Exception:
         window = 3.0
     return window > 0 and (time.monotonic() - _last_client_activity_monotonic) < window
-
-
-def _short_id(value: Any) -> str:
-    text = str(value) if value is not None else ""
-    if len(text) <= 18:
-        return text
-    return f"{text[:12]}...{text[-4:]}"
-
-
-def _summarize_client_msg(msg: dict, raw_len: int) -> str:
-    parts = [f"type={msg.get('type', '<missing>')}", f"bytes={raw_len}"]
-    for key in ("session_id", "request_id", "client_id", "device_id"):
-        if msg.get(key):
-            parts.append(f"{key}={_short_id(msg.get(key))}")
-    for key in ("content", "query", "message"):
-        val = msg.get(key)
-        if isinstance(val, str):
-            parts.append(f"{key}_len={len(val)}")
-    for key in ("files", "images", "items"):
-        val = msg.get(key)
-        if isinstance(val, list):
-            parts.append(f"{key}_count={len(val)}")
-    return " ".join(parts)
 
 
 async def _init_search() -> None:
@@ -694,28 +565,6 @@ async def _send_session_history_response(
     await ws.send(json.dumps(_msg_session_history(session.session_id, messages, runtime=runtime)))
 
 
-def _build_handoff_prompt(history: list[dict], user_request: str = "") -> str:
-    lines: list[str] = [
-        "Context handoff from previous session. Continue seamlessly.",
-        "Use the transcript below as prior context.",
-        "",
-    ]
-    for item in history[-80:]:
-        role = str(item.get("role", "user")).upper()
-        content = str(item.get("content", ""))
-        lines.append(f"{role}:")
-        lines.append(content)
-        lines.append("")
-    if user_request.strip():
-        lines.append("LATEST USER REQUEST:")
-        lines.append(user_request.strip())
-    else:
-        lines.append("LATEST USER REQUEST:")
-        lines.append("Please continue from the latest point with the same task.")
-    return "\n".join(lines)
-
-
-
 # ---------------------------------------------------------------------------
 # Saved sessions (persistence helpers — used by _persist_session, _restore_sessions_from_disk)
 # ---------------------------------------------------------------------------
@@ -921,419 +770,9 @@ async def _session_cache_refresher() -> None:
         await preload_sessions_cache(_BACKENDS)
 
 
-async def handler(ws: ServerConnection) -> None:
-    global _AUTO_TUNNEL_TASK, _PAIRING
-
-    # Liveness probe short-circuit.  The supervisor's bridge_healthcheck.py
-    # opens a WS every 3s, sends a control PING, then closes.  Without this
-    # gate the handler would (a) register the probe as a client, (b) reassign
-    # session.ws_ref on every existing session to this dying socket — causing
-    # the next broadcast event to be sent to a closed socket and dropped from
-    # the real app — and (c) serialize+send a 29KB sessions_list and replay
-    # offline buffers into a socket that closes 12ms later.  Probes only need
-    # the TCP/WS handshake to succeed and their control PING to be ponged
-    # (websockets library handles control PING automatically); we just need to
-    # keep the connection open until the probe closes it.
-    try:
-        ua = ws.request.headers.get("User-Agent", "") if ws.request else ""
-    except Exception:
-        ua = ""
-    if ua.startswith("bridge-healthcheck/"):
-        try:
-            async for _ in ws:
-                pass  # discard any frames; probe normally sends none
-        except Exception:
-            pass
-        return
-
-    # Cancel pending auto-tunnel — client is back
-    if _AUTO_TUNNEL_TASK and not _AUTO_TUNNEL_TASK.done():
-        _AUTO_TUNNEL_TASK.cancel()
-        _AUTO_TUNNEL_TASK = None
-
-    # Proactively start tunnel so client gets the URL while still on WiFi,
-    # avoiding FCM dependency on the next reconnect.
-    # Skip when external tunnel mode is active (_TUNNEL_URL_FILE set): in that
-    # case cloudflared_launcher.sh (managed by launchd) owns the tunnel lifecycle;
-    # starting an in-process tunnel here would create a second trycloudflare URL.
-    if (
-        os.environ.get("BRIDGE_AUTO_TUNNEL") == "1"
-        and not _TUNNEL_URL_FILE
-        and not _is_cloudflared_running()
-    ):
-        _spawn_task("cloudflared-start:on-connect", _start_cloudflared_tunnel(_BRIDGE_PORT))
-
-    remote = ws.remote_address
-    client = ClientConn(
-        client_id=f"c_{uuid.uuid4().hex[:8]}",
-        device_id=f"device_{uuid.uuid4().hex[:8]}",
-        device_name="Unknown device",
-        ws=ws,
-        connected_at=time.time(),
-        last_seen=time.time(),
-    )
-    try:
-        raw_first = await asyncio.wait_for(ws.recv(), timeout=20)
-        first_msg = json.loads(str(raw_first))
-    except asyncio.TimeoutError:
-        try:
-            await ws.send(json.dumps(_msg_error("Handshake timeout: expected hello")))
-        except Exception:
-            pass
-        return
-    except Exception:
-        try:
-            await ws.send(json.dumps(_msg_error("Handshake failed: invalid JSON")))
-        except Exception:
-            pass
-        return
-
-    first_err = validate_client_msg(first_msg)
-    if first_err or first_msg.get("type") != "hello":
-        try:
-            await ws.send(json.dumps(_msg_error("Protocol error: first message must be hello")))
-        except Exception:
-            pass
-        return
-    if not _is_auth_token_valid(first_msg):
-        try:
-            await ws.send(json.dumps(_msg_error("Unauthorized: invalid auth token")))
-        except Exception:
-            pass
-        return
-
-    if isinstance(first_msg.get("device_id"), str) and first_msg.get("device_id", "").strip():
-        client.device_id = first_msg["device_id"].strip()
-    if isinstance(first_msg.get("device_name"), str) and first_msg.get("device_name", "").strip():
-        client.device_name = first_msg["device_name"].strip()
-
-    client_manager.register(ws, client)
-    log.info("Client connected: %s (%s) device=%s", remote, client.client_id, client.device_id)
-    _mark_client_activity()
-
-    # Inject this ws into all existing sessions (reconnect scenario).
-    # ws_ref must be set before hello_ack/sessions_list so live events dispatched
-    # during the handshake go to this client instead of the offline buffer.
-    for session in list(_SESSIONS.values()):
-        session.ws_ref = ws
-
-    try:
-        _paired_token = _PAIRING.get("paired_token", "").strip()
-        _provided_token = str(first_msg.get("auth_token") or "").strip()
-        tunnel_url = get_current_tunnel_url()
-        log.info("hello_ack → client=%s instance_id=%s tunnel=%s",
-                 client.client_id, _INSTANCE_ID, bool(tunnel_url))
-        await ws.send(json.dumps({
-            "type": "hello_ack",
-            "instance_id": _INSTANCE_ID,
-            "client_id": client.client_id,
-            "device_id": client.device_id,
-            "device_name": client.device_name,
-            "is_locked": bool(_paired_token),
-            "locked_to_me": bool(_paired_token) and _paired_token == _provided_token,
-            "instance_name": _INSTANCE_NAME,
-            "root_dir": _ROOT_DIR,
-            "data_dir": _DATA_DIR,
-            **({"lan_ip": _LAN_IP} if _LAN_IP else {}),
-            **({"tunnel_url": tunnel_url} if tunnel_url else {}),
-        }))
-        await ws.send(json.dumps(build_sessions_list()))
-
-        # Replay offline buffers AFTER sessions_list so the frontend has already
-        # run reconcileFromServer (and hydrated its session state) before it
-        # processes buffered events.  Sending before sessions_list caused a cold-
-        # start race where the Zustand store wasn't hydrated yet, so done/stopped
-        # events were silently dropped and isStreaming stayed stuck.
-        await replay_offline_buffers(ws, _SESSIONS.values())
-        _spawn_task(f"unread-snapshot:connect:{client.client_id}", _send_unread_snapshot_deferred(ws, client))
-        # Re-deliver any file pushes that were broadcast before this client connected
-        device_id = client.device_id or ""
-        for item in pending_file_push_items(device_id):
-            payload = {"type": "file_push", **item}
-            try:
-                await ws.send(json.dumps(payload))
-            except Exception:
-                break
-    except Exception:
-        pass
-
-    try:
-        system_ctx = {
-            "asyncio": asyncio,
-            "sessions": _SESSIONS,
-            "backends": _BACKENDS,
-            "session_backend": _session_backend,
-            "msg_resumable_sessions": _msg_resumable_sessions,
-            "permission_mode": _PERMISSION_MANAGER.mode() if _PERMISSION_MANAGER else "off",
-            "restart_trigger_path": _RESTART_TRIGGER_PATH,
-            "msg_agent_tree": _msg_agent_tree,
-        }
-        runtime_ctx = {
-            "sessions": _SESSIONS,
-            "shell_sessions": _SHELL_SESSIONS,
-            "max_shells": MAX_SHELLS,
-            "session_backend": _session_backend,
-            "shell_cls": ShellSession,
-            "root_dir": _ROOT_DIR,
-            "shell_reader": _shell_reader,
-            "msg_error": _msg_error,
-            "msg_shell_created": _msg_shell_created,
-            "msg_tasks_list": _msg_tasks_list,
-            "msg_task_killed": _msg_task_killed,
-            "msg_processes_list": _msg_processes_list,
-            "msg_process_killed": _msg_process_killed,
-            "permission_manager": _PERMISSION_MANAGER,
-            "client": client,
-        }
-        file_ctx = {
-            "sessions": _SESSIONS,
-            "backends": _BACKENDS,
-            "msg_dir_listing": _msg_dir_listing,
-            "fcm_token_file": FCM_TOKEN_FILE,
-            "log": log,
-            "root_dir": _ROOT_DIR,
-            "get_tunnel_url": get_current_tunnel_url,
-            "is_tunnel_delivered": is_tunnel_url_delivered,
-            "notify_tunnel_fcm_once": _do_send_tunnel_fcm,
-        }
-        router_ctx = RouterContext(
-            sessions=_SESSIONS,
-            build_sessions_list=build_sessions_list,
-            broadcast_json=_broadcast_json,
-            persist_session_meta=_persist_session_meta,
-            send_all_sessions=_send_all_sessions,
-            spawn_task=_spawn_task,
-            handle_push_file=_handle_push_file,
-            handle_file_push_ack=_handle_file_push_ack,
-            msg_pong=_msg_pong,
-            msg_session_history=_msg_session_history,
-            send_unread_snapshot=_send_unread_snapshot,
-            send_unread_for_client_session=_send_unread_for_client_session,
-            mark_read=_mark_read,
-            persist_read_cursors=_persist_read_cursors,
-            send_session_history_response=_send_session_history_response,
-            history_runtime_payload=_history_runtime_payload,
-            emit_resume_progress=_emit_resume_progress,
-            close_duplicate_device_clients=client_manager.close_duplicate_device_clients,
-            log_warning=log.warning,
-            log_debug=log.debug,
-            sessions_lock=_SESSIONS_LOCK,
-            max_sessions=MAX_SESSIONS,
-            default_cwd=DEFAULT_CWD,
-            normalize_backend_name=_normalize_backend_name,
-            session_cls=Session,
-            queued_command_cls=QueuedCommand,
-            msg_session_created=_msg_session_created,
-            msg_error=_msg_error,
-            msg_session_renamed=_msg_session_renamed,
-            session_backend=_session_backend,
-            send_event=send_event,
-            evt_session_warning=_evt_session_warning,
-            evt_error=_evt_error,
-            persist_session=_persist_session,
-            read_cursors=_READ_CURSORS,
-            remove_saved_session=lambda sid: session_registry.remove_saved_session(
-                sid,
-                saved_sessions_file=SAVED_SESSIONS_FILE,
-                log_warning=log.warning,
-            ),
-            invalidate_sessions_cache=invalidate_sessions_cache,
-            preload_sessions_cache=preload_sessions_cache,
-            backends=_BACKENDS,
-            load_session_history_for_transfer=_load_session_history_for_transfer,
-            build_handoff_prompt=_build_handoff_prompt,
-            run_session_queue=_run_session_queue,
-            search_enabled=_search_enabled,
-            get_search_worker=get_worker,
-            strip_turn_aborted_notice=_strip_turn_aborted_notice,
-            log_prompt_lifecycle=_log_prompt_lifecycle,
-            root_dir=_ROOT_DIR,
-            data_dir=_DATA_DIR,
-            instance_name=_INSTANCE_NAME,
-            pairing=_PAIRING,
-        )
-        async for raw in ws:
-            op_started = time.perf_counter()
-            _mark_client_activity()
-            raw_text = str(raw)
-            raw_len = len(raw_text.encode("utf-8", errors="ignore"))
-
-            try:
-                msg = json.loads(raw_text)
-            except json.JSONDecodeError:
-                log.warning("Non-JSON from client: bytes=%d", raw_len)
-                continue
-            log.debug("Received: %s", _summarize_client_msg(msg, raw_len))
-
-            # --- Inbound schema validation ---
-            validation_err = validate_client_msg(msg)
-            if validation_err:
-                log.warning("Invalid client msg: %s | %s", validation_err, _summarize_client_msg(msg, raw_len))
-                try:
-                    await ws.send(json.dumps(_msg_error(f"Protocol error: {validation_err}")))
-                except Exception:
-                    pass
-                continue
-
-            mtype = msg["type"]  # safe after validation
-            runtime_ctx["client"] = client
-            if mtype == "hello":
-                if isinstance(msg.get("device_id"), str) and msg.get("device_id", "").strip():
-                    client.device_id = msg["device_id"].strip()
-                if isinstance(msg.get("device_name"), str) and msg.get("device_name", "").strip():
-                    client.device_name = msg["device_name"].strip()
-                _paired_token = _PAIRING.get("paired_token", "").strip()
-                _provided_token = str(msg.get("auth_token") or "").strip()
-                await ws.send(json.dumps({
-                    "type": "hello_ack",
-                    "instance_id": _INSTANCE_ID,
-                    "client_id": client.client_id,
-                    "device_id": client.device_id,
-                    "device_name": client.device_name,
-                    "is_locked": bool(_paired_token),
-                    "locked_to_me": bool(_paired_token) and _paired_token == _provided_token,
-                    "instance_name": _INSTANCE_NAME,
-                    "root_dir": _ROOT_DIR,
-                    "data_dir": _DATA_DIR,
-                    **({"lan_ip": _LAN_IP} if _LAN_IP else {}),
-                    **({"tunnel_url": get_current_tunnel_url()} if get_current_tunnel_url() else {}),
-                }))
-                await send_pending_interactions(ws)
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            if mtype == "claim_bridge":
-                token = str(msg.get("auth_token") or "").strip()
-                device_id = str(msg.get("device_id") or "").strip()
-                if not token:
-                    await ws.send(json.dumps(_msg_error("auth_token required for claim_bridge")))
-                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                    continue
-                existing = _PAIRING.get("paired_token", "").strip()
-                if existing and existing != token:
-                    await ws.send(json.dumps(_msg_error("Bridge already claimed by another device")))
-                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                    continue
-                # Synchronous block — asyncio single-thread guarantees atomicity (no await between clear and update).
-                _new_pairing = {"paired_token": token, "paired_device_id": device_id, "paired_at": int(time.time())}
-                _PAIRING.clear()
-                _PAIRING.update(_new_pairing)
-                _save_pairing(_PAIRING)
-                log.info("Bridge claimed by device_id=%s", device_id)
-                await ws.send(json.dumps({"type": "claim_ack", "is_locked": True, "locked_to_me": True}))
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            if mtype == "unclaim_bridge":
-                token = str(msg.get("auth_token") or "").strip()
-                paired = _PAIRING.get("paired_token", "").strip()
-                if paired and paired != token:
-                    await ws.send(json.dumps(_msg_error("Unauthorized: token mismatch")))
-                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                    continue
-                _PAIRING.clear()
-                _clear_pairing()
-                log.info("Bridge unclaimed")
-                await ws.send(json.dumps({"type": "unclaim_ack", "is_locked": False}))
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            if mtype == "get_inbox":
-                _inbox_conn = client_manager.CLIENTS.get(ws)
-                inbox_device_id = (_inbox_conn.device_id if _inbox_conn else "") or ""
-                inbox_items = pending_file_push_items(inbox_device_id, include_pushed_at=True)
-                try:
-                    await ws.send(json.dumps({"type": "inbox_list", "items": inbox_items}))
-                except Exception:
-                    pass
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            if mtype == "tunnel_url_ack":
-                mark_tunnel_url_delivered()
-                log.info("tunnel_url_ack received — FCM retry cancelled")
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            if await handle_interaction_message(
-                mtype=mtype,
-                msg=msg,
-                ws=ws,
-                sessions=_SESSIONS,
-                session_backend=_session_backend,
-                broadcast_json=_broadcast_json,
-                msg_error=_msg_error,
-            ):
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            if await _dispatch_ws_message(ws, msg):
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            if await handle_system_msg(mtype, msg, ws, system_ctx):
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-            if await handle_runtime_msg(mtype, msg, ws, runtime_ctx):
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-            if await handle_file_msg(mtype, msg, ws, file_ctx):
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            # WebRTC signaling — once the DataChannel opens we re-enter
-            # handler() on the WebRTCChannel adapter so the entire dispatch
-            # stack (including this very loop) runs unmodified over P2P.
-            if mtype in WEBRTC_MESSAGE_TYPES:
-                async def _on_channel_ready(adapter):
-                    try:
-                        await handler(adapter)
-                    except Exception:
-                        log.exception("[webrtc] handler raised on adapter")
-                if await handle_webrtc_message(mtype, msg, ws, _on_channel_ready):
-                    _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                    continue
-
-            if await handle_low_coupling_message(
-                mtype=mtype,
-                msg=msg,
-                ws=ws,
-                client=client,
-                ctx=router_ctx,
-            ):
-                _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-                continue
-
-            log.debug("No direct handler matched for type=%s", mtype)
-
-            _PERF.record(mtype, (time.perf_counter() - op_started) * 1000.0, log)
-
-    except Exception as exc:
-        name = type(exc).__name__
-        if "ConnectionClosed" in name:
-            log.info("Client disconnected: %s (%s)", remote, exc)
-        else:
-            log.exception("Unhandled error in handler: %s", exc)
-    finally:
-        client_manager.remove(ws)
-        for session in list(_SESSIONS.values()):
-            if session.ws_ref is ws:
-                session.ws_ref = None
-        for shell in list(_SHELL_SESSIONS.values()):
-            if shell.ws_ref is ws:
-                shell.ws_ref = None
-        # Tear down any pending WebRTC PC anchored on this signaling socket
-        # (the DC adapter, if promoted, has its own lifecycle).
-        _webrtc_cleanup_for_ws(ws)
-        log.info("Client gone: %s (%s)", remote, client.client_id)
-
-        if (
-            os.environ.get("BRIDGE_AUTO_TUNNEL") == "1"
-            and not _TUNNEL_URL_FILE
-            and not client_manager.has_clients()
-            and not _is_cloudflared_running()
-        ):
-            _AUTO_TUNNEL_TASK = _spawn_task("auto-tunnel-delayed", _auto_tunnel_after_delay(120))
+# The WebSocket connection handler lives in handlers/connection.py.
+# It is re-exported at the bottom of this module (see end of file) so
+# `bridge_v2.handler` keeps working for main(), webrtc re-entry, and tests.
 
 
 
@@ -1409,6 +848,71 @@ async def _warmup_history_cache_background() -> None:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _reconfigure_logging() -> None:
+    """Re-configure root logger to write to the correct data_dir log file."""
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+    logging.basicConfig(
+        level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            RotatingFileHandler(
+                LOG_FILE,
+                maxBytes=10 * 1024 * 1024,  # 10 MB per file
+                backupCount=3,
+                encoding="utf-8",
+            ),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
+async def _serve_forever(port: int, tunnel: bool, broadcaster, zc) -> None:
+    """Open the websockets server and run until cancelled, then tear down
+    background tasks, the search worker, the discovery broadcaster and mDNS."""
+    serve_kwargs = {
+        "handler": handler,
+        "host": ["0.0.0.0", "::"],
+        "port": port,
+        "ping_interval": 30,
+        "ping_timeout": 60,
+        "max_size": None,
+        "process_request": _media_request_handler,
+        "compression": "deflate",
+    }
+    if os.name != "nt":
+        serve_kwargs["reuse_port"] = True
+
+    async with serve(**serve_kwargs):
+        log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
+        if _TUNNEL_URL_FILE:
+            # External tunnel management: cloudflared_launcher.sh owns the process.
+            # Bridge just polls the URL file and broadcasts changes.
+            log.info("External tunnel mode: watching %s", _TUNNEL_URL_FILE)
+            _spawn_task("tunnel-url-watcher", _tunnel_url_file_watcher(_TUNNEL_URL_FILE))
+        else:
+            # Self-managed tunnel (legacy / manual --tunnel flag).
+            if tunnel:
+                _spawn_task("cloudflared-start", _start_cloudflared_tunnel(port))
+            if os.environ.get("BRIDGE_AUTO_TUNNEL") == "1":
+                _spawn_task("cloudflared-watchdog", _cloudflared_watchdog())
+        init_cache_db()
+        _spawn_task("preload-sessions-cache:startup", preload_sessions_cache(_BACKENDS))
+        _spawn_task("session-cache-refresher", _session_cache_refresher())
+        _spawn_task("history-cache-warmup", _warmup_history_cache_background())
+        _spawn_task("jsonl-watcher", _jsonl_watcher_task())
+        try:
+            await asyncio.Future()  # run forever
+        finally:
+            await _cancel_tasks()
+            await _shutdown_search()
+            if broadcaster:
+                await broadcaster.stop()
+            if zc:
+                zc.unregister_all_services()
+                zc.close()
+
+
 async def main(port: int, tunnel: bool = False,
                backend_name: str = "claude", model: str = "",
                ollama_host: str = "http://localhost:11434",
@@ -1439,22 +943,7 @@ async def main(port: int, tunnel: bool = False,
     global _PAIRING
     _PAIRING = _load_pairing()
 
-    # Re-configure root logger to write to the correct data_dir log file
-    for h in logging.root.handlers[:]:
-        logging.root.removeHandler(h)
-    logging.basicConfig(
-        level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            RotatingFileHandler(
-                LOG_FILE,
-                maxBytes=10 * 1024 * 1024,  # 10 MB per file
-                backupCount=3,
-                encoding="utf-8",
-            ),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    _reconfigure_logging()
 
     global _ROOT_DIR
     if root_dir:
@@ -1577,48 +1066,13 @@ async def main(port: int, tunnel: bool = False,
             version="2.0",
         )
         await broadcaster.start()
-    serve_kwargs = {
-        "handler": handler,
-        "host": ["0.0.0.0", "::"],
-        "port": port,
-        "ping_interval": 30,
-        "ping_timeout": 60,
-        "max_size": None,
-        "process_request": _media_request_handler,
-        "compression": "deflate",
-    }
-    if os.name != "nt":
-        serve_kwargs["reuse_port"] = True
 
-    async with serve(**serve_kwargs):
-        log.info("Bridge v2 listening on port %d (IPv4 + IPv6)", port)
-        if _TUNNEL_URL_FILE:
-            # External tunnel management: cloudflared_launcher.sh owns the process.
-            # Bridge just polls the URL file and broadcasts changes.
-            log.info("External tunnel mode: watching %s", _TUNNEL_URL_FILE)
-            _spawn_task("tunnel-url-watcher", _tunnel_url_file_watcher(_TUNNEL_URL_FILE))
-        else:
-            # Self-managed tunnel (legacy / manual --tunnel flag).
-            if tunnel:
-                _spawn_task("cloudflared-start", _start_cloudflared_tunnel(port))
-            if os.environ.get("BRIDGE_AUTO_TUNNEL") == "1":
-                _spawn_task("cloudflared-watchdog", _cloudflared_watchdog())
-        init_cache_db()
-        _spawn_task("preload-sessions-cache:startup", preload_sessions_cache(_BACKENDS))
-        _spawn_task("session-cache-refresher", _session_cache_refresher())
-        _spawn_task("history-cache-warmup", _warmup_history_cache_background())
-        _spawn_task("jsonl-watcher", _jsonl_watcher_task())
-        try:
-            await asyncio.Future()  # run forever
-        finally:
-            await _cancel_tasks()
-            await _shutdown_search()
-            if broadcaster:
-                await broadcaster.stop()
-            if zc:
-                zc.unregister_all_services()
-                zc.close()
+    await _serve_forever(port, tunnel, broadcaster, zc)
 
+
+# --- bottom re-export: defined here (after all module state) so that
+# handlers/connection.py can `import bridge_v2` and resolve bv.* attributes. ---
+from handlers.connection import handler  # noqa: E402
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Claude WebSocket Bridge v2")
