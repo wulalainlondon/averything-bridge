@@ -955,3 +955,72 @@ class TestIdleWatchdogOnlySpawnedSessions:
             if st.proc is not None
         ]
         assert set(spawned_with_proc) == set(spawned_sids)
+
+
+def test_codex_invalidate_live_threads_clears_all_session_routes():
+    """A singleton app-server exit invalidates every live thread mapping."""
+    from backends.codex_appserver import CodexAppServerBackend
+
+    backend = CodexAppServerBackend("codex")
+    s1 = _make_session("s_codex_1", backend_name="codex")
+    s2 = _make_session("s_codex_2", backend_name="codex")
+    state1 = backend._get_state(s1)
+    state2 = backend._get_state(s2)
+    state1.thread_id = "thread-1"
+    state1.current_turn_id = "turn-1"
+    state2.thread_id = "thread-2"
+    state2.current_turn_id = "turn-2"
+    backend._thread_to_session = {"thread-1": s1, "thread-2": s2}
+
+    backend._invalidate_live_threads()
+
+    assert backend._thread_to_session == {}
+    assert state1.thread_id is None
+    assert state1.current_turn_id is None
+    assert state2.thread_id is None
+    assert state2.current_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_start_retries_thread_not_found(monkeypatch):
+    """Codex retries stale live threads reported as `thread not found`."""
+    from backends import codex_appserver
+    from backends.codex_appserver import CodexAppServerBackend
+
+    backend = CodexAppServerBackend("codex")
+    session = _make_session("s_codex_retry", backend_name="codex")
+    session.accumulated_text = ""
+    state = backend._get_state(session)
+    state.thread_id = "old-thread"
+    backend._thread_to_session["old-thread"] = session
+    calls: list[tuple[str, dict | None]] = []
+
+    async def fake_spawn(spawn_session):
+        assert spawn_session is session
+        state.thread_id = "new-thread"
+        backend._thread_to_session["new-thread"] = session
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        if method == "turn/start" and params and params.get("threadId") == "old-thread":
+            raise RuntimeError("{'message': 'thread not found: old-thread'}")
+        if method == "turn/start" and params and params.get("threadId") == "new-thread":
+            state.turn_error = None
+            state.turn_done_event.set()
+            return {}
+        raise AssertionError(f"unexpected rpc call: {method} {params}")
+
+    monkeypatch.setattr(backend, "spawn", fake_spawn)
+    monkeypatch.setattr(backend, "_rpc", fake_rpc)
+    monkeypatch.setattr(codex_appserver, "emit_done", AsyncMock())
+
+    await backend._run_turn(session, state, [{"type": "text", "text": "hello", "text_elements": []}])
+
+    turn_threads = [
+        params["threadId"]
+        for method, params in calls
+        if method == "turn/start" and params is not None
+    ]
+    assert turn_threads == ["old-thread", "new-thread"]
+    assert "old-thread" not in backend._thread_to_session
+    assert backend._thread_to_session["new-thread"] is session

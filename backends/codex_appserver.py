@@ -45,7 +45,7 @@ _STREAM_READER_LIMIT = 128 * 1024 * 1024  # 128 MiB
 _COMPACT_THRESHOLD = 0.80
 # Errors that mean the Codex thread no longer exists on the server side
 # (e.g. app-server restarted). Detected here so we can respawn silently.
-_STALE_THREAD_RE = re.compile(r"Unknown session", re.IGNORECASE)
+_STALE_THREAD_RE = re.compile(r"(?:Unknown session|thread not found)", re.IGNORECASE)
 CODEX_MODEL = "gpt-5.5"
 
 # Matches a JSON block (in a fenced code block or inline) containing ask_user_question.
@@ -219,8 +219,16 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         finally:
             log.info("[codex-appserver] read_loop exited (proc rc=%s)", proc.returncode)
             self._rpc_plumber.fail_all(RuntimeError("app-server process died"))
+            self._invalidate_live_threads()
             # Mark proc gone so next call restarts it
             self._proc = None
+
+    def _invalidate_live_threads(self) -> None:
+        """Drop live thread routing after the singleton app-server exits."""
+        self._thread_to_session.clear()
+        for state in self._states.values():
+            state.thread_id = None
+            state.current_turn_id = None
 
     async def _dispatch(self, msg: dict) -> None:
         # --- Notifications (RPC responses are handled by _rpc_plumber in _read_loop) ---
@@ -867,6 +875,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
     def kill_session_proc(self, session: "Session") -> bool:
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
+            self._invalidate_live_threads()
             return True
         return False
 

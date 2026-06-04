@@ -225,7 +225,11 @@ async def handle_runtime_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
         if task_id in ctx["sessions"]:
             s = ctx["sessions"][task_id]
             backend = ctx["session_backend"](s)
-            killed = backend.kill_session_proc(s)
+            if getattr(s, "backend_name", "") == "codex":
+                await backend.stop(s)
+                killed = True
+            else:
+                killed = backend.kill_session_proc(s)
         elif task_id in ctx["shell_sessions"]:
             sh = ctx["shell_sessions"].pop(task_id, None)
             if sh and sh.proc.returncode is None:
