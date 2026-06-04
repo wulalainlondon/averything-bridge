@@ -8,6 +8,7 @@ Run: ~/.claude-bridge-runtime/venv/bin/python -m pytest bridge/tests/test_lazy_s
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import sys
 import time
@@ -435,6 +436,161 @@ class TestBuildSessionsListNoSpawn:
             "result": {"decision": "accept"},
         }
 
+    def test_codex_approval_event_includes_environment_id(self):
+        """0.137 permission requests carry environment identity; bridge should expose it."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+        from backends.events import set_event_dispatcher
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            proc = MagicMock()
+            proc.stdin = _fake_stdin()
+            backend._proc = proc
+            session = MagicMock()
+            session.session_id = "s_codex"
+            session.current_request_id = "r_codex"
+            session.ws_ref = None
+            session.offline_buffer = []
+            backend._thread_to_session["thread_1"] = session
+            delivered: list[dict] = []
+
+            async def dispatcher(payload: dict, session_arg) -> bool:
+                delivered.append(payload)
+                assert session_arg is session
+                return True
+
+            set_event_dispatcher(dispatcher)
+            try:
+                await backend._dispatch({
+                    "id": 42,
+                    "method": "item/permissions/requestApproval",
+                    "params": {
+                        "threadId": "thread_1",
+                        "environmentId": "env_abc",
+                        "permission": {"name": "network"},
+                    },
+                })
+            finally:
+                set_event_dispatcher(None)
+
+            raw = proc.stdin.write.call_args.args[0].decode()
+            return json.loads(raw), delivered
+
+        response, delivered = asyncio.run(run())
+        assert response == {"id": 42, "result": {"decision": "accept"}}
+        assert any(e.get("type") == "tool_result" and "env_abc" in e.get("output", "") for e in delivered)
+
+    def test_codex_request_user_input_waits_for_frontend_response(self):
+        """Native Codex requestUserInput should become a pending bridge interaction."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+        from interactions import REGISTRY
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            proc = MagicMock()
+            proc.stdin = _fake_stdin()
+            backend._proc = proc
+            session = MagicMock()
+            session.session_id = "s_codex"
+            session.current_request_id = "r_codex"
+            session.ws_ref = None
+            session.offline_buffer = []
+            backend._thread_to_session["thread_1"] = session
+            broadcasts: list[dict] = []
+
+            async def broadcast(payload: dict) -> int:
+                broadcasts.append(payload)
+                return 1
+
+            backend._broadcast_fn = broadcast
+            await backend._dispatch({
+                "id": 77,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "thread_1",
+                    "itemId": "ask_1",
+                    "questions": [{
+                        "id": "choice",
+                        "question": "Pick one",
+                        "options": [{"id": "yes", "label": "Yes"}],
+                    }],
+                },
+            })
+            assert proc.stdin.write.call_args is None
+            request_id = broadcasts[-1]["request_id"]
+            item = await REGISTRY.resolve(
+                {"type": "user_input_response", "request_id": request_id, "answers": {"choice": "yes"}},
+                broadcast_json=broadcast,
+            )
+            await backend.handle_user_input_response(
+                session,
+                item,
+                {"request_id": request_id, "answers": {"choice": "yes"}},
+            )
+
+            raw = proc.stdin.write.call_args.args[0].decode()
+            return broadcasts, json.loads(raw)
+
+        broadcasts, response = asyncio.run(run())
+        assert broadcasts[0]["type"] == "user_input_request"
+        assert broadcasts[0]["tool_use_id"] == "ask_1"
+        assert response == {"id": 77, "result": {"answers": {"choice": "yes"}, "cancelled": False}}
+
+    def test_codex_server_tool_call_gets_safe_error(self):
+        """Hosted tool calls should be observable, then safely rejected until implemented."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+        from backends.events import set_event_dispatcher
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            proc = MagicMock()
+            proc.stdin = _fake_stdin()
+            backend._proc = proc
+            session = MagicMock()
+            session.session_id = "s_codex"
+            session.current_request_id = "r_codex"
+            session.ws_ref = None
+            session.offline_buffer = []
+            backend._thread_to_session["thread_1"] = session
+            delivered: list[dict] = []
+
+            async def dispatcher(payload: dict, session_arg) -> bool:
+                delivered.append(payload)
+                assert session_arg is session
+                return True
+
+            set_event_dispatcher(dispatcher)
+            try:
+                await backend._dispatch({
+                    "id": 99,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread_1",
+                        "tool": {"name": "web_search"},
+                        "input": {"q": "codex"},
+                    },
+                })
+            finally:
+                set_event_dispatcher(None)
+
+            raw = proc.stdin.write.call_args.args[0].decode()
+            return json.loads(raw), delivered
+
+        response, delivered = asyncio.run(run())
+        assert response["id"] == 99
+        assert response["error"]["code"] == -32000
+        assert "web_search" in response["error"]["message"]
+        assert any(e.get("type") == "tool_start" and e.get("name") == "web_search" for e in delivered)
+
     def test_codex_server_request_unknown_method_gets_error(self):
         """Unhandled ServerRequest frames should fail explicitly instead of being dropped."""
         import asyncio
@@ -450,7 +606,7 @@ class TestBuildSessionsListNoSpawn:
 
             await backend._dispatch({
                 "id": 99,
-                "method": "item/tool/call",
+                "method": "item/unknown/request",
                 "params": {"threadId": "thread_1"},
             })
 
@@ -460,7 +616,7 @@ class TestBuildSessionsListNoSpawn:
         response = asyncio.run(run())
         assert response["id"] == 99
         assert response["error"]["code"] == -32601
-        assert "item/tool/call" in response["error"]["message"]
+        assert "item/unknown/request" in response["error"]["message"]
 
     def test_codex_output_delta_sends_accumulated_tool_result(self):
         """Frontend replaces tool_result output, so Codex deltas must be accumulated first."""
@@ -588,6 +744,51 @@ class TestBuildSessionsListNoSpawn:
         assert "打包taildrop給我" in history["messages"][0]["content"]
         assert "我什麼都沒做" in history["messages"][0]["content"]
         assert "turn_aborted" not in history["messages"][0]["content"]
+
+    def test_codex_gzip_rollout_registers_and_loads_history(self, tmp_path):
+        """Codex 0.137 compressed rollout files should appear in native sessions/history."""
+        from backends.codex_appserver import CodexAppServerBackend
+
+        uid = _random_uuid()
+        day = tmp_path / "sessions" / "2026" / "06" / "04"
+        day.mkdir(parents=True)
+        path = day / f"rollout-2026-06-04T01-27-37-{uid}.jsonl.gz"
+        records = [
+            {
+                "timestamp": "2026-06-04T01:27:37.210Z",
+                "type": "session_meta",
+                "payload": {"id": uid, "cwd": "/tmp/codex137"},
+            },
+            {
+                "timestamp": "2026-06-04T01:27:38.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "檢查壓縮 rollout"}],
+                },
+            },
+            {
+                "timestamp": "2026-06-04T01:27:39.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "可以讀取"}],
+                },
+            },
+        ]
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write("\n".join(json.dumps(r) for r in records) + "\n")
+
+        backend = CodexAppServerBackend("codex")
+        backend._native_sessions_root = str(tmp_path / "sessions")
+
+        sessions = backend._load_native_codex_sessions(limit=10)
+        assert sessions[0]["resume_id"] == uid
+        assert sessions[0]["name"] == "檢查壓縮 rollout"
+        history = backend._load_native_session_history(uid, limit=10)
+        assert [m["content"] for m in history["messages"]] == ["檢查壓縮 rollout", "可以讀取"]
 
 
 # ---------------------------------------------------------------------------

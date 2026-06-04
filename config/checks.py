@@ -5,8 +5,10 @@ Each check returns a CheckResult named tuple.
 from __future__ import annotations
 
 import platform
+import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -214,6 +216,78 @@ def check_codex_sessions_exists() -> CheckResult:
     )
 
 
+def check_codex_plugins_json() -> CheckResult:
+    codex = shutil.which("codex")
+    if not codex:
+        return CheckResult(
+            name="Codex plugins",
+            ok=False,
+            message="codex binary not found; cannot inspect `codex plugin list --json`",
+            severity="warning",
+        )
+    try:
+        proc = subprocess.run(
+            [codex, "plugin", "list", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        return CheckResult(
+            name="Codex plugins",
+            ok=False,
+            message="`codex plugin list --json` timed out",
+            severity="warning",
+        )
+    except Exception as exc:
+        return CheckResult(
+            name="Codex plugins",
+            ok=False,
+            message=f"Could not run `codex plugin list --json`: {exc}",
+            severity="warning",
+        )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        suffix = f": {detail[0][:160]}" if detail else ""
+        return CheckResult(
+            name="Codex plugins",
+            ok=False,
+            message=f"`codex plugin list --json` failed{suffix}",
+            severity="warning",
+        )
+    try:
+        data = json.loads(proc.stdout or "null")
+    except Exception as exc:
+        return CheckResult(
+            name="Codex plugins",
+            ok=False,
+            message=f"`codex plugin list --json` returned invalid JSON: {exc}",
+            severity="warning",
+        )
+    if isinstance(data, list):
+        count = len(data)
+    elif isinstance(data, dict):
+        plugins = data.get("plugins") or data.get("items")
+        if isinstance(plugins, list):
+            count = len(plugins)
+        else:
+            installed = data.get("installed")
+            available = data.get("available")
+            count = (
+                (len(installed) if isinstance(installed, list) else 0)
+                + (len(available) if isinstance(available, list) else 0)
+            )
+    else:
+        count = 0
+    return CheckResult(
+        name="Codex plugins",
+        ok=True,
+        message=f"Codex plugin JSON diagnostics available ({count} plugins)",
+        severity="info",
+    )
+
+
 def check_runtime_dir_writable() -> CheckResult:
     runtime_dir = Path("~/.claude-bridge-runtime").expanduser()
     try:
@@ -280,6 +354,7 @@ ALL_CHECKS = [
     check_inotify_limit,
     check_claude_projects_exists,
     check_codex_sessions_exists,
+    check_codex_plugins_json,
     check_runtime_dir_writable,
     check_disk_space,
 ]

@@ -71,6 +71,57 @@ def _extract_ask_user_question(text: str) -> dict | None:
     return None
 
 
+def _request_thread_id(params: dict) -> str:
+    thread_id = params.get("threadId") or params.get("thread_id")
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
+    thread = params.get("thread")
+    if isinstance(thread, dict):
+        thread_id = thread.get("id")
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    return ""
+
+
+def _request_item_id(params: dict, fallback: str) -> str:
+    item = params.get("item")
+    if not isinstance(item, dict):
+        item = {}
+    value = (
+        params.get("itemId")
+        or params.get("callId")
+        or params.get("toolCallId")
+        or params.get("toolUseId")
+        or item.get("id")
+        or fallback
+    )
+    return str(value)
+
+
+def _request_tool_name(params: dict) -> str:
+    tool = params.get("tool")
+    if isinstance(tool, dict):
+        value = tool.get("name") or tool.get("type")
+        if value:
+            return str(value)
+    item = params.get("item")
+    if isinstance(item, dict):
+        value = item.get("name") or item.get("type")
+        if value:
+            return str(value)
+    return str(params.get("name") or params.get("toolName") or "codex_tool")
+
+
+def _response_answers(response: dict) -> dict:
+    answers = response.get("answers") if isinstance(response.get("answers"), dict) else {}
+    if answers:
+        return answers
+    return {
+        k: v for k, v in response.items()
+        if k not in {"type", "response_type", "request_id", "session_id", "cancelled", "canceled"}
+    }
+
+
 class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _CodexImageMixin):
     """Persistent Codex app-server backend — one process, per-session threads."""
 
@@ -360,16 +411,27 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
             "applyPatchApproval",
             "execCommandApproval",
         }
+        thread_id = _request_thread_id(params)
+        session = self._thread_to_session.get(thread_id) if thread_id else None
         if method in approval_methods:
+            await self._emit_approval_event(session, method, params)
             result = {"decision": "accept"}
         elif method == "item/tool/requestUserInput":
-            result = {"answers": []}
+            if session is None:
+                result = {"answers": []}
+            else:
+                await self._create_jsonrpc_user_input_request(request_id, session, params)
+                return
         elif method == "item/tool/call":
+            await self._emit_unsupported_tool_call(session, params)
             await self._rpc_plumber.write(self._proc, {
                 "id": request_id,
                 "error": {
-                    "code": -32601,
-                    "message": "item/tool/call is not implemented by claude-bridge",
+                    "code": -32000,
+                    "message": (
+                        f"Codex hosted tool '{_request_tool_name(params)}' is not "
+                        "implemented by claude-bridge"
+                    ),
                 },
             })
             return
@@ -382,6 +444,85 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
             return
 
         await self._rpc_plumber.write(self._proc, {"id": request_id, "result": result})
+
+    async def _emit_approval_event(self, session, method: str, params: dict) -> None:
+        environment_id = str(params.get("environmentId") or params.get("environment_id") or "")
+        item_id = _request_item_id(params, f"codex_approval_{uuid.uuid4().hex[:8]}")
+        command = params.get("command") or params.get("changes") or params.get("permission") or ""
+        if isinstance(command, (dict, list)):
+            command = json.dumps(command, ensure_ascii=False)
+        summary = {
+            "method": method,
+            "environmentId": environment_id,
+            "cwd": params.get("cwd") or params.get("workingDirectory") or "",
+        }
+        log.info("[codex-appserver] approval accepted: %s", summary)
+        if session is None:
+            return
+        try:
+            await send_event(session, _evt_tool_start(item_id, "codex_approval", str(command)))
+            await send_event(session, _evt_tool_result(item_id, json.dumps(summary, ensure_ascii=False)))
+            await send_event(session, _evt_tool_end(item_id))
+        except Exception:
+            pass
+
+    async def _emit_unsupported_tool_call(self, session, params: dict) -> None:
+        tool_name = _request_tool_name(params)
+        item_id = _request_item_id(params, f"codex_tool_{uuid.uuid4().hex[:8]}")
+        raw_input = params.get("input") or params.get("arguments") or params.get("args") or {}
+        command = json.dumps(raw_input, ensure_ascii=False) if isinstance(raw_input, (dict, list)) else str(raw_input)
+        log.warning("[codex-appserver] unsupported hosted tool call: %s", tool_name)
+        if session is None:
+            return
+        try:
+            await send_event(session, _evt_tool_start(item_id, tool_name, command))
+            await send_event(
+                session,
+                _evt_tool_result(item_id, f"Unsupported Codex hosted tool: {tool_name}"),
+            )
+            await send_event(session, _evt_tool_end(item_id))
+        except Exception:
+            pass
+
+    async def _create_jsonrpc_user_input_request(self, request_id, session: "Session", params: dict) -> None:
+        command = dict(params)
+        raw_questions = (
+            params.get("questions")
+            or params.get("input")
+            or params.get("prompt")
+            or params.get("message")
+            or params.get("question")
+            or params
+        )
+        if isinstance(raw_questions, dict):
+            question_command = raw_questions
+        elif isinstance(raw_questions, list):
+            question_command = {"questions": raw_questions}
+        else:
+            question_command = {"questions": [{"text": str(raw_questions or "Codex needs input.")}]}
+        questions = normalize_questions(question_command)
+        header = str(params.get("header") or params.get("title") or "Codex needs input")
+        tool_use_id = _request_item_id(params, str(request_id))
+
+        async def _resolve_jsonrpc(interaction, response: dict) -> None:
+            payload = {
+                "answers": _response_answers(response),
+                "cancelled": bool(response.get("cancelled") or response.get("canceled")),
+            }
+            await self._rpc_plumber.write(self._proc, {"id": request_id, "result": payload})
+
+        await INTERACTIONS.create(
+            session_id=session.session_id,
+            source="codex",
+            kind="request_user_input",
+            questions=questions,
+            header=header,
+            tool_use_id=tool_use_id,
+            requesting_agent=str(params.get("requestingAgent") or params.get("requesting_agent") or "Codex"),
+            raw_command={**command, "codex_jsonrpc_request_id": request_id},
+            resolve_callback=_resolve_jsonrpc,
+            broadcast_json=self._broadcast_fn,
+        )
 
     # ------------------------------------------------------------------ Backend API
 
@@ -488,6 +629,9 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         asyncio.create_task(self._run_turn(session, state, user_input))
 
     async def handle_user_input_response(self, session: "Session", interaction, response: dict) -> None:
+        raw_command = getattr(interaction, "raw_command", None)
+        if isinstance(raw_command, dict) and raw_command.get("codex_jsonrpc_request_id") is not None:
+            return
         answers = response.get("answers") if isinstance(response.get("answers"), dict) else {}
         if not answers:
             answers = {

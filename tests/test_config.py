@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "bridge"))
 from bridge.config.loader import load_config, _apply_env_overrides, _deep_merge
 from bridge.config.schema import BridgeConfig
 from bridge.config import get_config
+from bridge.config.checks import check_codex_plugins_json
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,57 @@ def test_double_underscore_env_parses_nested(tmp_path):
         with mock.patch.dict(os.environ, {"BRIDGE_SEARCH__ENABLED": "false"}, clear=False):
             cfg = load_config()
     assert cfg.search.enabled is False
+
+
+def test_codex_plugin_json_check_counts_plugins(monkeypatch):
+    """doctor should surface Codex 0.137 `plugin list --json` diagnostics."""
+    from subprocess import CompletedProcess
+
+    monkeypatch.setattr("bridge.config.checks.shutil.which", lambda name: "/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(
+        "bridge.config.checks.subprocess.run",
+        lambda *args, **kwargs: CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout='{"plugins":[{"name":"Browser"},{"name":"Slack"}]}',
+            stderr="",
+        ),
+    )
+
+    result = check_codex_plugins_json()
+
+    assert result.ok is True
+    assert "2 plugins" in result.message
+
+
+def test_codex_plugin_json_check_counts_codex_137_shape(monkeypatch):
+    """Codex 0.137 emits installed/available plugin arrays."""
+    from subprocess import CompletedProcess
+
+    monkeypatch.setattr("bridge.config.checks.shutil.which", lambda name: "/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(
+        "bridge.config.checks.subprocess.run",
+        lambda *args, **kwargs: CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout='{"installed":[{"name":"browser"},{"name":"github"}],"available":[{"name":"foo"}]}',
+            stderr="",
+        ),
+    )
+
+    result = check_codex_plugins_json()
+
+    assert result.ok is True
+    assert "3 plugins" in result.message
+
+
+def test_codex_plugin_json_check_warns_when_missing(monkeypatch):
+    monkeypatch.setattr("bridge.config.checks.shutil.which", lambda name: None)
+
+    result = check_codex_plugins_json()
+
+    assert result.ok is False
+    assert result.severity == "warning"
 
 
 def test_double_underscore_env_parses_nested_path(tmp_path):

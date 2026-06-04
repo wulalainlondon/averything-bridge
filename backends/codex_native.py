@@ -8,6 +8,7 @@ and bootstrap-noise filtering.
 """
 
 import datetime
+import gzip
 import json
 import logging
 import os
@@ -34,6 +35,27 @@ _CODEX_WRAPPER_CLOSED_RE = re.compile(
 )
 
 
+def _is_codex_rollout_file(filename: str) -> bool:
+    return filename.startswith("rollout-") and (
+        filename.endswith(".jsonl") or filename.endswith(".jsonl.gz")
+    )
+
+
+def _codex_rollout_uid(filename: str) -> str:
+    stem = filename
+    if stem.endswith(".gz"):
+        stem = stem[:-3]
+    if stem.endswith(".jsonl"):
+        stem = stem[:-6]
+    return stem[-36:]
+
+
+def _open_codex_rollout_text(path: str):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
+    return open(path, "r", encoding="utf-8", errors="ignore")
+
+
 class _CodexNativeSessionMixin:
     def _get_session_path_index(self) -> dict[str, str]:
         now = time.time()
@@ -43,8 +65,8 @@ class _CodexNativeSessionMixin:
         if os.path.isdir(self._native_sessions_root):
             for root, _dirs, files in os.walk(self._native_sessions_root):
                 for fn in files:
-                    if fn.endswith(".jsonl"):
-                        uid = fn[:-6][-36:]
+                    if fn.endswith(".jsonl") or fn.endswith(".jsonl.gz"):
+                        uid = _codex_rollout_uid(fn)
                         index[uid] = os.path.join(root, fn)
         self._session_path_index = index
         self._session_path_index_time = now
@@ -130,9 +152,9 @@ class _CodexNativeSessionMixin:
             rollout_candidates: list[tuple[str, str, str]] = []
             for root, _dirs, files in os.walk(self._native_sessions_root):
                 for fn in files:
-                    if not (fn.startswith("rollout-") and fn.endswith(".jsonl")):
+                    if not _is_codex_rollout_file(fn):
                         continue
-                    uid = fn[:-6][-36:]  # last 36 chars of stem = UUID
+                    uid = _codex_rollout_uid(fn)
                     if uid in seen_ids:
                         continue
                     rollout_candidates.append((uid, os.path.join(root, fn), fn))
@@ -178,7 +200,7 @@ class _CodexNativeSessionMixin:
                     cwd = os.path.expanduser("~")
                     name = uid[:8]
                     try:
-                        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                        with _open_codex_rollout_text(filepath) as f:
                             for raw in f:
                                 raw = raw.strip()
                                 if not raw:
@@ -196,6 +218,11 @@ class _CodexNativeSessionMixin:
                                     if isinstance(msg, str) and msg.strip():
                                         name = msg.strip()
                                     break
+                                elif t == "response_item" and isinstance(p, dict) and p.get("role") == "user":
+                                    msg = self._extract_text_from_content(p.get("content"))
+                                    if msg and not self._is_codex_bootstrap_text(msg):
+                                        name = msg
+                                        break
                     except Exception:
                         pass
                 if file_key is not None:
@@ -282,11 +309,30 @@ class _CodexNativeSessionMixin:
                 blocks=[{"type": "text", "text": text}],
             )
         try:
-            index = load_indexed_jsonl_messages(cache_name=f"codex:{resume_id}", path=path, parse_line=parse)
+            if path.endswith(".gz"):
+                messages: list[dict] = []
+                offset = 0
+                with _open_codex_rollout_text(path) as f:
+                    for line_no, raw in enumerate(f, start=1):
+                        start_offset = offset
+                        offset += len(raw.encode("utf-8", errors="ignore"))
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        msg = parse(row, line_no, start_offset)
+                        if msg:
+                            messages.append(msg)
+            else:
+                index = load_indexed_jsonl_messages(cache_name=f"codex:{resume_id}", path=path, parse_line=parse)
+                messages = index.messages
         except Exception:
             return []
         return slice_history(
-            index.messages,
+            messages,
             limit=clamp_history_limit(limit),
             known_last_source_message_id=known_last_source_message_id,
             mode=mode,
