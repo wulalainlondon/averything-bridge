@@ -68,6 +68,13 @@ _SKIP_DIRS = frozenset({
 _SKIP_PREFIXES = (".", "~")
 
 _MAX_ENTRIES = 500
+_MAX_PREVIEW_FILE_BYTES = 256 * 1024
+_PREVIEW_TEXT_EXTS = frozenset({
+    ".c", ".cc", ".cpp", ".css", ".go", ".h", ".hpp", ".html", ".java",
+    ".js", ".json", ".jsx", ".kt", ".log", ".md", ".py", ".rb", ".rs",
+    ".sh", ".sql", ".swift", ".toml", ".ts", ".tsx", ".txt", ".xml",
+    ".yaml", ".yml",
+})
 
 
 def _list_entries_cached(path: str) -> list[dict]:
@@ -221,6 +228,64 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
             await ws.send(_build([] if unchanged else entries, merged))
         except Exception as exc:
             log.warning("browse_dir: WS send (stage 2) failed: %s", exc)
+        return True
+
+    if mtype == "open_file":
+        req_path = msg.get("path") or ""
+        root_dir = ctx.get("root_dir", "")
+        try:
+            path = resolve_jailed(req_path, root_dir)
+        except JailEscape as e:
+            try:
+                await ws.send(json.dumps({
+                    "type": "file_opened",
+                    "path": req_path,
+                    "name": os.path.basename(req_path),
+                    "content": "",
+                    "size": 0,
+                    "mime_type": "text/plain",
+                    "error": f"Path outside instance root: {req_path}",
+                }))
+            except Exception:
+                pass
+            log.warning("[jail] open_file escape: req=%r resolved=%r root=%r", e.req_path, e.resolved, e.root_dir)
+            return True
+
+        name = os.path.basename(path)
+
+        def _payload(content: str = "", size: int = 0, mime_type: str = "text/plain", error: str = "") -> str:
+            data = {
+                "type": "file_opened",
+                "path": path,
+                "name": name,
+                "content": content,
+                "size": size,
+                "mime_type": mime_type,
+            }
+            if error:
+                data["error"] = error
+            return json.dumps(data)
+
+        try:
+            stat = os.stat(path)
+            if os.path.isdir(path):
+                await ws.send(_payload(error="path is a directory"))
+                return True
+            if stat.st_size > _MAX_PREVIEW_FILE_BYTES:
+                await ws.send(_payload(size=stat.st_size, error="file is too large to preview"))
+                return True
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in _PREVIEW_TEXT_EXTS:
+                await ws.send(_payload(size=stat.st_size, mime_type="application/octet-stream", error="preview supports text files only"))
+                return True
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            await ws.send(_payload(content=content, size=stat.st_size, mime_type="text/plain; charset=utf-8"))
+        except Exception as exc:
+            try:
+                await ws.send(_payload(error=str(exc)))
+            except Exception:
+                pass
         return True
 
     if mtype == "fcm_token":
