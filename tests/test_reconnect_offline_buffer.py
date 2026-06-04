@@ -90,6 +90,47 @@ def test_replay_offline_buffers_restores_unsent_tail_on_send_failure():
     assert s2_buf == [{"type": "done", "session_id": "s2"}]
 
 
+def test_replay_offline_buffers_batches_one_session_without_live_interleaving():
+    import client_manager
+    import offline_replay
+
+    class InterleavingWs(_Ws):
+        def __init__(self) -> None:
+            super().__init__()
+            self.live_task = None
+
+        async def send(self, raw: str) -> None:
+            await super().send(raw)
+            if self._send_count == 1:
+                self.live_task = asyncio.create_task(
+                    client_manager.send_text(
+                        self,
+                        json.dumps({"type": "text_chunk", "session_id": "s1", "content": "live"}),
+                    )
+                )
+                await asyncio.sleep(0)
+
+    async def run():
+        s1 = _session("s1")
+        s1.offline_buffer = [
+            {"type": "text_chunk", "session_id": "s1", "content": "old-1"},
+            {"type": "text_chunk", "session_id": "s1", "content": "old-2"},
+        ]
+        ws = InterleavingWs()
+
+        replayed = await offline_replay.replay_offline_buffers(ws, [s1])
+        if ws.live_task is not None:
+            await ws.live_task
+        contents = [evt["content"] for evt in ws.sent]
+        client_manager.remove(ws)
+        return replayed, contents
+
+    replayed, contents = asyncio.run(run())
+
+    assert replayed == 2
+    assert contents == ["old-1", "old-2", "live"]
+
+
 def test_dispatch_event_returns_false_when_all_registered_clients_are_dead(monkeypatch):
     import client_manager
     import bridge_v2 as bv2
@@ -120,7 +161,7 @@ def test_dispatch_event_returns_false_when_all_registered_clients_are_dead(monke
 def test_send_event_buffers_when_only_stale_clients_exist(monkeypatch):
     import client_manager
     import bridge_v2 as bv2
-    from backends.events import send_event, set_event_dispatcher
+    from backends.events import flush_session_events, send_event, set_event_dispatcher
 
     async def run():
         client_manager.CLIENTS.clear()
@@ -138,6 +179,7 @@ def test_send_event_buffers_when_only_stale_clients_exist(monkeypatch):
         set_event_dispatcher(bv2._dispatch_event)
         try:
             await send_event(session, {"type": "text_chunk", "content": "buffer me"})
+            await flush_session_events(session)
         finally:
             set_event_dispatcher(None)
         return session.offline_buffer, dict(client_manager.CLIENTS)

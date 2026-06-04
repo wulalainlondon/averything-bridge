@@ -30,6 +30,8 @@ class ClientConn:
 CLIENTS: dict[Any, ClientConn] = {}
 _LATEST_BY_DEVICE: dict[str, Any] = {}
 _DEVICE_GENERATIONS: dict[str, int] = {}
+_WS_SEND_LOCKS: dict[Any, asyncio.Lock] = {}
+_WS_SEND_TIMEOUT_SECS = 2.0
 
 
 def mark_latest(ws: Any, device_id: str) -> int:
@@ -56,6 +58,7 @@ def remove(ws: Any) -> ClientConn | None:
     # Also drop any broadcast fail-counter so the dict can't accumulate orphan
     # keys for clients that disconnect normally before hitting the eviction limit.
     _BROADCAST_FAIL_COUNTS.pop(ws, None)
+    _WS_SEND_LOCKS.pop(ws, None)
     client = CLIENTS.pop(ws, None)
     if client is not None and _LATEST_BY_DEVICE.get(client.device_id) is ws:
         _LATEST_BY_DEVICE.pop(client.device_id, None)
@@ -129,27 +132,116 @@ def _is_closed_send_error(exc: Exception) -> bool:
     return "closed" in str(exc).lower()
 
 
+def unwrap_ws(ws: Any) -> Any:
+    return getattr(ws, "_bridge_ws", ws)
+
+
+def _send_lock(ws: Any) -> asyncio.Lock:
+    ws = unwrap_ws(ws)
+    lock = _WS_SEND_LOCKS.get(ws)
+    if lock is None:
+        lock = asyncio.Lock()
+        _WS_SEND_LOCKS[ws] = lock
+    return lock
+
+
+async def _send_raw(ws: Any, client: ClientConn | None, raw: str) -> "str":
+    """Return 'ok', 'closed', or 'error' after a serialized bounded send."""
+    ws = unwrap_ws(ws)
+    if client is None:
+        client = CLIENTS.get(ws)
+
+    async def _locked_send() -> None:
+        async with _send_lock(ws):
+            await ws.send(raw)
+
+    try:
+        await asyncio.wait_for(_locked_send(), timeout=_WS_SEND_TIMEOUT_SECS)
+        if client is not None:
+            client.last_seen = time.time()
+        return "ok"
+    except asyncio.TimeoutError:
+        log.warning(
+            "ws send timeout for client %s after %.1fs",
+            client.client_id if client is not None else "<unregistered>",
+            _WS_SEND_TIMEOUT_SECS,
+        )
+        return "closed"
+    except _WsConnectionClosed:
+        return "closed"
+    except Exception as exc:
+        if _is_closed_send_error(exc):
+            return "closed"
+        log.debug(
+            "ws send transient error for %s: %s",
+            client.client_id if client is not None else "<unregistered>",
+            exc,
+        )
+        return "error"
+
+
+async def send_text(ws: Any, raw: str, client: ClientConn | None = None) -> bool:
+    """Send one frame through the shared per-ws lock and timeout."""
+    real_ws = unwrap_ws(ws)
+    client = client or CLIENTS.get(real_ws) or getattr(ws, "_bridge_client", None)
+    result = await _send_raw(real_ws, client, raw)
+    if result == "ok":
+        return True
+    if result == "closed" and client is not None:
+        remove(real_ws)
+    return False
+
+
+async def send_json(ws: Any, payload: dict, client: ClientConn | None = None) -> bool:
+    return await send_text(ws, json.dumps(payload), client)
+
+
+async def send_text_batch(ws: Any, raws: list[str], client: ClientConn | None = None) -> int:
+    """Send a batch atomically with respect to other sends on the same websocket.
+
+    Returns the number of frames successfully sent before a closed/failed socket.
+    Each frame is individually bounded by the normal send timeout while the batch
+    holds the per-ws lock, so replayed ordered frames cannot be interleaved by a
+    live session drain task.
+    """
+    real_ws = unwrap_ws(ws)
+    client = client or CLIENTS.get(real_ws) or getattr(ws, "_bridge_client", None)
+    sent = 0
+    try:
+        async with _send_lock(real_ws):
+            for raw in raws:
+                await asyncio.wait_for(real_ws.send(raw), timeout=_WS_SEND_TIMEOUT_SECS)
+                sent += 1
+        if client is not None:
+            client.last_seen = time.time()
+        return sent
+    except asyncio.TimeoutError:
+        log.warning(
+            "ws batch send timeout for client %s after %.1fs",
+            client.client_id if client is not None else "<unregistered>",
+            _WS_SEND_TIMEOUT_SECS,
+        )
+    except _WsConnectionClosed:
+        pass
+    except Exception as exc:
+        if not _is_closed_send_error(exc):
+            log.debug(
+                "ws batch send error for %s: %s",
+                client.client_id if client is not None else "<unregistered>",
+                exc,
+            )
+    if client is not None:
+        remove(real_ws)
+    return sent
+
+
 async def broadcast_json(payload: dict) -> int:
     raw = json.dumps(payload)
     clients = list(CLIENTS.items())
     if not clients:
         return 0
 
-    async def _send_one(ws: Any, client: ClientConn) -> "str":
-        """Return 'ok', 'closed', or 'error'."""
-        try:
-            await ws.send(raw)
-            client.last_seen = time.time()
-            return "ok"
-        except _WsConnectionClosed:
-            return "closed"
-        except Exception as exc:
-            if _is_closed_send_error(exc):
-                return "closed"
-            log.debug("broadcast_json transient error for %s: %s", client.client_id, exc)
-            return "error"
-
-    results = await asyncio.gather(*[_send_one(ws, c) for ws, c in clients], return_exceptions=True)
+    results = await asyncio.gather(*[_send_raw(ws, c, raw) for ws, c in clients], return_exceptions=True)
     delivered = 0
     to_remove: list[Any] = []
 
@@ -174,7 +266,7 @@ async def broadcast_json(payload: dict) -> int:
                 _BROADCAST_FAIL_COUNTS.pop(ws, None)
 
     for ws in to_remove:
-        CLIENTS.pop(ws, None)
+        remove(ws)
 
     return delivered
 
@@ -184,15 +276,13 @@ async def send_unread_for_session(session: Any, unread_for: Callable[[Any, str],
     for ws, client in list(CLIENTS.items()):
         unread = unread_for(session, client.device_id)
         payload = {"type": "session_unread", "session_id": session.session_id, "unread": unread}
-        try:
-            await ws.send(json.dumps(payload))
-        except _WsConnectionClosed:
+        result = await _send_raw(ws, client, json.dumps(payload))
+        if result == "ok":
+            continue
+        if result == "closed":
             dead.append(ws)
-        except Exception as exc:
-            if _is_closed_send_error(exc):
-                dead.append(ws)
-                continue
-            log.debug("send_unread_for_session transient error for %s: %s", client.client_id, exc)
+            continue
+        log.debug("send_unread_for_session transient error for %s", client.client_id)
     for ws in dead:
         remove(ws)
 
@@ -214,17 +304,15 @@ async def send_unread_snapshot(
         if len(items) < batch_size:
             continue
         payload = {"type": "session_unread_snapshot", "items": items}
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
+        if await _send_raw(ws, client, json.dumps(payload)) != "ok":
+            remove(ws)
             return
         items = []
     if not items:
         return
     payload = {"type": "session_unread_snapshot", "items": items}
-    try:
-        await ws.send(json.dumps(payload))
-    except Exception:
+    if await _send_raw(ws, client, json.dumps(payload)) != "ok":
+        remove(ws)
         return
 
 
@@ -235,7 +323,6 @@ async def send_unread_for_client_session(
     unread_for: Callable[[Any, str], int],
 ) -> None:
     payload = {"type": "session_unread", "session_id": session.session_id, "unread": unread_for(session, client.device_id)}
-    try:
-        await ws.send(json.dumps(payload))
-    except Exception:
+    if await _send_raw(ws, client, json.dumps(payload)) != "ok":
+        remove(ws)
         pass

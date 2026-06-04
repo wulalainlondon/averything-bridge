@@ -6,17 +6,18 @@ remain independently testable without spinning up the full bridge.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import secrets
 import sys
+import contextlib
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
 
 OFFLINE_BUFFER_MAX = 10000
+EVENT_QUEUE_MAX = 10000
 
 # Per-BOOT generation id. Stamped on every session event (and hello_ack) so the
 # client can tell a post-restart seq=1 apart from a stale/duplicate pre-restart
@@ -285,6 +286,115 @@ def _msg_agent_tree(session_id: str, tree_data: dict) -> dict:
 # send_event — route session-scoped events; buffer when client is offline
 # ---------------------------------------------------------------------------
 
+def _append_offline(session: "Session", payload: dict) -> None:
+    if len(session.offline_buffer) >= OFFLINE_BUFFER_MAX:
+        if payload.get("type") == "text_chunk":
+            # Merge into the most recent text_chunk rather than dropping either event.
+            for i in range(len(session.offline_buffer) - 1, -1, -1):
+                last = session.offline_buffer[i]
+                if last.get("type") == "text_chunk":
+                    session.offline_buffer[i] = {
+                        **last,
+                        "content": last["content"] + payload["content"],
+                    }
+                    return
+        # No mergeable event; drop the oldest to stay under the cap.
+        session.offline_buffer.pop(0)
+    session.offline_buffer.append(payload)
+
+
+def _event_queue(session: "Session") -> asyncio.Queue:
+    queue = getattr(session, "_event_queue", None)
+    if not isinstance(queue, asyncio.Queue):
+        queue = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)
+        setattr(session, "_event_queue", queue)
+    return queue
+
+
+def _enqueue_payload(session: "Session", payload: dict) -> None:
+    queue = _event_queue(session)
+    try:
+        queue.put_nowait(payload)
+        return
+    except asyncio.QueueFull:
+        pass
+
+    if payload.get("type") == "text_chunk":
+        # asyncio.Queue intentionally hides its deque, but inspecting it here
+        # keeps send_event non-blocking while preserving bursty text chunks.
+        pending = getattr(queue, "_queue", None)
+        if pending is not None:
+            for i in range(len(pending) - 1, -1, -1):
+                item = pending[i]
+                if item.get("type") == "text_chunk":
+                    pending[i] = {**item, "content": item["content"] + payload["content"]}
+                    return
+
+    try:
+        queue.get_nowait()
+        queue.task_done()
+    except asyncio.QueueEmpty:
+        pass
+    try:
+        queue.put_nowait(payload)
+    except asyncio.QueueFull:
+        _append_offline(session, payload)
+
+
+async def _drain_session_events(session: "Session") -> None:
+    queue = _event_queue(session)
+    try:
+        while True:
+            payload = await queue.get()
+            try:
+                delivered = False
+                if _EVENT_DISPATCHER is not None:
+                    try:
+                        delivered = await _EVENT_DISPATCHER(payload, session)
+                    except Exception:
+                        delivered = False
+                if not delivered:
+                    _append_offline(session, payload)
+            finally:
+                queue.task_done()
+    except asyncio.CancelledError:
+        pending = getattr(queue, "_queue", None)
+        if pending is not None:
+            while pending:
+                _append_offline(session, pending.popleft())
+        raise
+
+
+def _ensure_session_drain(session: "Session") -> None:
+    task = getattr(session, "_event_drain_task", None)
+    if isinstance(task, asyncio.Task) and not task.done():
+        return
+    try:
+        task = asyncio.create_task(_drain_session_events(session))
+    except RuntimeError:
+        # No running loop. This should only happen in unusual tests/import paths;
+        # callers will enqueue again once the bridge is running.
+        return
+    setattr(session, "_event_drain_task", task)
+
+
+async def stop_session_drain(session: "Session") -> None:
+    task = getattr(session, "_event_drain_task", None)
+    if not isinstance(task, asyncio.Task):
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    setattr(session, "_event_drain_task", None)
+
+
+async def flush_session_events(session: "Session") -> None:
+    queue = getattr(session, "_event_queue", None)
+    if not isinstance(queue, asyncio.Queue):
+        return
+    await queue.join()
+
+
 async def send_event(session: "Session", event: dict) -> None:
     payload = {**event, "session_id": session.session_id}
     if session.current_request_id and "request_id" not in payload and event.get("type") in {
@@ -301,31 +411,11 @@ async def send_event(session: "Session", event: dict) -> None:
     session._event_seq += 1
     payload["seq"] = session._event_seq
     payload["gen"] = _GENERATION
-    if _EVENT_DISPATCHER is not None:
-        try:
-            delivered = await _EVENT_DISPATCHER(payload, session)
-            if delivered:
-                return
-        except Exception:
-            pass
-    if session.ws_ref is not None:
-        try:
-            async with session._ws_send_lock:
-                await session.ws_ref.send(json.dumps(payload))
-            return
-        except Exception:
-            session.ws_ref = None
-    if len(session.offline_buffer) >= OFFLINE_BUFFER_MAX:
-        if payload.get("type") == "text_chunk":
-            # Merge into the most recent text_chunk rather than dropping either event
-            for i in range(len(session.offline_buffer) - 1, -1, -1):
-                last = session.offline_buffer[i]
-                if last.get("type") == "text_chunk":
-                    session.offline_buffer[i] = {**last, "content": last["content"] + payload["content"]}
-                    return
-        # No mergeable event; drop the oldest to stay under the cap
-        session.offline_buffer.pop(0)
-    session.offline_buffer.append(payload)
+    if _EVENT_DISPATCHER is None and session.ws_ref is None:
+        _append_offline(session, payload)
+        return
+    _enqueue_payload(session, payload)
+    _ensure_session_drain(session)
 
 
 def set_event_dispatcher(dispatcher: Callable[[dict, "Session"], Awaitable[bool]] | None) -> None:

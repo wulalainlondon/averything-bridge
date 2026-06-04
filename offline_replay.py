@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
+import client_manager
+
 
 async def replay_offline_buffers(ws: Any, sessions: Iterable[Any]) -> int:
     """Replay buffered session events to a reconnecting client.
@@ -15,9 +17,8 @@ async def replay_offline_buffers(ws: Any, sessions: Iterable[Any]) -> int:
     If the socket fails mid-replay, the unsent portion of the snapshot is
     re-prepended so the next reconnect sees them.
 
-    All sends are serialised under session._ws_send_lock so that live events
-    emitted concurrently (e.g. from an ongoing Claude stream) cannot interleave
-    with the replayed frames and corrupt text_chunk ordering.
+    Each session snapshot is sent as one per-ws locked batch so live session
+    drain tasks cannot interleave between replayed frames.
     """
     replayed = 0
     for session in list(sessions):
@@ -25,19 +26,17 @@ async def replay_offline_buffers(ws: Any, sessions: Iterable[Any]) -> int:
             continue
         # Snapshot without clearing — other producers may still append.
         snapshot = session.offline_buffer[:]
-        sent_count = 0
-        async with session._ws_send_lock:
-            for idx, evt in enumerate(snapshot):
-                try:
-                    await ws.send(json.dumps(evt))
-                    sent_count += 1
-                    replayed += 1
-                except Exception:
-                    # Remove only the events we already sent from the live buffer.
-                    # The remaining front already starts with the unsent tail of
-                    # the snapshot, followed by any events appended during replay.
-                    del session.offline_buffer[:sent_count]
-                    return replayed
+        sent_count = await client_manager.send_text_batch(
+            ws,
+            [json.dumps(evt) for evt in snapshot],
+        )
+        replayed += sent_count
+        if sent_count < len(snapshot):
+            # Remove only the events we already sent from the live buffer.
+            # The remaining front already starts with the unsent tail of
+            # the snapshot, followed by any events appended during replay.
+            del session.offline_buffer[:sent_count]
+            return replayed
         # All snapshot events sent successfully.  Remove exactly those entries
         # from the front of the live buffer (new appends stay intact).
         del session.offline_buffer[:sent_count]
