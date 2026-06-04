@@ -1,6 +1,7 @@
 """WebSocket message routing entrypoint."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from dataclasses import dataclass
@@ -18,13 +19,64 @@ from handlers.instance_ops import handle_instance_msg
 from prompt_routes import handle_prompt_message
 from route_utils import safe_send_json as _safe_send_json
 from session_routes import handle_session_message
+import client_manager
+
+
+
+_RECENT_HEAVY_REQUESTS: dict[tuple, float] = {}
+
+
+def _throttle(key: tuple, interval: float) -> bool:
+    now = time.time()
+    last = _RECENT_HEAVY_REQUESTS.get(key, 0.0)
+    if now - last < interval:
+        return True
+    _RECENT_HEAVY_REQUESTS[key] = now
+    if len(_RECENT_HEAVY_REQUESTS) > 2048:
+        cutoff = now - 120.0
+        for old_key, ts in list(_RECENT_HEAVY_REQUESTS.items()):
+            if ts < cutoff:
+                _RECENT_HEAVY_REQUESTS.pop(old_key, None)
+    return False
+
+
+def _spawn_client_task(ctx: "RouterContext", client: Any, name: str, coro: Coroutine[Any, Any, Any]) -> Any:
+    try:
+        return ctx.spawn_task(name, coro, owner=getattr(client, "client_id", ""))
+    except TypeError:
+        return ctx.spawn_task(name, coro)
+
+
+class _CurrentClientWs:
+    def __init__(self, ws: Any, client: Any):
+        self._ws = ws
+        self._client = client
+        self._enforce_current = ws in client_manager.CLIENTS
+
+    async def send(self, payload: str) -> Any:
+        if self._enforce_current and not client_manager.is_current(self._ws, self._client):
+            raise asyncio.CancelledError("stale client websocket")
+        return await self._ws.send(payload)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ws, name)
+
+
+def _current_ws(ws: Any, client: Any) -> _CurrentClientWs:
+    return _CurrentClientWs(ws, client)
+
+def _is_current_if_registered(ws: Any, client: Any) -> bool:
+    if ws not in client_manager.CLIENTS:
+        return True
+    return client_manager.is_current(ws, client)
+
 
 
 SendAllSessions = Callable[[Any], Awaitable[None]]
 BroadcastJson = Callable[[dict], Awaitable[int]]
 BuildSessionsList = Callable[[], dict]
 PersistSessionMeta = Callable[[], None]
-SpawnTask = Callable[[str, Coroutine[Any, Any, Any]], Any]
+SpawnTask = Callable[..., Any]
 SendUnreadSnapshot = Callable[[Any, Any], Awaitable[None]]
 SendUnreadForClientSession = Callable[[Any, Any, Any], Awaitable[None]]
 MarkRead = Callable[[str, str, int], None]
@@ -132,9 +184,11 @@ async def handle_low_coupling_message(
             "root_dir": ctx.root_dir,
             "data_dir": ctx.data_dir,
         })
-        ctx.spawn_task(
+        _spawn_client_task(
+            ctx,
+            client,
             f"unread-snapshot:hello:{client.client_id}",
-            ctx.send_unread_snapshot(ws, client),
+            ctx.send_unread_snapshot(_current_ws(ws, client), client),
         )
         return True
 
@@ -189,23 +243,28 @@ async def handle_low_coupling_message(
             and _known_last_id == session.latest_source_line
         ):
             async def _fast_delta() -> None:
-                await _safe_send_json(ws, {
+                if not _is_current_if_registered(ws, client):
+                    return
+                await _safe_send_json(_current_ws(ws, client), {
                     "type": "history_delta",
                     "session_id": sid,
                     "after_source_message_id": _known_last_id,
                     "messages": [],
                     "source_count": 0,
                 })
-            ctx.spawn_task(f"request-history-fast:{sid}", _fast_delta())
+            _spawn_client_task(ctx, client, f"request-history-fast:{sid}", _fast_delta())
             return True
 
         async def _load_and_send() -> None:
+            if not _is_current_if_registered(ws, client):
+                return
+            guarded_ws = _current_ws(ws, client)
             if session.resume_id:
                 await ctx.emit_resume_progress(session, "resume_started", 5, "Resume started")
                 await ctx.emit_resume_progress(session, "resume_loading_history", 35, "Loading history")
                 try:
                     await ctx.send_session_history_response(
-                        ws,
+                        guarded_ws,
                         session,
                         limit=_limit,
                         known_last_source_message_id=_known_last_id,
@@ -215,7 +274,7 @@ async def handle_low_coupling_message(
                 except Exception as exc:
                     ctx.log_warning("history response error sid=%s: %s", sid, exc)
                     await _safe_send_json(
-                        ws,
+                        guarded_ws,
                         ctx.msg_session_history(
                             sid,
                             [],
@@ -228,7 +287,7 @@ async def handle_low_coupling_message(
                 await ctx.emit_resume_progress(session, "resume_ready", 100, "Resume ready")
             else:
                 await _safe_send_json(
-                    ws,
+                    guarded_ws,
                     ctx.msg_session_history(
                         session.session_id,
                         [],
@@ -242,7 +301,10 @@ async def handle_low_coupling_message(
         # to the next message instead of waiting for the JSONL parse to finish.
         # Multiple request_history messages (e.g. 40+ on reconnect) now run in
         # parallel via the thread pool executor rather than serially.
-        ctx.spawn_task(f"request-history:{sid}", _load_and_send())
+        throttle_key = ("request_history", client.device_id, sid, _mode, _before_id or _known_last_id)
+        if _throttle(throttle_key, 1.0):
+            return True
+        _spawn_client_task(ctx, client, f"request-history:{sid}", _load_and_send())
         return True
 
     if mtype == "set_session_meta":
@@ -267,7 +329,7 @@ async def handle_low_coupling_message(
         path = msg.get("path", "")
         ctx.spawn_task(
             f"push-file:{client.device_id}",
-            ctx.handle_push_file(ws, path, client.device_id),
+            ctx.handle_push_file(_current_ws(ws, client), path, client.device_id),
         )
         return True
 
@@ -282,7 +344,7 @@ async def handle_low_coupling_message(
     if mtype == "get_all_sessions":
         ctx.spawn_task(
             f"send-all-sessions:{client.client_id}",
-            ctx.send_all_sessions(ws),
+            ctx.send_all_sessions(_current_ws(ws, client)),
         )
         return True
 
@@ -290,7 +352,7 @@ async def handle_low_coupling_message(
         ctx.spawn_task(
             f"feed-push:{client.device_id}",
             handle_feed_push(
-                ws,
+                _current_ws(ws, client),
                 title=msg["title"],
                 html=msg["html"],
                 source=str(msg.get("source") or "pipeline"),
@@ -302,30 +364,34 @@ async def handle_low_coupling_message(
         return True
 
     if mtype == "feed_list_request":
-        ctx.spawn_task(
+        if _throttle(("feed_list", client.device_id), 3.0):
+            return True
+        _spawn_client_task(
+            ctx,
+            client,
             f"feed-list:{client.device_id}",
-            handle_feed_list_request(ws),
+            handle_feed_list_request(_current_ws(ws, client)),
         )
         return True
 
     if mtype == "feed_fetch":
         ctx.spawn_task(
             f"feed-fetch:{msg['feed_id']}",
-            handle_feed_fetch(ws, feed_id=msg["feed_id"]),
+            handle_feed_fetch(_current_ws(ws, client), feed_id=msg["feed_id"]),
         )
         return True
 
     if mtype == "feed_mark_read":
         ctx.spawn_task(
             f"feed-mark-read:{msg['feed_id']}",
-            handle_feed_mark_read(ws, feed_id=msg["feed_id"]),
+            handle_feed_mark_read(_current_ws(ws, client), feed_id=msg["feed_id"]),
         )
         return True
 
     if mtype == "feed_delete":
         ctx.spawn_task(
             f"feed-delete:{msg['feed_id']}",
-            handle_feed_delete(ws, feed_id=msg["feed_id"]),
+            handle_feed_delete(_current_ws(ws, client), feed_id=msg["feed_id"]),
         )
         return True
 

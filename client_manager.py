@@ -24,20 +24,42 @@ class ClientConn:
     ws: Any
     connected_at: float
     last_seen: float
+    generation: int = 0
 
 
 CLIENTS: dict[Any, ClientConn] = {}
+_LATEST_BY_DEVICE: dict[str, Any] = {}
+_DEVICE_GENERATIONS: dict[str, int] = {}
+
+
+def mark_latest(ws: Any, device_id: str) -> int:
+    if not device_id:
+        return 0
+    for old_device_id, old_ws in list(_LATEST_BY_DEVICE.items()):
+        if old_ws is ws and old_device_id != device_id:
+            _LATEST_BY_DEVICE.pop(old_device_id, None)
+    generation = _DEVICE_GENERATIONS.get(device_id, 0) + 1
+    _DEVICE_GENERATIONS[device_id] = generation
+    _LATEST_BY_DEVICE[device_id] = ws
+    client = CLIENTS.get(ws)
+    if client is not None:
+        client.generation = generation
+    return generation
 
 
 def register(ws: Any, client: ClientConn) -> None:
     CLIENTS[ws] = client
+    client.generation = mark_latest(ws, client.device_id)
 
 
 def remove(ws: Any) -> ClientConn | None:
     # Also drop any broadcast fail-counter so the dict can't accumulate orphan
     # keys for clients that disconnect normally before hitting the eviction limit.
     _BROADCAST_FAIL_COUNTS.pop(ws, None)
-    return CLIENTS.pop(ws, None)
+    client = CLIENTS.pop(ws, None)
+    if client is not None and _LATEST_BY_DEVICE.get(client.device_id) is ws:
+        _LATEST_BY_DEVICE.pop(client.device_id, None)
+    return client
 
 
 def values() -> Iterable[ClientConn]:
@@ -50,6 +72,15 @@ def items() -> Iterable[tuple[Any, ClientConn]]:
 
 def has_clients() -> bool:
     return bool(CLIENTS)
+
+
+def is_current(ws: Any, client: ClientConn | None = None) -> bool:
+    current = CLIENTS.get(ws)
+    if current is None:
+        return False
+    if client is not None and current is not client:
+        return False
+    return _LATEST_BY_DEVICE.get(current.device_id) is ws
 
 
 def connected_device_ids(*extra_device_ids: str) -> list[str]:
@@ -73,7 +104,13 @@ async def close_duplicate_device_clients(current_ws: Any, device_id: str) -> int
 
     closed = 0
     for old_ws in stale:
-        remove(old_ws)
+        old_client = remove(old_ws)
+        if old_client is not None:
+            try:
+                from task_manager import cancel_owner
+                cancel_owner(old_client.client_id)
+            except Exception:
+                pass
         try:
             await old_ws.close()
         except Exception:

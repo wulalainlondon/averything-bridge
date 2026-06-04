@@ -102,6 +102,7 @@ async def handler(ws: ServerConnection) -> None:
         client.device_name = first_msg["device_name"].strip()
 
     bv.client_manager.register(ws, client)
+    await bv.client_manager.close_duplicate_device_clients(ws, client.device_id)
     bv.log.info("Client connected: %s (%s) device=%s", remote, client.client_id, client.device_id)
     bv._mark_client_activity()
 
@@ -140,7 +141,15 @@ async def handler(ws: ServerConnection) -> None:
         # start race where the Zustand store wasn't hydrated yet, so done/stopped
         # events were silently dropped and isStreaming stayed stuck.
         await bv.replay_offline_buffers(ws, bv._SESSIONS.values())
-        bv._spawn_task(f"unread-snapshot:connect:{client.client_id}", bv._send_unread_snapshot_deferred(ws, client))
+        _unread_coro = bv._send_unread_snapshot_deferred(ws, client)
+        try:
+            bv._spawn_task(
+                f"unread-snapshot:connect:{client.client_id}",
+                _unread_coro,
+                owner=client.client_id,
+            )
+        except TypeError:
+            bv._spawn_task(f"unread-snapshot:connect:{client.client_id}", _unread_coro)
         # Re-deliver any file pushes that were broadcast before this client connected
         device_id = client.device_id or ""
         for item in bv.pending_file_push_items(device_id):
@@ -155,6 +164,8 @@ async def handler(ws: ServerConnection) -> None:
     try:
         system_ctx = {
             "asyncio": bv.asyncio,
+            "client": client,
+            "is_current_client": lambda: bv.client_manager.is_current(ws, client),
             "sessions": bv._SESSIONS,
             "backends": bv._BACKENDS,
             "session_backend": bv._session_backend,
@@ -182,6 +193,8 @@ async def handler(ws: ServerConnection) -> None:
         }
         file_ctx = {
             "sessions": bv._SESSIONS,
+            "client": client,
+            "is_current_client": lambda: bv.client_manager.is_current(ws, client),
             "backends": bv._BACKENDS,
             "msg_dir_listing": bv._msg_dir_listing,
             "fcm_token_file": bv.FCM_TOKEN_FILE,
@@ -191,13 +204,17 @@ async def handler(ws: ServerConnection) -> None:
             "is_tunnel_delivered": bv.is_tunnel_url_delivered,
             "notify_tunnel_fcm_once": bv._do_send_tunnel_fcm,
         }
+        def _spawn_client_task(name, coro, **kwargs):
+            kwargs.setdefault("owner", client.client_id)
+            return bv._spawn_task(name, coro, **kwargs)
+
         router_ctx = bv.RouterContext(
             sessions=bv._SESSIONS,
             build_sessions_list=bv.build_sessions_list,
             broadcast_json=bv._broadcast_json,
             persist_session_meta=bv._persist_session_meta,
             send_all_sessions=bv._send_all_sessions,
-            spawn_task=bv._spawn_task,
+            spawn_task=_spawn_client_task,
             handle_push_file=bv._handle_push_file,
             handle_file_push_ack=bv._handle_file_push_ack,
             msg_pong=bv._msg_pong,
@@ -275,6 +292,8 @@ async def handler(ws: ServerConnection) -> None:
             if mtype == "hello":
                 if isinstance(msg.get("device_id"), str) and msg.get("device_id", "").strip():
                     client.device_id = msg["device_id"].strip()
+                    bv.client_manager.mark_latest(ws, client.device_id)
+                    await bv.client_manager.close_duplicate_device_clients(ws, client.device_id)
                 if isinstance(msg.get("device_name"), str) and msg.get("device_name", "").strip():
                     client.device_name = msg["device_name"].strip()
                 _paired_token = bv._PAIRING.get("paired_token", "").strip()
@@ -411,6 +430,7 @@ async def handler(ws: ServerConnection) -> None:
         else:
             bv.log.exception("Unhandled error in handler: %s", exc)
     finally:
+        bv._cancel_client_tasks(client.client_id)
         bv.client_manager.remove(ws)
         for session in list(bv._SESSIONS.values()):
             if session.ws_ref is ws:

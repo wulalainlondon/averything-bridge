@@ -214,6 +214,8 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
             return json.dumps(payload)
 
         # Stage 1: return filesystem + active sessions quickly.
+        if not ctx.get("is_current_client", lambda: True)():
+            return True
         try:
             await ws.send(_build([] if unchanged else entries, active_items))
         except Exception as exc:
@@ -221,8 +223,12 @@ async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
             return True
 
         # Stage 2: enrich with resumable sessions (cached).
+        if not ctx.get("is_current_client", lambda: True)():
+            return True
         active_uuids = {s.resume_id for s in ctx["sessions"].values() if s.resume_id}
         resumable = await _resumable_for_path(path, ctx["backends"], active_uuids)
+        if not ctx.get("is_current_client", lambda: True)():
+            return True
         merged = active_items + resumable
         try:
             await ws.send(_build([] if unchanged else entries, merged))

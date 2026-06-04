@@ -77,6 +77,7 @@ from offline_replay import replay_offline_buffers
 from queue_runner import log_prompt_lifecycle as _log_prompt_lifecycle
 from queue_runner import run_session_queue as _run_session_queue_impl
 from task_manager import cancel_all as _cancel_tasks
+from task_manager import cancel_owner as _cancel_client_tasks
 from task_manager import spawn as _spawn_task
 from utils.uuid_helper import is_valid_uuid
 from permission_manager import PermissionManager
