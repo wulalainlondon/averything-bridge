@@ -26,6 +26,8 @@ from .events import (
     _msg_session_uuid,
 )
 from .history import complete_history_message, clamp_history_limit, slice_history
+import client_manager
+import task_manager
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
@@ -315,12 +317,10 @@ class GeminiCliBackend(Backend, _StatesMixin):
         # Propagate to bridge session metadata
         session.resume_id = state.acp_session_id
         if session.ws_ref:
-            try:
-                await session.ws_ref.send(json.dumps(
-                    _msg_session_uuid(session.session_id, state.acp_session_id)
-                ))
-            except Exception:
-                pass
+            await client_manager.send_json(
+                session.ws_ref,
+                _msg_session_uuid(session.session_id, state.acp_session_id),
+            )
 
     async def send(self, session: "Session", content: str,
                    images: list | None = None, files: list | None = None) -> None:
@@ -335,6 +335,7 @@ class GeminiCliBackend(Backend, _StatesMixin):
                 await self.spawn(session)
             except Exception as exc:
                 session.is_streaming = False
+                session.turn_done_event.set()
                 await send_event(session, _evt_error(f"Failed to start gemini: {exc}", "spawn_failed"))
                 return
 
@@ -361,7 +362,11 @@ class GeminiCliBackend(Backend, _StatesMixin):
         state.turn_stop_reason = None
         state.turn_error = None
 
-        asyncio.create_task(self._run_turn(session, state, prompt_blocks))
+        task_manager.spawn(
+            f"gemini-turn:{session.session_id}",
+            self._run_turn(session, state, prompt_blocks),
+            owner=f"session:{session.session_id}",
+        )
 
     async def _run_turn(self, session: "Session", state: _GeminiState,
                         prompt_blocks: list[dict]) -> None:
@@ -391,6 +396,7 @@ class GeminiCliBackend(Backend, _StatesMixin):
         finally:
             state.turn_active = False
             session.is_streaming = False
+            session.turn_done_event.set()
             session.is_stopping = False
 
     async def stop(self, session: "Session") -> None:
@@ -407,6 +413,7 @@ class GeminiCliBackend(Backend, _StatesMixin):
                 pass
 
         session.is_streaming = False
+        session.turn_done_event.set()
         await send_event(session, _evt_stopped())
 
     async def clear(self, session: "Session") -> None:

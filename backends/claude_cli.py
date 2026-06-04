@@ -34,6 +34,8 @@ from interactions import REGISTRY as INTERACTIONS, normalize_questions
 from push_registry import notify_fcm_user_input as _notify_fcm_user_input
 from push_registry import notify_fcm_session_died as _notify_fcm_session_died
 import client_manager
+import task_manager
+import client_manager
 from .claude_common import _ClaudeState, _get_context_limit
 from .claude_history import _ClaudeHistoryMixin
 from .claude_stream import _ClaudeProcessMixin
@@ -103,6 +105,7 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
                 pass
             if state.proc is None or state.proc.returncode is not None:
                 session.is_streaming = False
+                session.turn_done_event.set()
                 await send_event(session, _evt_error("Claude process failed to start.", "session_dead"))
                 return
 
@@ -150,12 +153,16 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
             # the CompactingBanner instead of an ordinary user/assistant exchange. The
             # matching session_command_done is broadcast from the result handler below.
             if self._broadcast_fn is not None:
-                asyncio.create_task(self._broadcast_fn({
-                    "type": "session_command_started",
-                    "session_id": session.session_id,
-                    "request_id": f"compact_{session.session_id}",
-                    "queue_length": 0,
-                }))
+                task_manager.spawn(
+                    f"claude-compact-started:{session.session_id}",
+                    self._broadcast_fn({
+                        "type": "session_command_started",
+                        "session_id": session.session_id,
+                        "request_id": f"compact_{session.session_id}",
+                        "queue_length": 0,
+                    }),
+                    owner=f"session:{session.session_id}",
+                )
 
         try:
             state.proc.stdin.write(payload.encode("utf-8"))
@@ -163,6 +170,7 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
             log.info("[%s] Message sent (%d chars, %d images)", session.session_id, len(content), len(images or []))
         except Exception as exc:
             session.is_streaming = False
+            session.turn_done_event.set()
             log.error("[%s] Failed to write to stdin: %s", session.session_id, exc)
             await send_event(session, _evt_error(f"stdin write failed: {exc}"))
             return
@@ -207,6 +215,7 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
             pass
 
         session.is_streaming = False
+        session.turn_done_event.set()
         if state.tree_poll_task and not state.tree_poll_task.done():
             state.tree_poll_task.cancel()
             state.tree_poll_task = None
@@ -234,6 +243,7 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
         state.tool_waiting_events.clear()
         state.tool_waiting_interactions.clear()
         session.is_streaming = False
+        session.turn_done_event.set()
         if state.tree_poll_task and not state.tree_poll_task.done():
             state.tree_poll_task.cancel()
             state.tree_poll_task = None
@@ -361,15 +371,12 @@ console.log(JSON.stringify(data));
                         util = None
                 return {"utilization": util, "resets_at": entry.get("resets_at")}
 
-            await ws.send(json.dumps(_msg_usage_report(
+            await client_manager.send_json(ws, _msg_usage_report(
                 fmt(data.get("five_hour")),
                 fmt(data.get("seven_day")),
                 fmt(data.get("seven_day_sonnet")),
-            )))
+            ))
             log.info("Usage report sent")
         except Exception as exc:
             log.warning("fetch_usage failed: %s", exc)
-            try:
-                await ws.send(json.dumps(_msg_error(f"Usage fetch failed: {exc}")))
-            except Exception:
-                pass
+            await client_manager.send_json(ws, _msg_error(f"Usage fetch failed: {exc}"))

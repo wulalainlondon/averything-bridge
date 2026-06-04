@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Any, Awaitable, Callable, Protocol
 
 from backends.events import _evt_error, send_event
@@ -77,25 +76,24 @@ async def run_session_queue(
 
             try:
                 await get_backend(session).send(session, cmd.content, cmd.images, cmd.files)
-                # backend.send() spawns a subprocess and returns immediately;
-                # wait here so session.processing stays True until streaming ends,
-                # preventing the next queued command from seeing is_streaming=True.
-                # W6: watchdog — bound the spin so a zombie subprocess (is_streaming
-                # never cleared, no user stop) doesn't hang the queue forever.
-                _SPIN_TIMEOUT = 7200  # 2 h — generous margin above TOOL_IDLE_TIMEOUT_SECS
-                _spin_start = time.monotonic()
-                while session.is_streaming:
-                    if session.is_stopping:
-                        return  # stop() is responsible for sending the stopped event
-                    await asyncio.sleep(0.15)
-                    if time.monotonic() - _spin_start > _SPIN_TIMEOUT:
+                # backend.send() starts the turn and returns immediately; wait on
+                # the explicit session completion event instead of polling the UI
+                # streaming flag.
+                _TURN_TIMEOUT = 7200  # 2 h — generous margin above TOOL_IDLE_TIMEOUT_SECS
+                turn_done = getattr(session, "turn_done_event", None)
+                if session.is_streaming and turn_done is not None:
+                    try:
+                        await asyncio.wait_for(turn_done.wait(), timeout=_TURN_TIMEOUT)
+                    except asyncio.TimeoutError:
                         log.warning(
-                            "[%s] is_streaming stuck for >%ds — forcing idle (zombie subprocess?)",
-                            session.session_id, _SPIN_TIMEOUT,
+                            "[%s] turn_done_event stuck for >%ds — forcing idle",
+                            session.session_id, _TURN_TIMEOUT,
                         )
                         session.is_streaming = False
+                        turn_done.set()
                         await send_event(session, _evt_error("Backend timed out (streaming stuck)"))
-                        break
+                if session.is_stopping:
+                    return  # stop() is responsible for sending the stopped event
                 if cmd.request_id not in session.recent_request_ids:
                     session.recent_request_ids.add(cmd.request_id)
                     session.recent_request_ids_seq.append(cmd.request_id)

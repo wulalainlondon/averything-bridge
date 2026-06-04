@@ -26,6 +26,7 @@ from interactions import REGISTRY as INTERACTIONS, normalize_questions
 from push_registry import notify_fcm_user_input as _notify_fcm_user_input
 from push_registry import notify_fcm_session_died as _notify_fcm_session_died
 import client_manager
+import task_manager
 from .claude_common import _get_context_limit
 
 if TYPE_CHECKING:
@@ -175,6 +176,7 @@ class _ClaudeProcessMixin:
                 log.info("[%s] Injected timeout context message", session.session_id)
             except Exception as exc:
                 session.is_streaming = False
+                session.turn_done_event.set()
                 log.error("[%s] Failed to inject timeout context: %s", session.session_id, exc)
 
     async def _stdout_reader(self, session: "Session") -> None:
@@ -241,13 +243,17 @@ class _ClaudeProcessMixin:
                                     broadcast_json=self._broadcast_fn,
                                 )
                                 _q_text = _questions[0].get("text", "") if _questions else ""
-                                asyncio.create_task(_notify_fcm_user_input(
-                                    session_name=session.name,
-                                    header=_header,
-                                    question_text=_q_text,
-                                    session_id=session.session_id,
-                                    request_id=interaction.request_id,
-                                ))
+                                task_manager.spawn(
+                                    f"claude-fcm-user-input:{session.session_id}",
+                                    _notify_fcm_user_input(
+                                        session_name=session.name,
+                                        header=_header,
+                                        question_text=_q_text,
+                                        session_id=session.session_id,
+                                        request_id=interaction.request_id,
+                                    ),
+                                    owner=f"session:{session.session_id}",
+                                )
                                 _wait_ev = asyncio.Event()
                                 state.tool_waiting_events[tool_id] = _wait_ev
                                 state.tool_waiting_interactions[tool_id] = interaction.request_id
@@ -290,6 +296,7 @@ class _ClaudeProcessMixin:
                 subtype = evt.get("subtype", "")
                 new_uuid = evt.get("session_id")
                 session.is_streaming = False
+                session.turn_done_event.set()
                 if state.tree_poll_task and not state.tree_poll_task.done():
                     state.tree_poll_task.cancel()
                     state.tree_poll_task = None
@@ -327,18 +334,24 @@ class _ClaudeProcessMixin:
                         if self._persist_session_fn is not None:
                             self._persist_session_fn(session)
                         if first_uuid:
-                            try:
-                                if session.ws_ref and session.ws_ref.open:
-                                    await session.ws_ref.send(json.dumps(
-                                        _msg_session_uuid(session.session_id, new_uuid)
-                                    ))
-                            except Exception:
-                                pass
+                            if session.ws_ref and getattr(session.ws_ref, "open", True):
+                                await client_manager.send_json(
+                                    session.ws_ref,
+                                    _msg_session_uuid(session.session_id, new_uuid),
+                                )
                     if self._notify_fcm_fn is not None and not client_manager.has_clients():
-                        asyncio.create_task(self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id))
+                        task_manager.spawn(
+                            f"claude-fcm-done:{session.session_id}",
+                            self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id),
+                            owner=f"session:{session.session_id}",
+                        )
                     await emit_done(session)
                     if session.ws_ref is not None:
-                        asyncio.create_task(self.fetch_usage(session.ws_ref))
+                        task_manager.spawn(
+                            f"claude-fetch-usage:{session.session_id}",
+                            self.fetch_usage(session.ws_ref),
+                            owner=f"session:{session.session_id}",
+                        )
                     state.tool_blocks = {}
 
                     # Auto-compact: if context exceeds threshold and compact not already running,
@@ -349,12 +362,16 @@ class _ClaudeProcessMixin:
                     state.compact_in_progress = False  # reset after each result
                     if compact_was_in_progress and self._broadcast_fn is not None:
                         # Compact just finished — signal the frontend's loading indicator.
-                        asyncio.create_task(self._broadcast_fn({
-                            "type": "session_command_done",
-                            "session_id": session.session_id,
-                            "request_id": f"compact_{session.session_id}",
-                            "queue_length": 0,
-                        }))
+                        task_manager.spawn(
+                            f"claude-compact-done:{session.session_id}",
+                            self._broadcast_fn({
+                                "type": "session_command_done",
+                                "session_id": session.session_id,
+                                "request_id": f"compact_{session.session_id}",
+                                "queue_length": 0,
+                            }),
+                            owner=f"session:{session.session_id}",
+                        )
                     if (
                         not compact_was_in_progress
                         and context_limit > 0
@@ -372,12 +389,16 @@ class _ClaudeProcessMixin:
                         session.is_streaming = True
                         state.compact_in_progress = True
                         if self._broadcast_fn is not None:
-                            asyncio.create_task(self._broadcast_fn({
-                                "type": "session_command_started",
-                                "session_id": session.session_id,
-                                "request_id": f"compact_{session.session_id}",
-                                "queue_length": 0,
-                            }))
+                            task_manager.spawn(
+                                f"claude-compact-started:{session.session_id}",
+                                self._broadcast_fn({
+                                    "type": "session_command_started",
+                                    "session_id": session.session_id,
+                                    "request_id": f"compact_{session.session_id}",
+                                    "queue_length": 0,
+                                }),
+                                owner=f"session:{session.session_id}",
+                            )
                         compact_payload = json.dumps({
                             "type": "user",
                             "message": {"role": "user", "content": [{"type": "text", "text": "/compact"}]},
@@ -388,15 +409,20 @@ class _ClaudeProcessMixin:
                         except Exception as exc:
                             log.warning("[%s] auto-compact stdin write failed: %s", session.session_id, exc)
                             session.is_streaming = False
+                            session.turn_done_event.set()
                             state.compact_in_progress = False
                             if self._broadcast_fn is not None:
-                                asyncio.create_task(self._broadcast_fn({
-                                    "type": "session_command_failed",
-                                    "session_id": session.session_id,
-                                    "request_id": f"compact_{session.session_id}",
-                                    "message": str(exc),
-                                    "queue_length": 0,
-                                }))
+                                task_manager.spawn(
+                                    f"claude-compact-failed:{session.session_id}",
+                                    self._broadcast_fn({
+                                        "type": "session_command_failed",
+                                        "session_id": session.session_id,
+                                        "request_id": f"compact_{session.session_id}",
+                                        "message": str(exc),
+                                        "queue_length": 0,
+                                    }),
+                                    owner=f"session:{session.session_id}",
+                                )
                 else:
                     err = evt.get("result", "Unknown error")
                     log.error("[%s] result error: %s", session.session_id, err)
@@ -423,13 +449,11 @@ class _ClaudeProcessMixin:
                             self._persist_session_fn(session)
                         log.info("[%s] captured claude_uuid=%s at init", session.session_id, init_uuid)
                         if first_uuid:
-                            try:
-                                if session.ws_ref and session.ws_ref.open:
-                                    await session.ws_ref.send(json.dumps(
-                                        _msg_session_uuid(session.session_id, init_uuid)
-                                    ))
-                            except Exception:
-                                pass
+                            if session.ws_ref and getattr(session.ws_ref, "open", True):
+                                await client_manager.send_json(
+                                    session.ws_ref,
+                                    _msg_session_uuid(session.session_id, init_uuid),
+                                )
 
             elif etype == "rate_limit_event":
                 log.debug("[%s] rate_limit_event", session.session_id)
@@ -469,6 +493,7 @@ class _ClaudeProcessMixin:
         # process/session event arrives.
         if session.is_streaming:
             session.is_streaming = False
+            session.turn_done_event.set()
             session.accumulated_text = ""
             state.tool_blocks = {}
             if state.timeout_task and not state.timeout_task.done():
@@ -485,13 +510,17 @@ class _ClaudeProcessMixin:
         if state.compact_in_progress:
             state.compact_in_progress = False
             if self._broadcast_fn is not None:
-                asyncio.create_task(self._broadcast_fn({
-                    "type": "session_command_failed",
-                    "session_id": session.session_id,
-                    "request_id": f"compact_{session.session_id}",
-                    "message": "Process exited during compact",
-                    "queue_length": 0,
-                }))
+                task_manager.spawn(
+                    f"claude-compact-process-exited:{session.session_id}",
+                    self._broadcast_fn({
+                        "type": "session_command_failed",
+                        "session_id": session.session_id,
+                        "request_id": f"compact_{session.session_id}",
+                        "message": "Process exited during compact",
+                        "queue_length": 0,
+                    }),
+                    owner=f"session:{session.session_id}",
+                )
 
         if state.bad_resume:
             state.bad_resume = False
@@ -537,10 +566,14 @@ class _ClaudeProcessMixin:
             await send_event(session, _evt_session_died(
                 f"Claude process exited (rc={rc}) and will not restart."
             ))
-            asyncio.create_task(_notify_fcm_session_died(
-                session_name=session.name,
-                session_id=session.session_id,
-            ))
+            task_manager.spawn(
+                f"claude-fcm-session-died:{session.session_id}",
+                _notify_fcm_session_died(
+                    session_name=session.name,
+                    session_id=session.session_id,
+                ),
+                owner=f"session:{session.session_id}",
+            )
 
     async def _agent_tree_poller(self, session: "Session") -> None:
         await asyncio.sleep(3)  # 初始延遲，等 subagent 有機會出現
@@ -566,13 +599,13 @@ class _ClaudeProcessMixin:
                         fingerprint = (total, done_count)
                         if fingerprint != last_fingerprint:
                             last_fingerprint = fingerprint
-                            msg = json.dumps({
+                            payload = {
                                 "type": "agent_tree",
                                 "session_id": session.session_id,
                                 **tree_data,
-                            })
+                            }
                             if session.ws_ref and getattr(session.ws_ref, "open", False):
-                                await session.ws_ref.send(msg)
+                                await client_manager.send_json(session.ws_ref, payload)
             except Exception:
                 pass
             await asyncio.sleep(2)
@@ -595,6 +628,7 @@ class _ClaudeProcessMixin:
             ))
             session.is_stopping = True
             session.is_streaming = False
+            session.turn_done_event.set()
             if state.tree_poll_task and not state.tree_poll_task.done():
                 state.tree_poll_task.cancel()
                 state.tree_poll_task = None

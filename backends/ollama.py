@@ -21,6 +21,7 @@ from .events import (
     _evt_text_chunk, _evt_done, _evt_error, _evt_stopped,
     _evt_session_warning, _evt_session_closed,
 )
+import task_manager
 from .history import complete_history_message, clamp_history_limit, slice_history
 
 log = logging.getLogger("bridge_v2")
@@ -96,15 +97,20 @@ class OllamaBackend(Backend):
                     if len(history) > OLLAMA_HISTORY_CAP:
                         del history[:-OLLAMA_HISTORY_CAP]
                     session.is_streaming = False
+                    session.turn_done_event.set()
                     if session.is_stopping:
                         return  # stop() already sent _evt_stopped()
                     if self._notify_fcm_fn is not None:
-                        asyncio.create_task(self._notify_fcm_fn(
-                            session.name, session.accumulated_text, session.session_id))
+                        task_manager.spawn(
+                            f"ollama-fcm-done:{session.session_id}",
+                            self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id),
+                            owner=f"session:{session.session_id}",
+                        )
                     await emit_done(session)
 
         except Exception as exc:
             session.is_streaming = False
+            session.turn_done_event.set()
             await send_event(session, _evt_error(f"Ollama error: {exc}"))
         finally:
             session.is_stopping = False
@@ -113,12 +119,14 @@ class OllamaBackend(Backend):
     async def stop(self, session) -> None:
         session.is_stopping = True
         session.is_streaming = False
+        session.turn_done_event.set()
         session.accumulated_text = ""
         await send_event(session, _evt_stopped())
 
     async def clear(self, session) -> None:
         self._histories[session.session_id] = []
         session.is_streaming = False
+        session.turn_done_event.set()
         session.is_stopping = False
         session.accumulated_text = ""
         await send_event(session, _evt_session_warning("History cleared."))

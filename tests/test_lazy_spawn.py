@@ -367,7 +367,7 @@ class TestBuildSessionsListNoSpawn:
         from unittest.mock import MagicMock
 
         from backends.codex_appserver import CodexAppServerBackend
-        from backends.events import set_event_dispatcher
+        from backends.events import flush_session_events, set_event_dispatcher
 
         async def run():
             backend = CodexAppServerBackend("codex")
@@ -395,6 +395,7 @@ class TestBuildSessionsListNoSpawn:
                         "delta": "我先檢查目前的 bridge stream。",
                     },
                 })
+                await flush_session_events(session)
             finally:
                 set_event_dispatcher(None)
             return delivered
@@ -442,7 +443,7 @@ class TestBuildSessionsListNoSpawn:
         from unittest.mock import MagicMock
 
         from backends.codex_appserver import CodexAppServerBackend
-        from backends.events import set_event_dispatcher
+        from backends.events import flush_session_events, set_event_dispatcher
 
         async def run():
             backend = CodexAppServerBackend("codex")
@@ -473,6 +474,7 @@ class TestBuildSessionsListNoSpawn:
                         "permission": {"name": "network"},
                     },
                 })
+                await flush_session_events(session)
             finally:
                 set_event_dispatcher(None)
 
@@ -548,7 +550,7 @@ class TestBuildSessionsListNoSpawn:
         from unittest.mock import MagicMock
 
         from backends.codex_appserver import CodexAppServerBackend
-        from backends.events import set_event_dispatcher
+        from backends.events import flush_session_events, set_event_dispatcher
 
         async def run():
             backend = CodexAppServerBackend("codex")
@@ -579,6 +581,7 @@ class TestBuildSessionsListNoSpawn:
                         "input": {"q": "codex"},
                     },
                 })
+                await flush_session_events(session)
             finally:
                 set_event_dispatcher(None)
 
@@ -624,7 +627,7 @@ class TestBuildSessionsListNoSpawn:
         from unittest.mock import MagicMock
 
         from backends.codex_appserver import CodexAppServerBackend
-        from backends.events import set_event_dispatcher
+        from backends.events import flush_session_events, set_event_dispatcher
 
         async def run():
             backend = CodexAppServerBackend("codex")
@@ -662,6 +665,7 @@ class TestBuildSessionsListNoSpawn:
                     "method": "item/commandExecution/outputDelta",
                     "params": {"threadId": "thread_1", "itemId": "cmd_1", "delta": "lo"},
                 })
+                await flush_session_events(session)
             finally:
                 set_event_dispatcher(None)
             return delivered

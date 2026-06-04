@@ -33,6 +33,7 @@ from .history import complete_history_message, clamp_history_limit, load_indexed
 from interactions import REGISTRY as INTERACTIONS, normalize_questions
 from push_registry import notify_fcm_user_input as _notify_fcm_user_input
 import client_manager
+import task_manager
 from .codex_common import _AppServerState
 from .codex_native import _CodexNativeSessionMixin
 from .codex_images import _CodexImageMixin
@@ -578,12 +579,10 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
 
         # Emit the native thread ID as the session UUID.
         if session.ws_ref:
-            try:
-                await session.ws_ref.send(json.dumps(
-                    _msg_session_uuid(session.session_id, state.thread_id)
-                ))
-            except Exception:
-                pass
+            await client_manager.send_json(
+                session.ws_ref,
+                _msg_session_uuid(session.session_id, state.thread_id),
+            )
         session.resume_id = state.thread_id
         if self._persist_session_fn is not None:
             self._persist_session_fn(session)
@@ -599,7 +598,11 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
 
         # User-triggered /compact: route through the proper RPC path, same as auto-compact.
         if (content or "").strip() == "/compact" and not state.compact_in_progress:
-            asyncio.create_task(self._auto_compact(session, state))
+            task_manager.spawn(
+                f"codex-auto-compact:{session.session_id}",
+                self._auto_compact(session, state),
+                owner=f"session:{session.session_id}",
+            )
             return
 
         # Ensure we have an active thread. Also re-spawn if app-server died (proc gone).
@@ -614,6 +617,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                 await self.spawn(session)
             except Exception as exc:
                 session.is_streaming = False
+                session.turn_done_event.set()
                 await send_event(session, _evt_error(f"Failed to start codex thread: {exc}", "spawn_failed"))
                 return
 
@@ -634,7 +638,11 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         state.turn_error = None
         state.turn_active = True
 
-        asyncio.create_task(self._run_turn(session, state, user_input))
+        task_manager.spawn(
+            f"codex-turn:{session.session_id}",
+            self._run_turn(session, state, user_input),
+            owner=f"session:{session.session_id}",
+        )
 
     async def handle_user_input_response(self, session: "Session", interaction, response: dict) -> None:
         raw_command = getattr(interaction, "raw_command", None)
@@ -727,26 +735,40 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                             raw_command=_ask_data,
                             broadcast_json=self._broadcast_fn,
                         )
-                        asyncio.create_task(_notify_fcm_user_input(
-                            session_name=session.name,
-                            header=_header,
-                            question_text=_questions[0].get("text", "") if _questions else "",
-                            session_id=session.session_id,
-                            request_id=_interaction.request_id,
-                        ))
+                        task_manager.spawn(
+                            f"codex-fcm-user-input:{session.session_id}",
+                            _notify_fcm_user_input(
+                                session_name=session.name,
+                                header=_header,
+                                question_text=_questions[0].get("text", "") if _questions else "",
+                                session_id=session.session_id,
+                                request_id=_interaction.request_id,
+                            ),
+                            owner=f"session:{session.session_id}",
+                        )
                     except Exception as _exc:
                         log.warning("[codex-appserver] AskUserQuestion extraction failed: %s", _exc)
                 if self._notify_fcm_fn is not None and not client_manager.has_clients():
-                    asyncio.create_task(
-                        self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id)
+                    task_manager.spawn(
+                        f"codex-fcm-done:{session.session_id}",
+                        self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id),
+                        owner=f"session:{session.session_id}",
                     )
                 await emit_done(session)
                 if session.ws_ref is not None:
-                    asyncio.create_task(self.fetch_usage(session.ws_ref))
+                    task_manager.spawn(
+                        f"codex-fetch-usage:{session.session_id}",
+                        self.fetch_usage(session.ws_ref),
+                        owner=f"session:{session.session_id}",
+                    )
                 if (session.context_max
                         and session.context_used >= int(session.context_max * _COMPACT_THRESHOLD)
                         and state.thread_id):
-                    asyncio.create_task(self._auto_compact(session, state))
+                    task_manager.spawn(
+                        f"codex-auto-compact:{session.session_id}",
+                        self._auto_compact(session, state),
+                        owner=f"session:{session.session_id}",
+                    )
 
         except Exception as exc:
             if not session.is_stopping:
@@ -754,12 +776,15 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         finally:
             state.turn_active = False
             session.is_streaming = False
+            session.turn_done_event.set()
             session.is_stopping = False
             session.accumulated_text = ""
             self._cleanup_temp_images(state)
 
     async def _auto_compact(self, session: "Session", state: _AppServerState) -> None:
         if not state.thread_id or self._proc is None or self._proc.returncode is not None:
+            session.is_streaming = False
+            session.turn_done_event.set()
             return
         state.compact_done_event.clear()
         state.compact_in_progress = True
@@ -770,12 +795,16 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                  session.session_id[:8], session.context_used, session.context_max)
 
         if self._broadcast_fn is not None:
-            asyncio.create_task(self._broadcast_fn({
-                "type": "session_command_started",
-                "session_id": session.session_id,
-                "request_id": f"compact_{session.session_id}",
-                "queue_length": 0,
-            }))
+            task_manager.spawn(
+                f"codex-compact-started:{session.session_id}",
+                self._broadcast_fn({
+                    "type": "session_command_started",
+                    "session_id": session.session_id,
+                    "request_id": f"compact_{session.session_id}",
+                    "queue_length": 0,
+                }),
+                owner=f"session:{session.session_id}",
+            )
 
         try:
             await self._rpc("thread/compact/start", {"threadId": state.thread_id}, timeout=30.0)
@@ -789,36 +818,49 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                 log.warning("[codex-appserver] compact failed session=%s: %s",
                             session.session_id[:8], state.compact_error)
                 if self._broadcast_fn is not None:
-                    asyncio.create_task(self._broadcast_fn({
-                        "type": "session_command_failed",
-                        "session_id": session.session_id,
-                        "request_id": f"compact_{session.session_id}",
-                        "error": state.compact_error,
-                        "queue_length": 0,
-                    }))
+                    task_manager.spawn(
+                        f"codex-compact-failed:{session.session_id}",
+                        self._broadcast_fn({
+                            "type": "session_command_failed",
+                            "session_id": session.session_id,
+                            "request_id": f"compact_{session.session_id}",
+                            "error": state.compact_error,
+                            "queue_length": 0,
+                        }),
+                        owner=f"session:{session.session_id}",
+                    )
             else:
                 log.info("[codex-appserver] compact done session=%s", session.session_id[:8])
                 if self._broadcast_fn is not None:
-                    asyncio.create_task(self._broadcast_fn({
-                        "type": "session_command_done",
-                        "session_id": session.session_id,
-                        "request_id": f"compact_{session.session_id}",
-                        "queue_length": 0,
-                    }))
+                    task_manager.spawn(
+                        f"codex-compact-done:{session.session_id}",
+                        self._broadcast_fn({
+                            "type": "session_command_done",
+                            "session_id": session.session_id,
+                            "request_id": f"compact_{session.session_id}",
+                            "queue_length": 0,
+                        }),
+                        owner=f"session:{session.session_id}",
+                    )
         except Exception as exc:
             log.warning("[codex-appserver] compact exception session=%s: %s",
                         session.session_id[:8], exc)
             if self._broadcast_fn is not None:
-                asyncio.create_task(self._broadcast_fn({
-                    "type": "session_command_failed",
-                    "session_id": session.session_id,
-                    "request_id": f"compact_{session.session_id}",
-                    "error": str(exc),
-                    "queue_length": 0,
-                }))
+                task_manager.spawn(
+                    f"codex-compact-exception:{session.session_id}",
+                    self._broadcast_fn({
+                        "type": "session_command_failed",
+                        "session_id": session.session_id,
+                        "request_id": f"compact_{session.session_id}",
+                        "error": str(exc),
+                        "queue_length": 0,
+                    }),
+                    owner=f"session:{session.session_id}",
+                )
         finally:
             state.compact_in_progress = False
             session.is_streaming = False
+            session.turn_done_event.set()
 
     async def stop(self, session: "Session") -> None:
         state = self._get_state(session)
@@ -837,6 +879,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         state.turn_error = "stopped"
         state.turn_done_event.set()
         session.is_streaming = False
+        session.turn_done_event.set()
         session.accumulated_text = ""
         await send_event(session, _evt_stopped())
 
@@ -1004,7 +1047,4 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                 five_hour = {"utilization": total, "resets_at": None}
 
         payload = _msg_usage_report(five_hour, seven_day, None)
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
-            pass
+        await client_manager.send_json(ws, payload)

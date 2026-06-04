@@ -154,7 +154,7 @@ def test_run_session_queue_returns_without_starting_second_runner_when_processin
 
 
 def test_send_event_injects_current_request_id_for_prompt_events():
-    from backends.events import send_event, set_event_dispatcher
+    from backends.events import flush_session_events, send_event, set_event_dispatcher
 
     async def run():
         session = _make_session()
@@ -171,6 +171,7 @@ def test_send_event_injects_current_request_id_for_prompt_events():
             await send_event(session, {"type": "thinking_chunk", "content": "thinking"})
             await send_event(session, {"type": "text_chunk", "content": "hi"})
             await send_event(session, {"type": "done"})
+            await flush_session_events(session)
         finally:
             set_event_dispatcher(None)
         return delivered

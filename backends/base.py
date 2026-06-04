@@ -67,6 +67,9 @@ class Backend(ABC):
         if session.is_streaming:
             await _send_event(session, _evt_error(MSG_SESSION_BUSY, "session_busy"))
             return False
+        turn_done = getattr(session, "turn_done_event", None)
+        if turn_done is not None:
+            turn_done.clear()
         session.is_streaming = True
         session.accumulated_text = ""
         session.last_activity = _time.time()
