@@ -447,6 +447,161 @@ def test_router_creates_new_session_and_defers_backend_spawn():
     assert calls["broadcasts"] == [{"type": "sessions_list", "sessions": [{"id": "s_new"}]}]
 
 
+def test_router_resumed_new_session_sends_created_before_warming():
+    from message_router import handle_low_coupling_message
+
+    async def run():
+        ws = _Ws()
+        sessions = {}
+        tasks = []
+        timeline = []
+
+        def spawn_task(name, coro):
+            task = asyncio.create_task(coro, name=name)
+            tasks.append((name, task))
+            return task
+
+        async def emit_resume_progress(session, stage, progress=None, message=None) -> None:
+            timeline.append(("progress", stage, progress, message))
+
+        async def send_history_response(ws, session, **kwargs) -> None:
+            timeline.append(("history", session.session_id, kwargs))
+            await ws.send(json.dumps({
+                "type": "session_history",
+                "session_id": session.session_id,
+                "messages": ["loaded"],
+            }))
+
+        class _Backend:
+            async def spawn(self, session) -> None:
+                timeline.append(("spawn", session.session_id))
+
+            def supports_resume(self) -> bool:
+                return True
+
+        ctx, calls = _ctx(
+            sessions=sessions,
+            spawn_task=spawn_task,
+            emit_resume_progress=emit_resume_progress,
+            send_session_history_response=send_history_response,
+            session_backend=lambda session: _Backend(),
+            build_sessions_list=lambda: {"type": "sessions_list", "sessions": [{"id": sid} for sid in sessions]},
+        )
+
+        handled = await handle_low_coupling_message(
+            mtype="new_session",
+            msg={
+                "type": "new_session",
+                "session_id": "s_resume",
+                "name": "Resume",
+                "resume_claude_id": "resume-1",
+            },
+            ws=ws,
+            client=_Client(),
+            ctx=ctx,
+        )
+
+        for _ in range(4):
+            pending = [task for _name, task in tasks if not task.done()]
+            if not pending:
+                break
+            await asyncio.gather(*pending)
+
+        return handled, ws.sent, timeline, calls
+
+    handled, sent, timeline, calls = asyncio.run(run())
+
+    assert handled is True
+    assert sent[0]["type"] == "session_created"
+    assert sent[0]["session_id"] == "s_resume"
+    assert any(item[0] == "history" for item in timeline)
+    assert any(item == ("spawn", "s_resume") for item in timeline)
+    assert [item[1] for item in timeline if item[0] == "progress"] == [
+        "resume_started",
+        "resume_loading_history",
+        "resume_spawning_backend",
+        "resume_ready",
+    ]
+    assert calls["persisted_sessions"] == ["s_resume"]
+    assert [name for name, _task in calls["spawned"]] == []
+
+
+def test_router_resumed_new_session_reports_spawn_failure_after_history():
+    from message_router import handle_low_coupling_message
+
+    async def run():
+        ws = _Ws()
+        sessions = {}
+        tasks = []
+        timeline = []
+
+        def spawn_task(name, coro):
+            task = asyncio.create_task(coro, name=name)
+            tasks.append((name, task))
+            return task
+
+        async def emit_resume_progress(session, stage, progress=None, message=None) -> None:
+            timeline.append(("progress", stage, progress, message))
+
+        async def send_history_response(ws, session, **kwargs) -> None:
+            timeline.append(("history", session.session_id, kwargs))
+            await ws.send(json.dumps({
+                "type": "session_history",
+                "session_id": session.session_id,
+                "messages": ["loaded"],
+            }))
+
+        class _Backend:
+            async def spawn(self, session) -> None:
+                raise RuntimeError("spawn exploded")
+
+            def supports_resume(self) -> bool:
+                return True
+
+        ctx, _calls = _ctx(
+            sessions=sessions,
+            spawn_task=spawn_task,
+            emit_resume_progress=emit_resume_progress,
+            send_session_history_response=send_history_response,
+            session_backend=lambda session: _Backend(),
+        )
+
+        handled = await handle_low_coupling_message(
+            mtype="new_session",
+            msg={
+                "type": "new_session",
+                "session_id": "s_resume_fail",
+                "name": "Resume",
+                "resume_claude_id": "resume-1",
+            },
+            ws=ws,
+            client=_Client(),
+            ctx=ctx,
+        )
+
+        for _ in range(4):
+            pending = [task for _name, task in tasks if not task.done()]
+            if not pending:
+                break
+            await asyncio.gather(*pending)
+
+        return handled, ws.sent, timeline
+
+    handled, sent, timeline = asyncio.run(run())
+
+    assert handled is True
+    assert sent[0]["type"] == "session_created"
+    assert any(item[0] == "history" for item in timeline)
+    progress = [item for item in timeline if item[0] == "progress"]
+    assert [item[1] for item in progress] == [
+        "resume_started",
+        "resume_loading_history",
+        "resume_spawning_backend",
+        "resume_failed",
+    ]
+    assert "spawn exploded" in progress[-1][3]
+
+
 def test_router_rejects_new_session_when_limit_reached():
     from message_router import handle_low_coupling_message
     from session_registry import Session

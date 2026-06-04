@@ -140,6 +140,7 @@ from backends.events import (
     _msg_tasks_list, _msg_task_killed, _msg_processes_list, _msg_process_killed, _msg_dir_listing, _msg_usage_report,
     _msg_agent_tree,
     set_event_dispatcher,
+    stop_session_drain,
     get_generation,
 )
 from backends.history import DEFAULT_HISTORY_LIMIT, clamp_history_limit

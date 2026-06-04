@@ -24,6 +24,7 @@ except ImportError:
     _FCNTL_AVAILABLE = False
 
 from utils.uuid_helper import is_valid_uuid
+import client_manager
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +123,7 @@ class Session:
     hidden: bool = False
     queue: Deque[QueuedCommand] = field(default_factory=deque)
     processing: bool = False
+    turn_done_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     current_request_id: str = ""
     message_seq: int = 0
     pending_clients: set[str] = field(default_factory=set)
@@ -136,9 +138,6 @@ class Session:
     _fts_first_msg_indexed: bool = False
     parent_session_id: str | None = None
     forked_at: float | None = None
-    # Per-session asyncio lock that serialises all ws.send() calls for this session.
-    # Prevents live events from interleaving with offline-buffer replay frames.
-    _ws_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Per-session monotonic event counter stamped onto every _evt_* event by
     # send_event (paired with the per-boot generation id). Lets the client
     # detect dropped events. Runtime-only: resets to 0 on restart (the gen id
@@ -268,9 +267,8 @@ async def send_all_sessions(
             "total": total,
             "done": done,
         }
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
+        ok = await client_manager.send_json(ws, payload)
+        if not ok:
             return
         if not done:
             await asyncio.sleep(0.1)

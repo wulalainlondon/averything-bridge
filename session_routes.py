@@ -1,6 +1,7 @@
 """Session lifecycle WebSocket routes."""
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import time
@@ -8,10 +9,26 @@ import uuid
 from typing import Any
 
 from route_utils import safe_send_json
+from task_manager import cancel_owner
 from utils.path_jail import resolve_jailed, JailEscape
 
 log = logging.getLogger(__name__)
 CODEX_MODEL = "gpt-5.5"
+
+
+def _spawn_session_task(ctx: Any, name: str, make_coro, session_id: str) -> Any:
+    try:
+        params = inspect.signature(ctx.spawn_task).parameters
+        supports_owner = "owner" in params or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in params.values()
+        )
+    except Exception:
+        supports_owner = True
+    coro = make_coro()
+    if supports_owner:
+        return ctx.spawn_task(name, coro, owner=f"session:{session_id}")
+    return ctx.spawn_task(name, coro)
 
 
 async def handle_session_message(
@@ -113,14 +130,6 @@ async def handle_session_message(
             except Exception as exc:
                 ctx.log_debug("FTS5 early upsert failed (non-fatal): %s", exc)
 
-        backend = ctx.session_backend(session)
-        if resume_claude_id:
-            await ctx.emit_resume_progress(session, "resume_started", 5, "Resume started")
-            await ctx.emit_resume_progress(session, "resume_spawning_backend", 20, "Spawning backend")
-            await backend.spawn(session)
-        else:
-            ctx.spawn_task(f"backend-spawn:{sid}", backend.spawn(session))
-
         await safe_send_json(
             ws,
             ctx.msg_session_created(
@@ -135,13 +144,84 @@ async def handle_session_message(
             ),
         )
 
-        if resume_claude_id and backend.supports_resume():
-            try:
-                await ctx.emit_resume_progress(session, "resume_loading_history", 65, "Loading history")
-                await ctx.send_session_history_response(ws, session, limit=None, mode="snapshot")
-                await ctx.emit_resume_progress(session, "resume_ready", 100, "Resume ready")
-            except Exception as exc:
-                await ctx.emit_resume_progress(session, "resume_failed", 100, f"Resume failed: {exc}")
+        backend = ctx.session_backend(session)
+
+        async def _warm_resumed_session() -> None:
+            await ctx.emit_resume_progress(session, "resume_started", 5, "Resume started")
+            await ctx.emit_resume_progress(session, "resume_loading_history", 35, "Loading history")
+            await ctx.emit_resume_progress(session, "resume_spawning_backend", 55, "Spawning backend")
+
+            async def _load_history() -> None:
+                if not backend.supports_resume():
+                    await safe_send_json(
+                        ws,
+                        ctx.msg_session_history(
+                            session.session_id,
+                            [],
+                            source_count=0,
+                            has_more_before=False,
+                            runtime=ctx.history_runtime_payload(session),
+                        ),
+                    )
+                    return
+                try:
+                    await ctx.send_session_history_response(ws, session, limit=None, mode="snapshot")
+                except Exception as exc:
+                    ctx.log_warning("resume history response error sid=%s: %s", session.session_id, exc)
+                    await safe_send_json(
+                        ws,
+                        ctx.msg_session_history(
+                            session.session_id,
+                            [],
+                            source_count=0,
+                            has_more_before=False,
+                            runtime=ctx.history_runtime_payload(session),
+                        ),
+                    )
+
+            async def _spawn_backend() -> Exception | None:
+                try:
+                    await backend.spawn(session)
+                    return None
+                except Exception as exc:
+                    return exc
+
+            _history_task = ctx.spawn_task(
+                f"resume-history:{sid}",
+                _load_history(),
+            )
+            spawn_error = await _spawn_backend()
+            if _history_task is not None:
+                try:
+                    await _history_task
+                except Exception as exc:
+                    ctx.log_warning("resume history task failed sid=%s: %s", session.session_id, exc)
+
+            if spawn_error is not None:
+                await ctx.emit_resume_progress(
+                    session,
+                    "resume_failed",
+                    100,
+                    f"Resume failed: {spawn_error}",
+                )
+                return
+
+            await ctx.emit_resume_progress(session, "resume_ready", 100, "Resume ready")
+
+        if resume_claude_id:
+            _spawn_session_task(
+                ctx,
+                f"resume-warm:{sid}",
+                _warm_resumed_session,
+                sid,
+            )
+        else:
+            _spawn_session_task(
+                ctx,
+                f"backend-spawn:{sid}",
+                lambda: backend.spawn(session),
+                sid,
+            )
 
         # Persist newly created sessions so bridge restart won't orphan `s_*` ids.
         ctx.persist_session(session)
@@ -158,6 +238,10 @@ async def handle_session_message(
         session.ws_ref = ws
 
         async def _do_close(s: Any) -> None:
+            cancel_owner(f"session:{s.session_id}")
+            stop_drain = getattr(ctx, "stop_session_drain", None)
+            if stop_drain is not None:
+                await stop_drain(s)
             await ctx.session_backend(s).close(s)
             async with ctx.sessions_lock:
                 ctx.sessions.pop(s.session_id, None)
@@ -194,6 +278,11 @@ async def handle_session_message(
             await safe_send_json(ws, ctx.msg_error(f"Unknown session: {sid}", sid))
             return True
         session.ws_ref = ws
+        cancel_owner(f"session:{session.session_id}")
+        stop_drain = getattr(ctx, "stop_session_drain", None)
+        if stop_drain is not None:
+            await stop_drain(session)
+        session.offline_buffer.clear()
         ctx.spawn_task(f"session-clear:{sid}", ctx.session_backend(session).clear(session))
         return True
 

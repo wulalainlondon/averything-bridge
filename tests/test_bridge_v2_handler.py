@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -42,6 +43,12 @@ class FakeWebSocket:
         self.sent.append(json.loads(payload))
 
 
+class YieldingFakeWebSocket(FakeWebSocket):
+    async def __anext__(self) -> str:
+        await asyncio.sleep(0)
+        return await super().__anext__()
+
+
 @pytest.fixture(autouse=True)
 def clean_bridge_state(monkeypatch, tmp_path):
     bridge_v2._SESSIONS.clear()
@@ -78,6 +85,7 @@ def clean_bridge_state(monkeypatch, tmp_path):
     monkeypatch.setattr(bridge_v2._PERF, "record", lambda *args, **kwargs: None)
     yield
     client_manager.CLIENTS.clear()
+    client_manager._WS_SEND_LOCKS.clear()
 
 
 async def _async_none():
@@ -106,10 +114,11 @@ async def test_handler_requires_hello_as_first_protocol_message():
 
     assert ws.sent == [{"type": "error", "message": "Protocol error: first message must be hello"}]
     assert client_manager.CLIENTS == {}
+    assert client_manager._WS_SEND_LOCKS == {}
 
 
 @pytest.mark.asyncio
-async def test_handler_sends_hello_ack_sessions_list_and_disconnects_cleanly():
+async def test_handler_sends_hello_ack_and_disconnects_cleanly():
     ws = FakeWebSocket([
         {"type": "hello", "device_id": "dev1", "device_name": "Phone", "auth_token": "tok"},
     ])
@@ -131,8 +140,29 @@ async def test_handler_sends_hello_ack_sessions_list_and_disconnects_cleanly():
         "lan_ip": "192.168.1.10",
         "tunnel_url": "https://tunnel.example",
     }
-    assert ws.sent[1] == {"type": "sessions_list", "sessions": []}
     assert client_manager.CLIENTS == {}
+
+
+@pytest.mark.asyncio
+async def test_handler_background_hydration_sends_sessions_list(monkeypatch):
+    tasks: list[asyncio.Task] = []
+
+    def spawn_task(name, coro, owner=None):
+        task = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(bridge_v2, "_spawn_task", spawn_task)
+    ws = YieldingFakeWebSocket([
+        {"type": "hello", "device_id": "dev1"},
+    ])
+
+    await bridge_v2.handler(ws)
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    assert ws.sent[0]["type"] == "hello_ack"
+    assert {"type": "sessions_list", "sessions": []} in ws.sent
 
 
 @pytest.mark.asyncio
@@ -184,7 +214,7 @@ async def test_handler_returns_device_scoped_inbox(monkeypatch):
 
     await bridge_v2.handler(ws)
 
-    assert seen == [("dev1", False), ("dev1", True)]
+    assert seen == [("dev1", True)]
     assert {"type": "inbox_list", "items": [{"id": "file1", "name": "notes.md"}]} in ws.sent
 
 

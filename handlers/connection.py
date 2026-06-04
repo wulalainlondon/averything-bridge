@@ -12,6 +12,8 @@ would re-import bridge_v2 under its real name and hit a partially-initialized
 circular import. Deferring to call time avoids the cycle entirely.
 """
 
+import inspect
+
 from websockets.asyncio.server import ServerConnection
 
 
@@ -70,30 +72,22 @@ async def handler(ws: ServerConnection) -> None:
         raw_first = await bv.asyncio.wait_for(ws.recv(), timeout=20)
         first_msg = bv.json.loads(str(raw_first))
     except bv.asyncio.TimeoutError:
-        try:
-            await ws.send(bv.json.dumps(bv._msg_error("Handshake timeout: expected hello")))
-        except Exception:
-            pass
+        await bv.client_manager.send_json(ws, bv._msg_error("Handshake timeout: expected hello"))
+        bv.client_manager.remove(ws)
         return
     except Exception:
-        try:
-            await ws.send(bv.json.dumps(bv._msg_error("Handshake failed: invalid JSON")))
-        except Exception:
-            pass
+        await bv.client_manager.send_json(ws, bv._msg_error("Handshake failed: invalid JSON"))
+        bv.client_manager.remove(ws)
         return
 
     first_err = bv.validate_client_msg(first_msg)
     if first_err or first_msg.get("type") != "hello":
-        try:
-            await ws.send(bv.json.dumps(bv._msg_error("Protocol error: first message must be hello")))
-        except Exception:
-            pass
+        await bv.client_manager.send_json(ws, bv._msg_error("Protocol error: first message must be hello"))
+        bv.client_manager.remove(ws)
         return
     if not bv._is_auth_token_valid(first_msg):
-        try:
-            await ws.send(bv.json.dumps(bv._msg_error("Unauthorized: invalid auth token")))
-        except Exception:
-            pass
+        await bv.client_manager.send_json(ws, bv._msg_error("Unauthorized: invalid auth token"))
+        bv.client_manager.remove(ws)
         return
 
     if isinstance(first_msg.get("device_id"), str) and first_msg.get("device_id", "").strip():
@@ -118,7 +112,7 @@ async def handler(ws: ServerConnection) -> None:
         tunnel_url = bv.get_current_tunnel_url()
         bv.log.info("hello_ack → client=%s instance_id=%s tunnel=%s",
                  client.client_id, bv._INSTANCE_ID, bool(tunnel_url))
-        await ws.send(bv.json.dumps({
+        ok = await bv.client_manager.send_json(ws, {
             "type": "hello_ack",
             "instance_id": bv._INSTANCE_ID,
             "gen": bv.get_generation(),
@@ -132,32 +126,43 @@ async def handler(ws: ServerConnection) -> None:
             "data_dir": bv._DATA_DIR,
             **({"lan_ip": bv._LAN_IP} if bv._LAN_IP else {}),
             **({"tunnel_url": tunnel_url} if tunnel_url else {}),
-        }))
-        await ws.send(bv.json.dumps(bv.build_sessions_list()))
+        }, client)
+        if not ok:
+            return
 
-        # Replay offline buffers AFTER sessions_list so the frontend has already
-        # run reconcileFromServer (and hydrated its session state) before it
-        # processes buffered events.  Sending before sessions_list caused a cold-
-        # start race where the Zustand store wasn't hydrated yet, so done/stopped
-        # events were silently dropped and isStreaming stayed stuck.
-        await bv.replay_offline_buffers(ws, bv._SESSIONS.values())
-        _unread_coro = bv._send_unread_snapshot_deferred(ws, client)
+        async def _hydrate_reconnected_client() -> None:
+            if not bv.client_manager.is_current(ws, client):
+                return
+            await bv.client_manager.send_json(ws, bv.build_sessions_list(), client)
+
+            # Replay offline buffers AFTER sessions_list so the frontend has
+            # hydrated its session state before it processes buffered events.
+            await bv.replay_offline_buffers(ws, bv._SESSIONS.values())
+            if not bv.client_manager.is_current(ws, client):
+                return
+            await bv._send_unread_snapshot_deferred(ws, client)
+            device_id = client.device_id or ""
+            for item in bv.pending_file_push_items(device_id):
+                if not bv.client_manager.is_current(ws, client):
+                    return
+                payload = {"type": "file_push", **item}
+                ok = await bv.client_manager.send_json(ws, payload, client)
+                if not ok:
+                    return
+
         try:
+            spawn_sig = inspect.signature(bv._spawn_task)
+            supports_owner = "owner" in spawn_sig.parameters
+        except Exception:
+            supports_owner = True
+        if supports_owner:
             bv._spawn_task(
-                f"unread-snapshot:connect:{client.client_id}",
-                _unread_coro,
+                f"client-hydrate:connect:{client.client_id}",
+                _hydrate_reconnected_client(),
                 owner=client.client_id,
             )
-        except TypeError:
-            bv._spawn_task(f"unread-snapshot:connect:{client.client_id}", _unread_coro)
-        # Re-deliver any file pushes that were broadcast before this client connected
-        device_id = client.device_id or ""
-        for item in bv.pending_file_push_items(device_id):
-            payload = {"type": "file_push", **item}
-            try:
-                await ws.send(bv.json.dumps(payload))
-            except Exception:
-                break
+        else:
+            bv._spawn_task(f"client-hydrate:connect:{client.client_id}", _hydrate_reconnected_client())
     except Exception:
         pass
 
@@ -240,6 +245,7 @@ async def handler(ws: ServerConnection) -> None:
             msg_session_renamed=bv._msg_session_renamed,
             session_backend=bv._session_backend,
             send_event=bv.send_event,
+            stop_session_drain=bv.stop_session_drain,
             evt_session_warning=bv._evt_session_warning,
             evt_error=bv._evt_error,
             persist_session=bv._persist_session,
@@ -281,10 +287,7 @@ async def handler(ws: ServerConnection) -> None:
             validation_err = bv.validate_client_msg(msg)
             if validation_err:
                 bv.log.warning("Invalid client msg: %s | %s", validation_err, bv._summarize_client_msg(msg, raw_len))
-                try:
-                    await ws.send(bv.json.dumps(bv._msg_error(f"Protocol error: {validation_err}")))
-                except Exception:
-                    pass
+                await bv.client_manager.send_json(ws, bv._msg_error(f"Protocol error: {validation_err}"), client)
                 continue
 
             mtype = msg["type"]  # safe after validation
@@ -298,7 +301,7 @@ async def handler(ws: ServerConnection) -> None:
                     client.device_name = msg["device_name"].strip()
                 _paired_token = bv._PAIRING.get("paired_token", "").strip()
                 _provided_token = str(msg.get("auth_token") or "").strip()
-                await ws.send(bv.json.dumps({
+                await bv.client_manager.send_json(ws, {
                     "type": "hello_ack",
                     "instance_id": bv._INSTANCE_ID,
                     "gen": bv.get_generation(),
@@ -312,7 +315,7 @@ async def handler(ws: ServerConnection) -> None:
                     "data_dir": bv._DATA_DIR,
                     **({"lan_ip": bv._LAN_IP} if bv._LAN_IP else {}),
                     **({"tunnel_url": bv.get_current_tunnel_url()} if bv.get_current_tunnel_url() else {}),
-                }))
+                }, client)
                 await bv.send_pending_interactions(ws)
                 bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
                 continue
@@ -321,12 +324,12 @@ async def handler(ws: ServerConnection) -> None:
                 token = str(msg.get("auth_token") or "").strip()
                 device_id = str(msg.get("device_id") or "").strip()
                 if not token:
-                    await ws.send(bv.json.dumps(bv._msg_error("auth_token required for claim_bridge")))
+                    await bv.client_manager.send_json(ws, bv._msg_error("auth_token required for claim_bridge"), client)
                     bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
                     continue
                 existing = bv._PAIRING.get("paired_token", "").strip()
                 if existing and existing != token:
-                    await ws.send(bv.json.dumps(bv._msg_error("Bridge already claimed by another device")))
+                    await bv.client_manager.send_json(ws, bv._msg_error("Bridge already claimed by another device"), client)
                     bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
                     continue
                 # Synchronous block — asyncio single-thread guarantees atomicity (no await between clear and update).
@@ -335,7 +338,7 @@ async def handler(ws: ServerConnection) -> None:
                 bv._PAIRING.update(_new_pairing)
                 bv._save_pairing(bv._PAIRING)
                 bv.log.info("Bridge claimed by device_id=%s", device_id)
-                await ws.send(bv.json.dumps({"type": "claim_ack", "is_locked": True, "locked_to_me": True}))
+                await bv.client_manager.send_json(ws, {"type": "claim_ack", "is_locked": True, "locked_to_me": True}, client)
                 bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
                 continue
 
@@ -343,13 +346,13 @@ async def handler(ws: ServerConnection) -> None:
                 token = str(msg.get("auth_token") or "").strip()
                 paired = bv._PAIRING.get("paired_token", "").strip()
                 if paired and paired != token:
-                    await ws.send(bv.json.dumps(bv._msg_error("Unauthorized: token mismatch")))
+                    await bv.client_manager.send_json(ws, bv._msg_error("Unauthorized: token mismatch"), client)
                     bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
                     continue
                 bv._PAIRING.clear()
                 bv._clear_pairing()
                 bv.log.info("Bridge unclaimed")
-                await ws.send(bv.json.dumps({"type": "unclaim_ack", "is_locked": False}))
+                await bv.client_manager.send_json(ws, {"type": "unclaim_ack", "is_locked": False}, client)
                 bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
                 continue
 
@@ -357,10 +360,7 @@ async def handler(ws: ServerConnection) -> None:
                 _inbox_conn = bv.client_manager.CLIENTS.get(ws)
                 inbox_device_id = (_inbox_conn.device_id if _inbox_conn else "") or ""
                 inbox_items = bv.pending_file_push_items(inbox_device_id, include_pushed_at=True)
-                try:
-                    await ws.send(bv.json.dumps({"type": "inbox_list", "items": inbox_items}))
-                except Exception:
-                    pass
+                await bv.client_manager.send_json(ws, {"type": "inbox_list", "items": inbox_items}, client)
                 bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
                 continue
 

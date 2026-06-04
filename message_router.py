@@ -51,12 +51,16 @@ class _CurrentClientWs:
     def __init__(self, ws: Any, client: Any):
         self._ws = ws
         self._client = client
+        self._bridge_ws = ws
+        self._bridge_client = client
         self._enforce_current = ws in client_manager.CLIENTS
 
     async def send(self, payload: str) -> Any:
         if self._enforce_current and not client_manager.is_current(self._ws, self._client):
             raise asyncio.CancelledError("stale client websocket")
-        return await self._ws.send(payload)
+        ok = await client_manager.send_text(self._ws, payload, self._client)
+        if not ok:
+            raise asyncio.CancelledError("client websocket unavailable")
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._ws, name)
@@ -138,6 +142,7 @@ class RouterContext:
     data_dir: str = ""
     instance_name: str = ""
     pairing: dict = None  # type: ignore[assignment]
+    stop_session_drain: Callable[[Any], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if self.pairing is None:
