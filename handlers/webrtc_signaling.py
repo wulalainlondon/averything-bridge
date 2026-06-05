@@ -219,21 +219,34 @@ async def _handle_offer(ws, msg, on_channel_ready):
     @pc.on("datachannel")
     def _on_datachannel(channel):
         log.info(
-            "[webrtc] datachannel offered by peer: label=%s id=%s",
+            "[webrtc] datachannel offered by peer: label=%s id=%s state=%s",
             channel.label,
             getattr(channel, "id", None),
+            getattr(channel, "readyState", None),
         )
+        _detach_promoted_pc(ws, pc)
 
         # Best-effort remote address; the selected pair isn't always available
         # synchronously, so just tag the adapter with a sentinel.
         remote = ("webrtc", 0)
+        promoted = False
 
-        @channel.on("open")
-        def _on_open():
+        def _promote_channel():
+            nonlocal promoted
+            if promoted:
+                return
+            promoted = True
             log.info("[webrtc] datachannel open — promoting to bridge handler")
             adapter = WebRTCChannel(pc=pc, dc=channel, remote_address=remote)
             asyncio.create_task(on_channel_ready(adapter))
             asyncio.create_task(_safe_send(ws, {"type": "webrtc_ready"}))
+
+        @channel.on("open")
+        def _on_open():
+            _promote_channel()
+
+        if getattr(channel, "readyState", None) == "open":
+            _promote_channel()
 
     try:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
@@ -289,6 +302,12 @@ async def _safe_send(ws, payload: dict) -> None:
         await ws.send(json.dumps(payload))
     except Exception:
         log.debug("[webrtc] send dropped (signaling WS closed?)")
+
+
+def _detach_promoted_pc(ws, pc) -> None:
+    """Keep a promoted DataChannel alive after its signaling WebSocket closes."""
+    if _PC_BY_SIGNALING.get(ws) is pc:
+        _PC_BY_SIGNALING.pop(ws, None)
 
 
 def cleanup_for_ws(ws) -> None:
