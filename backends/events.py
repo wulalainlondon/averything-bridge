@@ -354,7 +354,13 @@ async def _drain_session_events(session: "Session") -> None:
             payload = await queue.get()
             try:
                 delivered = False
-                if _EVENT_DISPATCHER is not None:
+                event_sink = getattr(session, "event_sink", None)
+                if event_sink is not None:
+                    try:
+                        delivered = await event_sink.emit(payload, session)
+                    except Exception:
+                        delivered = False
+                if not delivered and _EVENT_DISPATCHER is not None:
                     try:
                         delivered = await _EVENT_DISPATCHER(payload, session)
                     except Exception:
@@ -417,7 +423,7 @@ async def send_event(session: "Session", event: dict) -> None:
     session._event_seq += 1
     payload["seq"] = session._event_seq
     payload["gen"] = _GENERATION
-    if _EVENT_DISPATCHER is None and session.ws_ref is None:
+    if getattr(session, "event_sink", None) is None and _EVENT_DISPATCHER is None and session.ws_ref is None:
         _append_offline(session, payload)
         return
     _enqueue_payload(session, payload)

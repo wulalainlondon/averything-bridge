@@ -72,6 +72,37 @@ def test_multi_client_dispatch_sees_identical_seq():
     assert all("gen" in e for e in seen)
 
 
+def test_session_event_sink_delivers_without_websocket_or_dispatcher():
+    import backends.events as ev
+    from backends.event_sink import MemoryEventSink
+
+    ev.set_event_dispatcher(None)
+
+    async def run():
+        s = _session("s")
+        sink = MemoryEventSink()
+        s.event_sink = sink
+        s.current_request_id = "r1"
+        await ev.send_event(s, {"type": "text_chunk", "content": "a"})
+        await ev.flush_session_events(s)
+        await ev.stop_session_drain(s)
+        return sink.events, s.offline_buffer
+
+    events, offline = asyncio.run(run())
+
+    assert offline == []
+    assert events == [
+        {
+            "type": "text_chunk",
+            "content": "a",
+            "session_id": "s",
+            "request_id": "r1",
+            "seq": 1,
+            "gen": ev.get_generation(),
+        }
+    ]
+
+
 def test_offline_overflow_merge_creates_detectable_seq_gap(monkeypatch):
     """When the buffer overflows and text_chunks merge, the dropped event's seq
     vanishes — leaving a gap the client uses to trigger a reconcile."""

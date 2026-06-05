@@ -128,6 +128,7 @@ class Session:
     message_seq: int = 0
     pending_clients: set[str] = field(default_factory=set)
     ws_ref: Optional[Any] = field(default=None, repr=False)
+    event_sink: Optional[Any] = field(default=None, repr=False)
     offline_buffer: list = field(default_factory=list)
     recent_request_ids: set[str] = field(default_factory=set)
     # W5: insertion-ordered list that mirrors recent_request_ids for deterministic
