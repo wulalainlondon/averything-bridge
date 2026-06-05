@@ -16,7 +16,7 @@ import inspect
 
 from websockets.asyncio.server import ServerConnection
 
-from command_dispatcher import dispatch_bridge_command
+from command_dispatcher import CommandDispatchContext, dispatch_bridge_command
 
 
 async def handler(ws: ServerConnection) -> None:
@@ -272,6 +272,16 @@ async def handler(ws: ServerConnection) -> None:
             instance_name=bv._INSTANCE_NAME,
             pairing=bv._PAIRING,
         )
+        dispatch_ctx = CommandDispatchContext(
+            bv=bv,
+            ws=ws,
+            client=client,
+            system_ctx=system_ctx,
+            runtime_ctx=runtime_ctx,
+            file_ctx=file_ctx,
+            router_ctx=router_ctx,
+            handler_func=handler,
+        )
         async for raw in ws:
             op_started = bv.time.perf_counter()
             bv._mark_client_activity()
@@ -289,18 +299,7 @@ async def handler(ws: ServerConnection) -> None:
 
             msg = command.payload
             bv.log.debug("Received: %s", bv._summarize_client_msg(msg, raw_len))
-            await dispatch_bridge_command(
-                bv=bv,
-                ws=ws,
-                client=client,
-                command=command,
-                system_ctx=system_ctx,
-                runtime_ctx=runtime_ctx,
-                file_ctx=file_ctx,
-                router_ctx=router_ctx,
-                op_started=op_started,
-                handler_func=handler,
-            )
+            await dispatch_bridge_command(dispatch_ctx, command, op_started=op_started)
 
     except Exception as exc:
         name = type(exc).__name__

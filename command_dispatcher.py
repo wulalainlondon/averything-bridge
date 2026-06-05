@@ -1,20 +1,31 @@
 """Transport-neutral bridge command dispatch."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 
-async def dispatch_bridge_command(
-    *,
-    bv,
-    ws,
-    client,
-    command,
-    system_ctx,
-    runtime_ctx,
-    file_ctx,
-    router_ctx,
-    op_started: float,
-    handler_func,
-) -> None:
+
+@dataclass(frozen=True)
+class CommandDispatchContext:
+    bv: object
+    ws: object
+    client: object
+    system_ctx: dict
+    runtime_ctx: dict
+    file_ctx: dict
+    router_ctx: object
+    handler_func: object
+
+
+async def dispatch_bridge_command(ctx: CommandDispatchContext, command, *, op_started: float) -> None:
+    bv = ctx.bv
+    ws = ctx.ws
+    client = ctx.client
+    system_ctx = ctx.system_ctx
+    runtime_ctx = ctx.runtime_ctx
+    file_ctx = ctx.file_ctx
+    router_ctx = ctx.router_ctx
+    handler_func = ctx.handler_func
+
     msg = command.payload
     mtype = command.type
     runtime_ctx["client"] = client
