@@ -16,11 +16,25 @@ class CommandDispatchContext:
     file_ctx: dict
     router_ctx: object
     handler_func: object
+    log: object
+    perf: object
+    perf_counter: object
+    sessions: object
+    session_backend: object
+    broadcast_json: object
+    msg_error: object
+    handle_interaction_message: object
+    dispatch_search_message: object
+    handle_system_msg: object
+    handle_runtime_msg: object
+    handle_file_msg: object
+    webrtc_message_types: object
+    handle_webrtc_message: object
+    handle_low_coupling_message: object
 
 
 def _record_perf(ctx: CommandDispatchContext, mtype: str, op_started: float) -> None:
-    bv = ctx.bv
-    bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
+    ctx.perf.record(mtype, (ctx.perf_counter() - op_started) * 1000.0, ctx.log)
 
 
 async def _handle_webrtc_signaling(
@@ -30,20 +44,19 @@ async def _handle_webrtc_signaling(
     *,
     op_started: float,
 ) -> bool:
-    bv = ctx.bv
     ws = ctx.ws
     handler_func = ctx.handler_func
 
-    if mtype not in bv.WEBRTC_MESSAGE_TYPES:
+    if mtype not in ctx.webrtc_message_types:
         return False
 
     async def _on_channel_ready(adapter):
         try:
             await handler_func(adapter)
         except Exception:
-            bv.log.exception("[webrtc] handler raised on adapter")
+            ctx.log.exception("[webrtc] handler raised on adapter")
 
-    if await bv.handle_webrtc_message(mtype, msg, ws, _on_channel_ready):
+    if await ctx.handle_webrtc_message(mtype, msg, ws, _on_channel_ready):
         _record_perf(ctx, mtype, op_started)
         return True
     return False
@@ -56,7 +69,6 @@ async def _dispatch_route_chain(
     *,
     op_started: float,
 ) -> bool:
-    bv = ctx.bv
     ws = ctx.ws
     client = ctx.client
     system_ctx = ctx.system_ctx
@@ -64,36 +76,36 @@ async def _dispatch_route_chain(
     file_ctx = ctx.file_ctx
     router_ctx = ctx.router_ctx
 
-    if await bv.handle_interaction_message(
+    if await ctx.handle_interaction_message(
         mtype=mtype,
         msg=msg,
         ws=ws,
-        sessions=bv._SESSIONS,
-        session_backend=bv._session_backend,
-        broadcast_json=bv._broadcast_json,
-        msg_error=bv._msg_error,
+        sessions=ctx.sessions,
+        session_backend=ctx.session_backend,
+        broadcast_json=ctx.broadcast_json,
+        msg_error=ctx.msg_error,
     ):
         _record_perf(ctx, mtype, op_started)
         return True
 
-    if await bv._dispatch_ws_message(ws, msg):
+    if await ctx.dispatch_search_message(ws, msg):
         _record_perf(ctx, mtype, op_started)
         return True
 
-    if await bv.handle_system_msg(mtype, msg, ws, system_ctx):
+    if await ctx.handle_system_msg(mtype, msg, ws, system_ctx):
         _record_perf(ctx, mtype, op_started)
         return True
-    if await bv.handle_runtime_msg(mtype, msg, ws, runtime_ctx):
+    if await ctx.handle_runtime_msg(mtype, msg, ws, runtime_ctx):
         _record_perf(ctx, mtype, op_started)
         return True
-    if await bv.handle_file_msg(mtype, msg, ws, file_ctx):
+    if await ctx.handle_file_msg(mtype, msg, ws, file_ctx):
         _record_perf(ctx, mtype, op_started)
         return True
 
     if await _handle_webrtc_signaling(ctx, mtype, msg, op_started=op_started):
         return True
 
-    if await bv.handle_low_coupling_message(
+    if await ctx.handle_low_coupling_message(
         mtype=mtype,
         msg=msg,
         ws=ws,
@@ -124,5 +136,5 @@ async def dispatch_bridge_command(ctx: CommandDispatchContext, command, *, op_st
     if await _dispatch_route_chain(ctx, mtype, msg, op_started=op_started):
         return
 
-    ctx.bv.log.debug("No direct handler matched for type=%s", mtype)
+    ctx.log.debug("No direct handler matched for type=%s", mtype)
     _record_perf(ctx, mtype, op_started)

@@ -281,6 +281,21 @@ async def handler(ws: ServerConnection) -> None:
             file_ctx=file_ctx,
             router_ctx=router_ctx,
             handler_func=handler,
+            log=bv.log,
+            perf=bv._PERF,
+            perf_counter=bv.time.perf_counter,
+            sessions=bv._SESSIONS,
+            session_backend=bv._session_backend,
+            broadcast_json=bv._broadcast_json,
+            msg_error=bv._msg_error,
+            handle_interaction_message=bv.handle_interaction_message,
+            dispatch_search_message=bv._dispatch_ws_message,
+            handle_system_msg=bv.handle_system_msg,
+            handle_runtime_msg=bv.handle_runtime_msg,
+            handle_file_msg=bv.handle_file_msg,
+            webrtc_message_types=bv.WEBRTC_MESSAGE_TYPES,
+            handle_webrtc_message=bv.handle_webrtc_message,
+            handle_low_coupling_message=bv.handle_low_coupling_message,
         )
         async for raw in ws:
             op_started = bv.time.perf_counter()
