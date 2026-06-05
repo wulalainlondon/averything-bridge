@@ -23,7 +23,39 @@ def _record_perf(ctx: CommandDispatchContext, mtype: str, op_started: float) -> 
     bv._PERF.record(mtype, (bv.time.perf_counter() - op_started) * 1000.0, bv.log)
 
 
-async def dispatch_bridge_command(ctx: CommandDispatchContext, command, *, op_started: float) -> None:
+async def _handle_webrtc_signaling(
+    ctx: CommandDispatchContext,
+    mtype: str,
+    msg: dict,
+    *,
+    op_started: float,
+) -> bool:
+    bv = ctx.bv
+    ws = ctx.ws
+    handler_func = ctx.handler_func
+
+    if mtype not in bv.WEBRTC_MESSAGE_TYPES:
+        return False
+
+    async def _on_channel_ready(adapter):
+        try:
+            await handler_func(adapter)
+        except Exception:
+            bv.log.exception("[webrtc] handler raised on adapter")
+
+    if await bv.handle_webrtc_message(mtype, msg, ws, _on_channel_ready):
+        _record_perf(ctx, mtype, op_started)
+        return True
+    return False
+
+
+async def _dispatch_route_chain(
+    ctx: CommandDispatchContext,
+    mtype: str,
+    msg: dict,
+    *,
+    op_started: float,
+) -> bool:
     bv = ctx.bv
     ws = ctx.ws
     client = ctx.client
@@ -31,20 +63,6 @@ async def dispatch_bridge_command(ctx: CommandDispatchContext, command, *, op_st
     runtime_ctx = ctx.runtime_ctx
     file_ctx = ctx.file_ctx
     router_ctx = ctx.router_ctx
-    handler_func = ctx.handler_func
-
-    msg = command.payload
-    mtype = command.type
-    runtime_ctx["client"] = client
-
-    if await handle_control_command(
-        ctx,
-        mtype,
-        msg,
-        op_started=op_started,
-        record_perf=_record_perf,
-    ):
-        return
 
     if await bv.handle_interaction_message(
         mtype=mtype,
@@ -56,33 +74,24 @@ async def dispatch_bridge_command(ctx: CommandDispatchContext, command, *, op_st
         msg_error=bv._msg_error,
     ):
         _record_perf(ctx, mtype, op_started)
-        return
+        return True
 
     if await bv._dispatch_ws_message(ws, msg):
         _record_perf(ctx, mtype, op_started)
-        return
+        return True
 
     if await bv.handle_system_msg(mtype, msg, ws, system_ctx):
         _record_perf(ctx, mtype, op_started)
-        return
+        return True
     if await bv.handle_runtime_msg(mtype, msg, ws, runtime_ctx):
         _record_perf(ctx, mtype, op_started)
-        return
+        return True
     if await bv.handle_file_msg(mtype, msg, ws, file_ctx):
         _record_perf(ctx, mtype, op_started)
-        return
+        return True
 
-    # WebRTC signaling: once the DataChannel opens we re-enter handler_func()
-    # on the WebRTCChannel adapter so this same dispatch stack runs over P2P.
-    if mtype in bv.WEBRTC_MESSAGE_TYPES:
-        async def _on_channel_ready(adapter):
-            try:
-                await handler_func(adapter)
-            except Exception:
-                bv.log.exception("[webrtc] handler raised on adapter")
-        if await bv.handle_webrtc_message(mtype, msg, ws, _on_channel_ready):
-            _record_perf(ctx, mtype, op_started)
-            return
+    if await _handle_webrtc_signaling(ctx, mtype, msg, op_started=op_started):
+        return True
 
     if await bv.handle_low_coupling_message(
         mtype=mtype,
@@ -92,7 +101,28 @@ async def dispatch_bridge_command(ctx: CommandDispatchContext, command, *, op_st
         ctx=router_ctx,
     ):
         _record_perf(ctx, mtype, op_started)
+        return True
+
+    return False
+
+
+async def dispatch_bridge_command(ctx: CommandDispatchContext, command, *, op_started: float) -> None:
+    runtime_ctx = ctx.runtime_ctx
+    msg = command.payload
+    mtype = command.type
+    runtime_ctx["client"] = ctx.client
+
+    if await handle_control_command(
+        ctx,
+        mtype,
+        msg,
+        op_started=op_started,
+        record_perf=_record_perf,
+    ):
         return
 
-    bv.log.debug("No direct handler matched for type=%s", mtype)
+    if await _dispatch_route_chain(ctx, mtype, msg, op_started=op_started):
+        return
+
+    ctx.bv.log.debug("No direct handler matched for type=%s", mtype)
     _record_perf(ctx, mtype, op_started)
