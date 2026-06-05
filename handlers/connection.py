@@ -16,7 +16,8 @@ import inspect
 
 from websockets.asyncio.server import ServerConnection
 
-from command_dispatcher import CommandDispatchContext, dispatch_bridge_command
+from command_dispatcher import dispatch_bridge_command
+from command_runtime import build_command_dispatch_context
 
 
 async def handler(ws: ServerConnection) -> None:
@@ -169,147 +170,16 @@ async def handler(ws: ServerConnection) -> None:
         pass
 
     try:
-        system_ctx = {
-            "asyncio": bv.asyncio,
-            "client": client,
-            "is_current_client": lambda: bv.client_manager.is_current(ws, client),
-            "sessions": bv._SESSIONS,
-            "backends": bv._BACKENDS,
-            "session_backend": bv._session_backend,
-            "msg_resumable_sessions": bv._msg_resumable_sessions,
-            "permission_mode": bv._PERMISSION_MANAGER.mode() if bv._PERMISSION_MANAGER else "off",
-            "restart_trigger_path": bv._RESTART_TRIGGER_PATH,
-            "msg_agent_tree": bv._msg_agent_tree,
-        }
-        runtime_ctx = {
-            "sessions": bv._SESSIONS,
-            "shell_sessions": bv._SHELL_SESSIONS,
-            "max_shells": bv.MAX_SHELLS,
-            "session_backend": bv._session_backend,
-            "shell_cls": bv.ShellSession,
-            "root_dir": bv._ROOT_DIR,
-            "shell_reader": bv._shell_reader,
-            "msg_error": bv._msg_error,
-            "msg_shell_created": bv._msg_shell_created,
-            "msg_tasks_list": bv._msg_tasks_list,
-            "msg_task_killed": bv._msg_task_killed,
-            "msg_processes_list": bv._msg_processes_list,
-            "msg_process_killed": bv._msg_process_killed,
-            "permission_manager": bv._PERMISSION_MANAGER,
-            "client": client,
-        }
-        file_ctx = {
-            "sessions": bv._SESSIONS,
-            "client": client,
-            "is_current_client": lambda: bv.client_manager.is_current(ws, client),
-            "backends": bv._BACKENDS,
-            "msg_dir_listing": bv._msg_dir_listing,
-            "fcm_token_file": bv.FCM_TOKEN_FILE,
-            "log": bv.log,
-            "root_dir": bv._ROOT_DIR,
-            "get_tunnel_url": bv.get_current_tunnel_url,
-            "is_tunnel_delivered": bv.is_tunnel_url_delivered,
-            "notify_tunnel_fcm_once": bv._do_send_tunnel_fcm,
-        }
         def _spawn_client_task(name, coro, **kwargs):
             kwargs.setdefault("owner", client.client_id)
             return bv._spawn_task(name, coro, **kwargs)
 
-        router_ctx = bv.RouterContext(
-            sessions=bv._SESSIONS,
-            build_sessions_list=bv.build_sessions_list,
-            broadcast_json=bv._broadcast_json,
-            persist_session_meta=bv._persist_session_meta,
-            send_all_sessions=bv._send_all_sessions,
-            spawn_task=_spawn_client_task,
-            handle_push_file=bv._handle_push_file,
-            handle_file_push_ack=bv._handle_file_push_ack,
-            msg_pong=bv._msg_pong,
-            msg_session_history=bv._msg_session_history,
-            send_unread_snapshot=bv._send_unread_snapshot,
-            send_unread_for_client_session=bv._send_unread_for_client_session,
-            mark_read=bv._mark_read,
-            persist_read_cursors=bv._persist_read_cursors,
-            send_session_history_response=bv._send_session_history_response,
-            history_runtime_payload=bv._history_runtime_payload,
-            emit_resume_progress=bv._emit_resume_progress,
-            close_duplicate_device_clients=bv.client_manager.close_duplicate_device_clients,
-            log_warning=bv.log.warning,
-            log_debug=bv.log.debug,
-            sessions_lock=bv._SESSIONS_LOCK,
-            max_sessions=bv.MAX_SESSIONS,
-            default_cwd=bv.DEFAULT_CWD,
-            normalize_backend_name=bv._normalize_backend_name,
-            session_cls=bv.Session,
-            queued_command_cls=bv.QueuedCommand,
-            msg_session_created=bv._msg_session_created,
-            msg_error=bv._msg_error,
-            msg_session_renamed=bv._msg_session_renamed,
-            session_backend=bv._session_backend,
-            send_event=bv.send_event,
-            stop_session_drain=bv.stop_session_drain,
-            evt_session_warning=bv._evt_session_warning,
-            evt_error=bv._evt_error,
-            persist_session=bv._persist_session,
-            read_cursors=bv._READ_CURSORS,
-            remove_saved_session=lambda sid: bv.session_registry.remove_saved_session(
-                sid,
-                saved_sessions_file=bv.SAVED_SESSIONS_FILE,
-                log_warning=bv.log.warning,
-            ),
-            invalidate_sessions_cache=bv.invalidate_sessions_cache,
-            preload_sessions_cache=bv.preload_sessions_cache,
-            backends=bv._BACKENDS,
-            load_session_history_for_transfer=bv._load_session_history_for_transfer,
-            build_handoff_prompt=bv._build_handoff_prompt,
-            run_session_queue=bv._run_session_queue,
-            search_enabled=bv._search_enabled,
-            get_search_worker=bv.get_worker,
-            strip_turn_aborted_notice=bv._strip_turn_aborted_notice,
-            log_prompt_lifecycle=bv._log_prompt_lifecycle,
-            root_dir=bv._ROOT_DIR,
-            data_dir=bv._DATA_DIR,
-            instance_name=bv._INSTANCE_NAME,
-            pairing=bv._PAIRING,
-        )
-        dispatch_ctx = CommandDispatchContext(
+        dispatch_ctx = build_command_dispatch_context(
+            bv=bv,
             ws=ws,
             client=client,
-            system_ctx=system_ctx,
-            runtime_ctx=runtime_ctx,
-            file_ctx=file_ctx,
-            router_ctx=router_ctx,
             handler_func=handler,
-            log=bv.log,
-            perf=bv._PERF,
-            perf_counter=bv.time.perf_counter,
-            time_now=bv.time.time,
-            sessions=bv._SESSIONS,
-            session_backend=bv._session_backend,
-            broadcast_json=bv._broadcast_json,
-            msg_error=bv._msg_error,
-            handle_interaction_message=bv.handle_interaction_message,
-            dispatch_search_message=bv._dispatch_ws_message,
-            handle_system_msg=bv.handle_system_msg,
-            handle_runtime_msg=bv.handle_runtime_msg,
-            handle_file_msg=bv.handle_file_msg,
-            webrtc_message_types=bv.WEBRTC_MESSAGE_TYPES,
-            handle_webrtc_message=bv.handle_webrtc_message,
-            handle_low_coupling_message=bv.handle_low_coupling_message,
-            client_manager=bv.client_manager,
-            pairing=bv._PAIRING,
-            instance_id=bv._INSTANCE_ID,
-            instance_name=bv._INSTANCE_NAME,
-            root_dir=bv._ROOT_DIR,
-            data_dir=bv._DATA_DIR,
-            lan_ip=bv._LAN_IP,
-            get_generation=bv.get_generation,
-            get_current_tunnel_url=bv.get_current_tunnel_url,
-            send_pending_interactions=bv.send_pending_interactions,
-            save_pairing=bv._save_pairing,
-            clear_pairing=bv._clear_pairing,
-            pending_file_push_items=bv.pending_file_push_items,
-            mark_tunnel_url_delivered=bv.mark_tunnel_url_delivered,
+            spawn_client_task=_spawn_client_task,
         )
         async for raw in ws:
             op_started = bv.time.perf_counter()
