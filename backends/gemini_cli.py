@@ -20,11 +20,12 @@ from .base import Backend, _StatesMixin
 from .jsonrpc import JsonRpcPlumber
 from .events import (
     send_event, stream_text,
-    _evt_error, _evt_stopped, _evt_done,
-    _evt_tool_start, _evt_tool_result, _evt_tool_end,
     _evt_session_warning, _evt_session_closed,
-    _msg_session_uuid,
+    _evt_todo_update, _msg_session_uuid,
 )
+from .todo_state import normalize_full_list
+from .tool_lifecycle import ToolLifecycleTracker
+from .turn_lifecycle import emit_turn_done, emit_turn_error, emit_turn_stopped, settle_turn_state
 from .history import complete_history_message, clamp_history_limit, slice_history
 import client_manager
 import task_manager
@@ -54,6 +55,7 @@ class _GeminiState:
     turn_stop_reason: Optional[str] = None  # "end_turn" | "cancelled" | etc.
     turn_error: Optional[str] = None
     spawning: bool = False
+    tool_lifecycle: ToolLifecycleTracker = field(default_factory=ToolLifecycleTracker)
 
 
 class GeminiCliBackend(Backend, _StatesMixin):
@@ -183,7 +185,17 @@ class GeminiCliBackend(Backend, _StatesMixin):
             tool_name = tool_call.get("name") or tool_call.get("toolName") or "tool"
             tool_input = tool_call.get("input") or tool_call.get("args") or {}
             tool_id = tool_call.get("toolCallId") or tool_call.get("id") or "tc"
-            await send_event(session, _evt_tool_start(tool_id, tool_name, json.dumps(tool_input) if isinstance(tool_input, (dict, list)) else str(tool_input)))
+            # write_todos → normalized todo panel (full replace; description→content).
+            # Suppress the tool card; the later tool_call_update no-ops in the app.
+            if tool_name == "write_todos":
+                todos = normalize_full_list(
+                    tool_input.get("todos") if isinstance(tool_input, dict) else None,
+                    content_key="description",
+                )
+                await send_event(session, _evt_todo_update(todos))
+            else:
+                command = json.dumps(tool_input) if isinstance(tool_input, (dict, list)) else str(tool_input)
+                await state.tool_lifecycle.start(session, tool_id, tool_name, command)
 
         elif kind == "tool_call_update":
             tool_call = update.get("toolCall", {}) or {}
@@ -192,8 +204,8 @@ class GeminiCliBackend(Backend, _StatesMixin):
             status = update.get("status") or ""
             if status in ("completed", "done", "success", "error"):
                 output = update.get("output") or update.get("result") or ""
-                await send_event(session, _evt_tool_result(tool_id, str(output)))
-                await send_event(session, _evt_tool_end(tool_id))
+                await state.tool_lifecycle.result(session, tool_id, str(output))
+                await state.tool_lifecycle.end(session, tool_id)
 
         elif kind == "usage_update":
             usage = update.get("usage") or {}
@@ -334,9 +346,7 @@ class GeminiCliBackend(Backend, _StatesMixin):
             try:
                 await self.spawn(session)
             except Exception as exc:
-                session.is_streaming = False
-                session.turn_done_event.set()
-                await send_event(session, _evt_error(f"Failed to start gemini: {exc}", "spawn_failed"))
+                await emit_turn_error(session, f"Failed to start gemini: {exc}", "spawn_failed")
                 return
 
         # Build ACP ContentBlock[]
@@ -382,22 +392,30 @@ class GeminiCliBackend(Backend, _StatesMixin):
             state.turn_stop_reason = stop_reason
 
             if session.is_stopping or stop_reason == "cancelled":
-                await send_event(session, _evt_stopped())
+                await emit_turn_stopped(session, tool_lifecycle=state.tool_lifecycle)
             else:
-                await send_event(session, _evt_done())
+                await emit_turn_done(session, tool_lifecycle=state.tool_lifecycle)
 
         except asyncio.TimeoutError:
             if not session.is_stopping:
-                await send_event(session, _evt_error(
-                    f"Gemini turn timed out after {_TURN_TIMEOUT_SECS}s", "timeout"))
+                await emit_turn_error(
+                    session,
+                    f"Gemini turn timed out after {_TURN_TIMEOUT_SECS}s",
+                    "timeout",
+                    tool_lifecycle=state.tool_lifecycle,
+                    reason="timeout",
+                )
         except Exception as exc:
             if not session.is_stopping:
-                await send_event(session, _evt_error(f"gemini turn failed: {exc}", "stream_error"))
+                await emit_turn_error(
+                    session,
+                    f"gemini turn failed: {exc}",
+                    "stream_error",
+                    tool_lifecycle=state.tool_lifecycle,
+                )
         finally:
             state.turn_active = False
-            session.is_streaming = False
-            session.turn_done_event.set()
-            session.is_stopping = False
+            settle_turn_state(session, clear_accumulated=False, clear_stopping=True)
 
     async def stop(self, session: "Session") -> None:
         state = self._get_state(session)
@@ -412,9 +430,7 @@ class GeminiCliBackend(Backend, _StatesMixin):
             except Exception:
                 pass
 
-        session.is_streaming = False
-        session.turn_done_event.set()
-        await send_event(session, _evt_stopped())
+        await emit_turn_stopped(session, tool_lifecycle=state.tool_lifecycle)
 
     async def clear(self, session: "Session") -> None:
         await self.stop(session)
@@ -431,6 +447,7 @@ class GeminiCliBackend(Backend, _StatesMixin):
                     pass
         state.proc = None
         state.acp_session_id = None
+        state.tool_lifecycle.clear()
         session.resume_id = None
         await send_event(session, _evt_session_warning("Session history cleared."))
 
@@ -442,6 +459,8 @@ class GeminiCliBackend(Backend, _StatesMixin):
                 state.proc.terminate()
             except Exception:
                 pass
+        if state:
+            state.tool_lifecycle.clear()
         await send_event(session, _evt_session_closed())
 
     def supports_resume(self) -> bool:

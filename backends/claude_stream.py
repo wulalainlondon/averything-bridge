@@ -17,11 +17,12 @@ from typing import Any, Optional, TYPE_CHECKING
 
 from utils.uuid_helper import is_valid_uuid
 from .events import (
-    send_event, stream_text, emit_done,
-    _evt_error, _evt_session_warning, _evt_session_died, _evt_session_closed,
-    _evt_tool_start, _evt_tool_result, _evt_tool_end, _evt_thinking_chunk,
-    _msg_session_uuid,
+    send_event, stream_text,
+    _evt_session_warning, _evt_session_died, _evt_session_closed,
+    _evt_thinking_chunk,
+    _evt_todo_update, _msg_session_uuid,
 )
+from .turn_lifecycle import emit_turn_done, emit_turn_error, settle_turn_state
 from interactions import REGISTRY as INTERACTIONS, normalize_questions
 from push_registry import notify_fcm_user_input as _notify_fcm_user_input
 from push_registry import notify_fcm_session_died as _notify_fcm_session_died
@@ -46,6 +47,9 @@ _STREAM_READER_LIMIT = 128 * 1024 * 1024  # 128 MiB — matches codex_appserver;
 
 # Compact when context_used exceeds this fraction of the model's context window.
 _COMPACT_THRESHOLD = 0.80
+
+# Task/plan tools normalized into todo_update events instead of rendered as tool cards.
+_TODO_TOOLS = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate", "TaskDelete"})
 
 
 class _ClaudeProcessMixin:
@@ -134,7 +138,7 @@ class _ClaudeProcessMixin:
             )
         except Exception as exc:
             log.error("[%s] Failed to spawn claude: %s", session.session_id, exc)
-            await send_event(session, _evt_error(f"Failed to spawn claude: {exc}"))
+            await emit_turn_error(session, f"Failed to spawn claude: {exc}")
             state.spawning = False
             if state.proc_ready_event is not None:
                 state.proc_ready_event.set()
@@ -175,8 +179,7 @@ class _ClaudeProcessMixin:
                 await state.proc.stdin.drain()
                 log.info("[%s] Injected timeout context message", session.session_id)
             except Exception as exc:
-                session.is_streaming = False
-                session.turn_done_event.set()
+                settle_turn_state(session, clear_accumulated=False)
                 log.error("[%s] Failed to inject timeout context: %s", session.session_id, exc)
 
     async def _stdout_reader(self, session: "Session") -> None:
@@ -225,8 +228,25 @@ class _ClaudeProcessMixin:
                         tool_id = block.get("id", "")
                         name = block.get("name", "")
                         input_data = block.get("input", {})
+                        # Task/plan tools → normalized todo_update panel, not a tool card.
+                        # Suppress the tool_start (and later its result/end) so they don't
+                        # clutter the message stream. TaskCreate's server-assigned id is
+                        # resolved later from its tool_result text.
+                        if name in _TODO_TOOLS:
+                            if name == "TodoWrite":
+                                changed = state.todo_store.apply_todowrite(input_data)
+                            elif name == "TaskCreate":
+                                changed = state.todo_store.note_create(tool_id, input_data)
+                            elif name == "TaskUpdate":
+                                changed = state.todo_store.apply_update(input_data)
+                            else:  # TaskDelete
+                                changed = state.todo_store.apply_delete(input_data)
+                            if tool_id:
+                                state.todo_suppressed_ids.add(tool_id)
+                            if changed:
+                                await send_event(session, _evt_todo_update(state.todo_store.as_list()))
+                            continue
                         command = input_data.get("command", json.dumps(input_data))
-                        state.tool_blocks[tool_id] = {"name": name}
                         if name == "AskUserQuestion":
                             try:
                                 _questions = normalize_questions(input_data)
@@ -260,7 +280,7 @@ class _ClaudeProcessMixin:
                                 _pending_ask_events.append((tool_id, _wait_ev))
                             except Exception as exc:
                                 log.warning("[%s] AskUserQuestion bridge conversion failed: %s", session.session_id, exc)
-                        await send_event(session, _evt_tool_start(tool_id, name, command))
+                        await state.tool_lifecycle.start(session, tool_id, name, command)
                 # Pause stdout reader until user answers all AskUserQuestion calls.
                 # This ensures tool_result is written to Claude's stdin BEFORE readline()
                 # is called, preventing Claude Code from timing out the interaction.
@@ -289,14 +309,21 @@ class _ClaudeProcessMixin:
                     output = "\n".join(
                         b.get("text", "") for b in output if b.get("type") == "text"
                     )
-                await send_event(session, _evt_tool_result(tool_id, str(output)))
-                await send_event(session, _evt_tool_end(tool_id))
+                # Swallow results for normalized task/todo tools. For TaskCreate this
+                # is where the server-assigned id (#N) arrives — resolve it so later
+                # TaskUpdate(taskId) can match, then re-emit the snapshot.
+                if tool_id in state.todo_suppressed_ids:
+                    state.todo_suppressed_ids.discard(tool_id)
+                    if state.todo_store.resolve_create(tool_id, str(output)):
+                        await send_event(session, _evt_todo_update(state.todo_store.as_list()))
+                    continue
+                await state.tool_lifecycle.result(session, tool_id, str(output))
+                await state.tool_lifecycle.end(session, tool_id)
 
             elif etype == "result":
                 subtype = evt.get("subtype", "")
                 new_uuid = evt.get("session_id")
-                session.is_streaming = False
-                session.turn_done_event.set()
+                settle_turn_state(session, clear_accumulated=False)
                 if state.tree_poll_task and not state.tree_poll_task.done():
                     state.tree_poll_task.cancel()
                     state.tree_poll_task = None
@@ -345,14 +372,14 @@ class _ClaudeProcessMixin:
                             self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id),
                             owner=f"session:{session.session_id}",
                         )
-                    await emit_done(session)
+                    await emit_turn_done(session, tool_lifecycle=state.tool_lifecycle)
                     if session.ws_ref is not None:
                         task_manager.spawn(
                             f"claude-fetch-usage:{session.session_id}",
                             self.fetch_usage(session.ws_ref),
                             owner=f"session:{session.session_id}",
                         )
-                    state.tool_blocks = {}
+                    state.tool_lifecycle.clear()
 
                     # Auto-compact: if context exceeds threshold and compact not already running,
                     # write /compact directly to stdin before the next user message arrives.
@@ -408,8 +435,7 @@ class _ClaudeProcessMixin:
                             await state.proc.stdin.drain()
                         except Exception as exc:
                             log.warning("[%s] auto-compact stdin write failed: %s", session.session_id, exc)
-                            session.is_streaming = False
-                            session.turn_done_event.set()
+                            settle_turn_state(session, clear_accumulated=False)
                             state.compact_in_progress = False
                             if self._broadcast_fn is not None:
                                 task_manager.spawn(
@@ -426,9 +452,8 @@ class _ClaudeProcessMixin:
                 else:
                     err = evt.get("result", "Unknown error")
                     log.error("[%s] result error: %s", session.session_id, err)
-                    await send_event(session, _evt_error(str(err)))
-                    session.accumulated_text = ""
-                    state.tool_blocks = {}
+                    await emit_turn_error(session, str(err), tool_lifecycle=state.tool_lifecycle)
+                    state.tool_lifecycle.clear()
 
             elif etype == "system":
                 subtype = evt.get("subtype", "")
@@ -492,19 +517,19 @@ class _ClaudeProcessMixin:
         # mobile UI do not stay in a stale "processing" state until the next
         # process/session event arrives.
         if session.is_streaming:
-            session.is_streaming = False
-            session.turn_done_event.set()
-            session.accumulated_text = ""
-            state.tool_blocks = {}
+            await emit_turn_error(
+                session,
+                f"Claude process exited (rc={rc}); current response was stopped.",
+                "process_exited",
+                tool_lifecycle=state.tool_lifecycle,
+                reason="process_exited",
+            )
+            state.tool_lifecycle.clear()
             if state.timeout_task and not state.timeout_task.done():
                 state.timeout_task.cancel()
             if state.tree_poll_task and not state.tree_poll_task.done():
                 state.tree_poll_task.cancel()
                 state.tree_poll_task = None
-            await send_event(session, _evt_error(
-                f"Claude process exited (rc={rc}); current response was stopped.",
-                "process_exited",
-            ))
 
         # If compact was in progress when the proc died, clear the flag and notify frontend.
         if state.compact_in_progress:
@@ -627,13 +652,12 @@ class _ClaudeProcessMixin:
                 "已自動終止並重新啟動 Claude…"
             ))
             session.is_stopping = True
-            session.is_streaming = False
-            session.turn_done_event.set()
+            settle_turn_state(session, clear_accumulated=True)
             if state.tree_poll_task and not state.tree_poll_task.done():
                 state.tree_poll_task.cancel()
                 state.tree_poll_task = None
-            session.accumulated_text = ""
-            state.tool_blocks = {}
+            await state.tool_lifecycle.end_all(session, "idle_timeout")
+            state.tool_lifecycle.clear()
             state.timed_out = True
             try:
                 state.proc.send_signal(signal.SIGTERM)

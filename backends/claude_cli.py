@@ -18,12 +18,11 @@ from typing import Any, Callable, Coroutine, Optional, TYPE_CHECKING
 from .base import Backend, _StatesMixin
 from utils.uuid_helper import is_valid_uuid
 from .events import (
-    send_event, stream_text, emit_done,
-    _evt_error, _evt_stopped, _evt_done,
-    _evt_tool_start, _evt_tool_result, _evt_tool_end, _evt_thinking_chunk,
-    _evt_session_warning, _evt_session_died, _evt_session_closed,
-    _msg_session_uuid, _msg_usage_report, _msg_error,
+    send_event,
+    _evt_session_warning, _evt_session_closed,
+    _evt_todo_update, _msg_usage_report, _msg_error,
 )
+from .turn_lifecycle import emit_turn_error, emit_turn_stopped, settle_turn_state
 from .history import (
     complete_history_message, clamp_history_limit, slice_history,
     _JSONL_HISTORY_CACHE, _file_cache_key, HistoryIndex,
@@ -104,12 +103,10 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
             except asyncio.TimeoutError:
                 pass
             if state.proc is None or state.proc.returncode is not None:
-                session.is_streaming = False
-                session.turn_done_event.set()
-                await send_event(session, _evt_error("Claude process failed to start.", "session_dead"))
+                await emit_turn_error(session, "Claude process failed to start.", "session_dead")
                 return
 
-        state.tool_blocks = {}
+        state.tool_lifecycle.clear()
 
         content_blocks: list = []
         for img in (images or []):
@@ -169,10 +166,8 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
             await state.proc.stdin.drain()
             log.info("[%s] Message sent (%d chars, %d images)", session.session_id, len(content), len(images or []))
         except Exception as exc:
-            session.is_streaming = False
-            session.turn_done_event.set()
             log.error("[%s] Failed to write to stdin: %s", session.session_id, exc)
-            await send_event(session, _evt_error(f"stdin write failed: {exc}"))
+            await emit_turn_error(session, f"stdin write failed: {exc}")
             return
 
         if state.timeout_task and not state.timeout_task.done():
@@ -187,7 +182,7 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
         state = self._get_state(session)
 
         if state.proc is None or state.proc.returncode is not None:
-            await send_event(session, _evt_stopped())
+            await emit_turn_stopped(session, tool_lifecycle=state.tool_lifecycle)
             return
 
         session.is_stopping = True
@@ -214,18 +209,15 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
         except ProcessLookupError:
             pass
 
-        session.is_streaming = False
-        session.turn_done_event.set()
         if state.tree_poll_task and not state.tree_poll_task.done():
             state.tree_poll_task.cancel()
             state.tree_poll_task = None
-        session.accumulated_text = ""
-        state.tool_blocks = {}
+        await emit_turn_stopped(session, tool_lifecycle=state.tool_lifecycle)
+        state.tool_lifecycle.clear()
         for ev in state.tool_waiting_events.values():
             ev.set()
         state.tool_waiting_events.clear()
         state.tool_waiting_interactions.clear()
-        await send_event(session, _evt_stopped())
         await self._spawn_proc(session)
 
     async def clear(self, session: "Session") -> None:
@@ -236,14 +228,14 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
             state.timeout_task.cancel()
         session.is_stopping = True
         session.resume_id = None
-        session.accumulated_text = ""
-        state.tool_blocks = {}
+        settle_turn_state(session, clear_accumulated=True)
+        state.tool_lifecycle.clear()
+        state.todo_store.reset()
+        state.todo_suppressed_ids.clear()
         for ev in state.tool_waiting_events.values():
             ev.set()
         state.tool_waiting_events.clear()
         state.tool_waiting_interactions.clear()
-        session.is_streaming = False
-        session.turn_done_event.set()
         if state.tree_poll_task and not state.tree_poll_task.done():
             state.tree_poll_task.cancel()
             state.tree_poll_task = None
@@ -263,6 +255,7 @@ class ClaudeCliBackend(_StatesMixin, _ClaudeHistoryMixin, _ClaudeProcessMixin, _
 
         state.restart_count = 0
         await self._spawn_proc(session)
+        await send_event(session, _evt_todo_update([]))
         await send_event(session, _evt_session_warning("Session history cleared."))
 
     async def close(self, session: "Session") -> None:

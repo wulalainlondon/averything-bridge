@@ -167,6 +167,7 @@ def test_claude_proc_exit_closes_active_stream_before_restart(monkeypatch):
             spawn_calls.append(session_arg.session_id)
 
         monkeypatch.setattr("backends.claude_stream.send_event", fake_send_event)
+        monkeypatch.setattr("backends.turn_lifecycle.send_event", fake_send_event)
         monkeypatch.setattr(backend, "_spawn_proc", fake_spawn)
 
         await backend._watch_proc(session)
@@ -176,7 +177,7 @@ def test_claude_proc_exit_closes_active_stream_before_restart(monkeypatch):
 
     assert session.is_streaming is False
     assert session.accumulated_text == ""
-    assert state.tool_blocks == {}
+    assert state.tool_lifecycle.active == {}
     assert sent_events[0]["type"] == "error"
     assert sent_events[0]["code"] == "process_exited"
     assert "rc=185" in sent_events[0]["message"]
@@ -1016,7 +1017,7 @@ async def test_codex_turn_start_retries_thread_not_found(monkeypatch):
 
     monkeypatch.setattr(backend, "spawn", fake_spawn)
     monkeypatch.setattr(backend, "_rpc", fake_rpc)
-    monkeypatch.setattr(codex_appserver, "emit_done", AsyncMock())
+    monkeypatch.setattr(codex_appserver, "emit_turn_done", AsyncMock())
 
     await backend._run_turn(session, state, [{"type": "text", "text": "hello", "text_elements": []}])
 

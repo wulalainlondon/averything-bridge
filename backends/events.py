@@ -86,6 +86,12 @@ def _evt_tool_result(tool_use_id: str, output: str) -> dict:
 def _evt_tool_end(tool_use_id: str) -> dict:
     return {"type": "tool_end", "tool_use_id": tool_use_id}
 
+# Backend-agnostic task/plan list. Folds Claude TodoWrite + TaskCreate/Update/Delete,
+# Codex update_plan, and Gemini write_todos into one normalized snapshot. `todos` is
+# the full current list (full replace each emit). Item: {id, content, status, activeForm}.
+def _evt_todo_update(todos: list) -> dict:
+    return {"type": "todo_update", "todos": todos}
+
 def _evt_media(media_type: str, path: str, url: str) -> dict:
     return {"type": "media", "media_type": media_type, "path": path, "url": url}
 

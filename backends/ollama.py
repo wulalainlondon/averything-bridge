@@ -17,10 +17,11 @@ except ImportError:
 
 from .base import Backend
 from .events import (
-    send_event, emit_done,
-    _evt_text_chunk, _evt_done, _evt_error, _evt_stopped,
+    send_event,
+    _evt_text_chunk,
     _evt_session_warning, _evt_session_closed,
 )
+from .turn_lifecycle import emit_turn_done, emit_turn_error, emit_turn_stopped, settle_turn_state
 import task_manager
 from .history import complete_history_message, clamp_history_limit, slice_history
 
@@ -45,7 +46,7 @@ class OllamaBackend(Backend):
                    images: list | None = None, files: list | None = None) -> None:
 
         if not _AIOHTTP_AVAILABLE:
-            await send_event(session, _evt_error("aiohttp not installed. Run: pip install aiohttp", "backend_unavailable"))
+            await emit_turn_error(session, "aiohttp not installed. Run: pip install aiohttp", "backend_unavailable")
             return
 
         if not await self._begin_send(session):
@@ -96,8 +97,7 @@ class OllamaBackend(Backend):
                     })
                     if len(history) > OLLAMA_HISTORY_CAP:
                         del history[:-OLLAMA_HISTORY_CAP]
-                    session.is_streaming = False
-                    session.turn_done_event.set()
+                    settle_turn_state(session, clear_accumulated=False)
                     if session.is_stopping:
                         return  # stop() already sent _evt_stopped()
                     if self._notify_fcm_fn is not None:
@@ -106,29 +106,20 @@ class OllamaBackend(Backend):
                             self._notify_fcm_fn(session.name, session.accumulated_text, session.session_id),
                             owner=f"session:{session.session_id}",
                         )
-                    await emit_done(session)
+                    await emit_turn_done(session)
 
         except Exception as exc:
-            session.is_streaming = False
-            session.turn_done_event.set()
-            await send_event(session, _evt_error(f"Ollama error: {exc}"))
+            await emit_turn_error(session, f"Ollama error: {exc}")
         finally:
             session.is_stopping = False
-            session.accumulated_text = ""
 
     async def stop(self, session) -> None:
         session.is_stopping = True
-        session.is_streaming = False
-        session.turn_done_event.set()
-        session.accumulated_text = ""
-        await send_event(session, _evt_stopped())
+        await emit_turn_stopped(session)
 
     async def clear(self, session) -> None:
         self._histories[session.session_id] = []
-        session.is_streaming = False
-        session.turn_done_event.set()
-        session.is_stopping = False
-        session.accumulated_text = ""
+        settle_turn_state(session, clear_accumulated=True, clear_stopping=True)
         await send_event(session, _evt_session_warning("History cleared."))
 
     async def close(self, session) -> None:

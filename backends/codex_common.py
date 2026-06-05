@@ -10,6 +10,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .tool_lifecycle import ToolLifecycleTracker
+
 
 @dataclass
 class _AppServerState:
@@ -23,6 +25,7 @@ class _AppServerState:
     usage_updated_at: float = 0.0
     temp_image_paths: list = field(default_factory=list)
     tool_outputs: dict[str, str] = field(default_factory=dict)
+    tool_lifecycle: ToolLifecycleTracker = field(default_factory=ToolLifecycleTracker)
     compact_in_progress: bool = False
     compact_done_event: asyncio.Event = field(default_factory=asyncio.Event)
     compact_error: Optional[str] = None

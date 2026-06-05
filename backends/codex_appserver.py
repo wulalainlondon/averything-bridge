@@ -24,11 +24,13 @@ from typing import Optional, TYPE_CHECKING
 from .base import Backend, _StatesMixin
 from .jsonrpc import JsonRpcPlumber
 from .events import (
-    send_event, stream_text, emit_done,
-    _evt_error, _evt_stopped, _evt_done, _evt_session_warning, _evt_session_closed,
-    _evt_thinking_chunk, _evt_tool_start, _evt_tool_result, _evt_tool_end,
-    _msg_session_uuid, _msg_usage_report,
+    send_event, stream_text,
+    _evt_session_warning, _evt_session_closed,
+    _evt_thinking_chunk,
+    _evt_todo_update, _msg_session_uuid, _msg_usage_report,
 )
+from .todo_state import normalize_full_list
+from .turn_lifecycle import emit_turn_done, emit_turn_error, emit_turn_stopped, settle_turn_state
 from .history import complete_history_message, clamp_history_limit, load_indexed_jsonl_messages, slice_history, _JSONL_HISTORY_CACHE, DEFAULT_HISTORY_LIMIT
 from interactions import REGISTRY as INTERACTIONS, normalize_questions
 from push_registry import notify_fcm_user_input as _notify_fcm_user_input
@@ -283,7 +285,8 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                     if state:
                         output = state.tool_outputs.get(item_id, "") + output
                         state.tool_outputs[item_id] = output
-                    await send_event(session, _evt_tool_result(item_id, output))
+                    if state:
+                        await state.tool_lifecycle.result(session, item_id, output)
                 except Exception:
                     pass
 
@@ -297,7 +300,8 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                     if state:
                         output = state.tool_outputs.get(item_id, "") + output
                         state.tool_outputs[item_id] = output
-                    await send_event(session, _evt_tool_result(item_id, output))
+                    if state:
+                        await state.tool_lifecycle.result(session, item_id, output)
                 except Exception:
                     pass
 
@@ -312,7 +316,8 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                 state = self._states.get(session.session_id)
                 if state:
                     state.tool_outputs[item_id] = ""
-                await send_event(session, _evt_tool_start(item_id, name, str(command)))
+                if state:
+                    await state.tool_lifecycle.start(session, item_id, name, str(command))
             except Exception:
                 pass
 
@@ -322,13 +327,22 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
             output = params.get("output") or item.get("output") or item.get("result") or ""
             try:
                 state = self._states.get(session.session_id)
-                if output:
+                if state and output:
                     if state:
                         state.tool_outputs[item_id] = str(output)
-                    await send_event(session, _evt_tool_result(item_id, str(output)))
-                await send_event(session, _evt_tool_end(item_id))
+                    await state.tool_lifecycle.result(session, item_id, str(output))
+                if state:
+                    await state.tool_lifecycle.end(session, item_id)
                 if state:
                     state.tool_outputs.pop(item_id, None)
+            except Exception:
+                pass
+
+        elif method == "turn/plan/updated" and session:
+            # Codex update_plan → normalized todo panel. Full replace; step→content.
+            todos = normalize_full_list(params.get("plan"), content_key="step")
+            try:
+                await send_event(session, _evt_todo_update(todos))
             except Exception:
                 pass
 
@@ -342,7 +356,8 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                     if state:
                         output = state.tool_outputs.get(item_id, "") + output
                         state.tool_outputs[item_id] = output
-                    await send_event(session, _evt_tool_result(item_id, output))
+                    if state:
+                        await state.tool_lifecycle.result(session, item_id, output)
                 except Exception:
                     pass
 
@@ -469,9 +484,10 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         if session is None:
             return
         try:
-            await send_event(session, _evt_tool_start(item_id, "codex_approval", str(command)))
-            await send_event(session, _evt_tool_result(item_id, json.dumps(summary, ensure_ascii=False)))
-            await send_event(session, _evt_tool_end(item_id))
+            state = self._get_state(session)
+            await state.tool_lifecycle.start(session, item_id, "codex_approval", str(command))
+            await state.tool_lifecycle.result(session, item_id, json.dumps(summary, ensure_ascii=False))
+            await state.tool_lifecycle.end(session, item_id)
         except Exception:
             pass
 
@@ -484,12 +500,10 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         if session is None:
             return
         try:
-            await send_event(session, _evt_tool_start(item_id, tool_name, command))
-            await send_event(
-                session,
-                _evt_tool_result(item_id, f"Unsupported Codex hosted tool: {tool_name}"),
-            )
-            await send_event(session, _evt_tool_end(item_id))
+            state = self._get_state(session)
+            await state.tool_lifecycle.start(session, item_id, tool_name, command)
+            await state.tool_lifecycle.result(session, item_id, f"Unsupported Codex hosted tool: {tool_name}")
+            await state.tool_lifecycle.end(session, item_id)
         except Exception:
             pass
 
@@ -616,9 +630,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
             try:
                 await self.spawn(session)
             except Exception as exc:
-                session.is_streaming = False
-                session.turn_done_event.set()
-                await send_event(session, _evt_error(f"Failed to start codex thread: {exc}", "spawn_failed"))
+                await emit_turn_error(session, f"Failed to start codex thread: {exc}", "spawn_failed")
                 return
 
         # Build input list.
@@ -714,10 +726,15 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                     state.turn_error = "Codex turn timed out after 6000s"
 
             if session.is_stopping:
-                await send_event(session, _evt_stopped())
+                await emit_turn_stopped(session, tool_lifecycle=state.tool_lifecycle)
             elif state.turn_error:
                 log.warning("[codex-appserver] turn error: %s", state.turn_error)
-                await send_event(session, _evt_error(state.turn_error, "turn_error"))
+                await emit_turn_error(
+                    session,
+                    state.turn_error,
+                    "turn_error",
+                    tool_lifecycle=state.tool_lifecycle,
+                )
             else:
                 # Detect AskUserQuestion JSON block in Codex output.
                 _ask_data = _extract_ask_user_question(session.accumulated_text or "")
@@ -754,7 +771,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                         self._notify_fcm_fn(session.name, session.accumulated_text or "", session.session_id),
                         owner=f"session:{session.session_id}",
                     )
-                await emit_done(session)
+                await emit_turn_done(session, tool_lifecycle=state.tool_lifecycle)
                 if session.ws_ref is not None:
                     task_manager.spawn(
                         f"codex-fetch-usage:{session.session_id}",
@@ -772,19 +789,20 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
 
         except Exception as exc:
             if not session.is_stopping:
-                await send_event(session, _evt_error(f"codex turn failed: {exc}", "stream_error"))
+                await emit_turn_error(
+                    session,
+                    f"codex turn failed: {exc}",
+                    "stream_error",
+                    tool_lifecycle=state.tool_lifecycle,
+                )
         finally:
             state.turn_active = False
-            session.is_streaming = False
-            session.turn_done_event.set()
-            session.is_stopping = False
-            session.accumulated_text = ""
+            settle_turn_state(session, clear_accumulated=True, clear_stopping=True)
             self._cleanup_temp_images(state)
 
     async def _auto_compact(self, session: "Session", state: _AppServerState) -> None:
         if not state.thread_id or self._proc is None or self._proc.returncode is not None:
-            session.is_streaming = False
-            session.turn_done_event.set()
+            settle_turn_state(session, clear_accumulated=False)
             return
         state.compact_done_event.clear()
         state.compact_in_progress = True
@@ -859,8 +877,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                 )
         finally:
             state.compact_in_progress = False
-            session.is_streaming = False
-            session.turn_done_event.set()
+            settle_turn_state(session, clear_accumulated=False)
 
     async def stop(self, session: "Session") -> None:
         state = self._get_state(session)
@@ -878,10 +895,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         # Signal any waiting _run_turn.
         state.turn_error = "stopped"
         state.turn_done_event.set()
-        session.is_streaming = False
-        session.turn_done_event.set()
-        session.accumulated_text = ""
-        await send_event(session, _evt_stopped())
+        await emit_turn_stopped(session, tool_lifecycle=state.tool_lifecycle)
 
     async def clear(self, session: "Session") -> None:
         state = self._get_state(session)
@@ -899,6 +913,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
         state.thread_id = None
         state.last_usage = {}
         state.tool_outputs.clear()
+        state.tool_lifecycle.clear()
         session.resume_id = None
         state.turn_done_event.clear()
         await send_event(session, _evt_session_warning("Session history cleared."))

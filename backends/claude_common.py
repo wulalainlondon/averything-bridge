@@ -11,6 +11,9 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .todo_state import TodoStore
+from .tool_lifecycle import ToolLifecycleTracker
+
 
 # All current Claude models share a 200k input context window.
 # Unknown / non-Claude models return 0 (auto-compact disabled).
@@ -35,10 +38,12 @@ class _ClaudeState:
     timed_out: bool = False
     spawning: bool = False
     proc_ready_event: Optional[asyncio.Event] = field(default=None, repr=False)
-    tool_blocks: dict = field(default_factory=dict)
+    tool_lifecycle: ToolLifecycleTracker = field(default_factory=ToolLifecycleTracker)
     tool_waiting_events: dict = field(default_factory=dict)  # tool_use_id → asyncio.Event
     tool_waiting_interactions: dict = field(default_factory=dict)  # tool_use_id → request_id
     restart_count: int = 0
     pending_stop: bool = False
     bad_resume: bool = False
     compact_in_progress: bool = False
+    todo_store: TodoStore = field(default_factory=TodoStore)
+    todo_suppressed_ids: set = field(default_factory=set)  # tool_use_ids whose result/end we swallow
