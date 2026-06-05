@@ -1,7 +1,18 @@
 """Inbound WebSocket protocol validation."""
 from __future__ import annotations
 
-from typing import Literal, NotRequired, TypedDict
+import json
+from dataclasses import dataclass
+from typing import Any, Literal, NotRequired, TypedDict
+
+
+@dataclass(frozen=True)
+class BridgeCommand:
+    """Validated inbound bridge command, independent of the transport frame."""
+
+    type: str
+    payload: dict[str, Any]
+    raw_len: int = 0
 
 
 class PingMsg(TypedDict):
@@ -256,3 +267,24 @@ def validate_client_msg(msg: object) -> str | None:
         if not isinstance(val, expected_type):
             return f"'{mtype}.{field_name}' must be {expected_type.__name__}, got {type(val).__name__}"
     return None
+
+
+def parse_client_command(raw: object, *, raw_len: int = 0) -> tuple[BridgeCommand | None, str | None]:
+    """Decode and validate one inbound client frame.
+
+    The returned BridgeCommand is transport-agnostic: WebSocket, WebRTC
+    DataChannel, tests, or future IO adapters can all feed the same command
+    shape into the bridge core.
+    """
+    if isinstance(raw, dict):
+        msg = raw
+    else:
+        try:
+            msg = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return None, "invalid JSON"
+
+    err = validate_client_msg(msg)
+    if err:
+        return None, err
+    return BridgeCommand(type=msg["type"], payload=msg, raw_len=raw_len), None

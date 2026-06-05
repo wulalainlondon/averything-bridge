@@ -276,21 +276,18 @@ async def handler(ws: ServerConnection) -> None:
             raw_text = str(raw)
             raw_len = len(raw_text.encode("utf-8", errors="ignore"))
 
-            try:
-                msg = bv.json.loads(raw_text)
-            except bv.json.JSONDecodeError:
-                bv.log.warning("Non-JSON from client: bytes=%d", raw_len)
-                continue
-            bv.log.debug("Received: %s", bv._summarize_client_msg(msg, raw_len))
-
-            # --- Inbound schema validation ---
-            validation_err = bv.validate_client_msg(msg)
-            if validation_err:
-                bv.log.warning("Invalid client msg: %s | %s", validation_err, bv._summarize_client_msg(msg, raw_len))
+            command, validation_err = bv.parse_client_command(raw_text, raw_len=raw_len)
+            if command is None:
+                if validation_err == "invalid JSON":
+                    bv.log.warning("Non-JSON from client: bytes=%d", raw_len)
+                    continue
+                bv.log.warning("Invalid client msg: %s | bytes=%d", validation_err, raw_len)
                 await bv.client_manager.send_json(ws, bv._msg_error(f"Protocol error: {validation_err}"), client)
                 continue
 
-            mtype = msg["type"]  # safe after validation
+            msg = command.payload
+            bv.log.debug("Received: %s", bv._summarize_client_msg(msg, raw_len))
+            mtype = command.type
             runtime_ctx["client"] = client
             if mtype == "hello":
                 if isinstance(msg.get("device_id"), str) and msg.get("device_id", "").strip():

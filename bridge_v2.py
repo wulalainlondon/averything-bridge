@@ -81,7 +81,7 @@ from task_manager import cancel_owner as _cancel_client_tasks
 from task_manager import spawn as _spawn_task
 from utils.uuid_helper import is_valid_uuid
 from permission_manager import PermissionManager
-from protocol import _KNOWN_MSG_TYPES, validate_client_msg
+from protocol import _KNOWN_MSG_TYPES, parse_client_command, validate_client_msg
 from push_registry import (
     configure as configure_push_registry,
     handle_file_push_ack as _handle_file_push_ack,
