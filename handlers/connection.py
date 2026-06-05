@@ -14,13 +14,12 @@ circular import. Deferring to call time avoids the cycle entirely.
 
 import inspect
 
-from websockets.asyncio.server import ServerConnection
-
 from command_dispatcher import dispatch_bridge_command
 from command_runtime import build_command_dispatch_context
+from transport import BridgeTransport, transport_remote_address, transport_user_agent
 
 
-async def handler(ws: ServerConnection) -> None:
+async def handler(ws: BridgeTransport) -> None:
     import bridge_v2 as bv
 
     # Liveness probe short-circuit.  The supervisor's bridge_healthcheck.py
@@ -33,10 +32,7 @@ async def handler(ws: ServerConnection) -> None:
     # the TCP/WS handshake to succeed and their control PING to be ponged
     # (websockets library handles control PING automatically); we just need to
     # keep the connection open until the probe closes it.
-    try:
-        ua = ws.request.headers.get("User-Agent", "") if ws.request else ""
-    except Exception:
-        ua = ""
+    ua = transport_user_agent(ws)
     if ua.startswith("bridge-healthcheck/"):
         try:
             async for _ in ws:
@@ -62,7 +58,7 @@ async def handler(ws: ServerConnection) -> None:
     ):
         bv._spawn_task("cloudflared-start:on-connect", bv._start_cloudflared_tunnel(bv._BRIDGE_PORT))
 
-    remote = ws.remote_address
+    remote = transport_remote_address(ws)
     client = bv.ClientConn(
         client_id=f"c_{bv.uuid.uuid4().hex[:8]}",
         device_id=f"device_{bv.uuid.uuid4().hex[:8]}",

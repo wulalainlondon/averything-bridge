@@ -38,6 +38,8 @@ import json
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
+from transport import BridgeTransport
+
 try:
     from aiortc import (
         RTCConfiguration,
@@ -71,7 +73,7 @@ WEBRTC_MESSAGE_TYPES = frozenset({"webrtc_offer", "webrtc_answer", "webrtc_ice"}
 _PC_BY_SIGNALING: "dict[Any, RTCPeerConnection]" = {}
 
 
-class WebRTCChannel:
+class WebRTCChannel(BridgeTransport):
     """WebSocket-like adapter over an aiortc DataChannel.
 
     Duck-types ``websockets.asyncio.server.ServerConnection`` so the existing
