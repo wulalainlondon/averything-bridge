@@ -273,7 +273,6 @@ async def handler(ws: ServerConnection) -> None:
             pairing=bv._PAIRING,
         )
         dispatch_ctx = CommandDispatchContext(
-            bv=bv,
             ws=ws,
             client=client,
             system_ctx=system_ctx,
@@ -284,6 +283,7 @@ async def handler(ws: ServerConnection) -> None:
             log=bv.log,
             perf=bv._PERF,
             perf_counter=bv.time.perf_counter,
+            time_now=bv.time.time,
             sessions=bv._SESSIONS,
             session_backend=bv._session_backend,
             broadcast_json=bv._broadcast_json,
@@ -296,6 +296,20 @@ async def handler(ws: ServerConnection) -> None:
             webrtc_message_types=bv.WEBRTC_MESSAGE_TYPES,
             handle_webrtc_message=bv.handle_webrtc_message,
             handle_low_coupling_message=bv.handle_low_coupling_message,
+            client_manager=bv.client_manager,
+            pairing=bv._PAIRING,
+            instance_id=bv._INSTANCE_ID,
+            instance_name=bv._INSTANCE_NAME,
+            root_dir=bv._ROOT_DIR,
+            data_dir=bv._DATA_DIR,
+            lan_ip=bv._LAN_IP,
+            get_generation=bv.get_generation,
+            get_current_tunnel_url=bv.get_current_tunnel_url,
+            send_pending_interactions=bv.send_pending_interactions,
+            save_pairing=bv._save_pairing,
+            clear_pairing=bv._clear_pairing,
+            pending_file_push_items=bv.pending_file_push_items,
+            mark_tunnel_url_delivered=bv.mark_tunnel_url_delivered,
         )
         async for raw in ws:
             op_started = bv.time.perf_counter()

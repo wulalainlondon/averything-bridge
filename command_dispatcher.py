@@ -8,7 +8,6 @@ from control_commands import handle_control_command
 
 @dataclass(frozen=True)
 class CommandDispatchContext:
-    bv: object
     ws: object
     client: object
     system_ctx: dict
@@ -19,6 +18,7 @@ class CommandDispatchContext:
     log: object
     perf: object
     perf_counter: object
+    time_now: object
     sessions: object
     session_backend: object
     broadcast_json: object
@@ -31,6 +31,20 @@ class CommandDispatchContext:
     webrtc_message_types: object
     handle_webrtc_message: object
     handle_low_coupling_message: object
+    client_manager: object
+    pairing: dict
+    instance_id: str
+    instance_name: str
+    root_dir: str
+    data_dir: str
+    lan_ip: str
+    get_generation: object
+    get_current_tunnel_url: object
+    send_pending_interactions: object
+    save_pairing: object
+    clear_pairing: object
+    pending_file_push_items: object
+    mark_tunnel_url_delivered: object
 
 
 def _record_perf(ctx: CommandDispatchContext, mtype: str, op_started: float) -> None:
