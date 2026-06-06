@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 from .events import send_event, _evt_tool_start, _evt_tool_result, _evt_tool_end
 
+_MAX_TOOL_OUTPUT = 256 * 1024  # 256 KB — mirrors claude_history.py
+
 
 @dataclass
 class ToolLifecycleTracker:
@@ -24,6 +26,8 @@ class ToolLifecycleTracker:
     async def result(self, session, tool_id: str, output: str) -> None:
         if not tool_id or tool_id in self.suppressed:
             return
+        if len(output) > _MAX_TOOL_OUTPUT:
+            output = output[:_MAX_TOOL_OUTPUT] + "\n…(truncated)"
         await send_event(session, _evt_tool_result(tool_id, output))
 
     async def end(self, session, tool_id: str) -> None:

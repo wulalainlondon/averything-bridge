@@ -265,10 +265,18 @@ class _CodexNativeSessionMixin:
     @staticmethod
     def _is_codex_bootstrap_text(text: str) -> bool:
         stripped = text.lstrip()
+        if (
+            stripped.startswith("<environment_context>")
+            and "</environment_context>" in stripped
+            and "<cwd>" in stripped
+        ):
+            return True
         return (
             stripped.startswith("# AGENTS.md instructions")
-            and "<environment_context>" in stripped
-            and "<INSTRUCTIONS>" in stripped
+            and (
+                "<environment_context>" in stripped
+                or "<INSTRUCTIONS>" in stripped
+            )
         )
 
     def _load_native_session_history(
