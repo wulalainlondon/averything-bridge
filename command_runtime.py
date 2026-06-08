@@ -16,6 +16,7 @@ def build_command_dispatch_context(*, bv, ws, client, handler_func, spawn_client
         "permission_mode": bv._PERMISSION_MANAGER.mode() if bv._PERMISSION_MANAGER else "off",
         "restart_trigger_path": bv._RESTART_TRIGGER_PATH,
         "msg_agent_tree": bv._msg_agent_tree,
+        "root_dir": bv._ROOT_DIR,
     }
     runtime_ctx = {
         "sessions": bv._SESSIONS,

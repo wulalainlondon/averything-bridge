@@ -67,6 +67,14 @@ async def handle_system_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
             _RESUMABLE_CACHE = (now + _RESUMABLE_TTL_SEC, [dict(item) for item in resumable])
         active_uuids = {s.resume_id for s in sessions.values() if s.resume_id}
         resumable = [r for r in resumable if r.get("claude_uuid") not in active_uuids]
+        root_dir = ctx.get("root_dir", "")
+        if root_dir:
+            from utils.path_jail import is_inside_jail
+            real_root = os.path.realpath(root_dir)
+            resumable = [
+                r for r in resumable
+                if is_inside_jail(os.path.realpath(os.path.expanduser(r.get("cwd") or "~")), real_root)
+            ]
         if not ctx.get("is_current_client", lambda: True)():
             return True
         try:
