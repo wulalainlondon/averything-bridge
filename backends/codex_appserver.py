@@ -39,6 +39,7 @@ import task_manager
 from .codex_common import _AppServerState
 from .codex_native import _CodexNativeSessionMixin
 from .codex_images import _CodexImageMixin
+from .codex_tools import normalize_codex_live_tool
 if TYPE_CHECKING:
     from bridge_v2 import Session
 
@@ -306,18 +307,15 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                     pass
 
         elif method == "item/started" and session:
-            item = params.get("item", {}) if isinstance(params.get("item"), dict) else {}
-            item_id = str(params.get("itemId") or item.get("id") or "codex_item")
-            name = str(params.get("name") or item.get("name") or item.get("type") or "codex")
-            command = params.get("command") or item.get("command") or item.get("input") or ""
-            if isinstance(command, (dict, list)):
-                command = json.dumps(command, ensure_ascii=False)
+            tool = normalize_codex_live_tool(params)
+            if not tool:
+                return
             try:
                 state = self._states.get(session.session_id)
                 if state:
-                    state.tool_outputs[item_id] = ""
+                    state.tool_outputs[tool.tool_use_id] = ""
                 if state:
-                    await state.tool_lifecycle.start(session, item_id, name, str(command))
+                    await state.tool_lifecycle.start(session, tool.tool_use_id, tool.name, tool.command)
             except Exception:
                 pass
 

@@ -23,10 +23,34 @@ Canonical item shape:
 import re
 
 _VALID_STATUS = ("pending", "in_progress", "completed")
-_TASK_ID_RE = re.compile(r"#(\d+)")
+_STATUS_ALIASES = {
+    "todo": "pending",
+    "open": "pending",
+    "queued": "pending",
+    "doing": "in_progress",
+    "running": "in_progress",
+    "in-progress": "in_progress",
+    "inprogress": "in_progress",
+    "active": "in_progress",
+    "done": "completed",
+    "complete": "completed",
+    "success": "completed",
+    "succeeded": "completed",
+}
+_TASK_ID_RE = re.compile(r"(?:#|task(?:[_\s-]*id)?\D+|id\D+)(\d+)", re.IGNORECASE)
+
+
+def _normalize_status(status) -> str:
+    key = str(status or "").strip().lower().replace(" ", "_")
+    if not key:
+        return ""
+    if key in _VALID_STATUS:
+        return key
+    return _STATUS_ALIASES.get(key, str(status or ""))
 
 
 def _coerce_item(content, status, active_form, item_id="") -> dict | None:
+    status = _normalize_status(status)
     if not content or status not in _VALID_STATUS:
         return None
     return {
@@ -110,7 +134,7 @@ class TodoStore:
         tid = str(inp.get("taskId") or inp.get("task_id") or "")
         if not tid:
             return False
-        status = inp.get("status")
+        status = _normalize_status(inp.get("status"))
         for it in self._items:
             if it["id"] == tid:
                 changed = False

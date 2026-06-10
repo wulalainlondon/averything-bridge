@@ -681,6 +681,58 @@ class TestBuildSessionsListNoSpawn:
         assert delivered[-2]["output"] == "hel"
         assert delivered[-1]["output"] == "hello"
 
+    def test_codex_live_tool_start_normalizes_function_call(self):
+        """Codex app-server tool starts should render through the shared tool_call UI."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from backends.codex_appserver import CodexAppServerBackend
+        from backends.events import flush_session_events, set_event_dispatcher
+
+        async def run():
+            backend = CodexAppServerBackend("codex")
+            session = MagicMock()
+            session.session_id = "s_codex_tool"
+            session.current_request_id = "r_codex_tool"
+            session.ws_ref = None
+            session.offline_buffer = []
+            backend._states[session.session_id] = backend._state_factory()
+            backend._thread_to_session["thread_1"] = session
+
+            delivered: list[dict] = []
+
+            async def dispatcher(payload: dict, session_arg) -> bool:
+                delivered.append(payload)
+                assert session_arg is session
+                return True
+
+            set_event_dispatcher(dispatcher)
+            try:
+                await backend._dispatch({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_1",
+                        "item": {
+                            "id": "call_1",
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"pwd\",\"workdir\":\"/tmp\"}",
+                        },
+                    },
+                })
+                await flush_session_events(session)
+            finally:
+                set_event_dispatcher(None)
+            return delivered
+
+        delivered = asyncio.run(run())
+
+        assert len(delivered) == 1
+        assert delivered[0]["type"] == "tool_start"
+        assert delivered[0]["tool_use_id"] == "call_1"
+        assert delivered[0]["name"] == "Bash"
+        assert delivered[0]["command"] == "pwd"
+
     def test_codex_spawn_uses_session_model(self, tmp_path):
         """thread/start should respect the model selected on the bridge session."""
         import asyncio
@@ -794,6 +846,91 @@ class TestBuildSessionsListNoSpawn:
         assert sessions[0]["name"] == "檢查壓縮 rollout"
         history = backend._load_native_session_history(uid, limit=10)
         assert [m["content"] for m in history["messages"]] == ["檢查壓縮 rollout", "可以讀取"]
+
+    def test_codex_history_replays_tool_blocks(self, tmp_path):
+        """Codex native rollout tool calls should hydrate into shared tool_call blocks."""
+        from backends.codex_appserver import CodexAppServerBackend
+
+        uid = _random_uuid()
+        day = tmp_path / "sessions" / "2026" / "06" / "05"
+        day.mkdir(parents=True)
+        path = day / f"rollout-2026-06-05T01-27-37-{uid}.jsonl"
+        records = [
+            {
+                "timestamp": "2026-06-05T01:27:37.210Z",
+                "type": "session_meta",
+                "payload": {"id": uid, "cwd": "/tmp/codex-tools"},
+            },
+            {
+                "timestamp": "2026-06-05T01:27:38.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "跑工具"}],
+                },
+            },
+            {
+                "timestamp": "2026-06-05T01:27:39.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}",
+                },
+            },
+            {
+                "timestamp": "2026-06-05T01:27:40.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "/tmp/codex-tools\n",
+                },
+            },
+            {
+                "timestamp": "2026-06-05T01:27:41.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "id": "call_2",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** Add File: src/a.ts\n+export {}\n*** End Patch\n",
+                },
+            },
+            {
+                "timestamp": "2026-06-05T01:27:42.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_2",
+                    "output": "Success\n",
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        backend = CodexAppServerBackend("codex")
+        backend._native_sessions_root = str(tmp_path / "sessions")
+        history = backend._load_native_session_history(uid, limit=20, mode="snapshot")
+
+        messages = history["messages"]
+        assert [m["role"] for m in messages] == ["user", "assistant", "assistant"]
+        bash = messages[1]["blocks"][0]
+        patch = messages[2]["blocks"][0]
+        assert bash == {
+            "type": "tool_call",
+            "tool_use_id": "call_1",
+            "name": "Bash",
+            "command": "pwd",
+            "output": "/tmp/codex-tools\n",
+        }
+        assert patch["type"] == "tool_call"
+        assert patch["tool_use_id"] == "call_2"
+        assert patch["name"] == "ApplyPatch"
+        assert "src/a.ts" in patch["command"]
+        assert patch["output"] == "Success\n"
 
 
 # ---------------------------------------------------------------------------

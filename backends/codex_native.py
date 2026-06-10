@@ -18,9 +18,13 @@ from typing import TYPE_CHECKING
 
 from .history import (
     complete_history_message, clamp_history_limit, slice_history,
-    load_indexed_jsonl_messages,
 )
 from .codex_common import _sanitize_session_name
+from .codex_tools import (
+    codex_payload_call_id,
+    codex_response_tool_output,
+    normalize_codex_response_tool,
+)
 
 if TYPE_CHECKING:
     from bridge_v2 import Session
@@ -290,11 +294,25 @@ class _CodexNativeSessionMixin:
         path = self._find_native_session_file(resume_id)
         if not path or not os.path.isfile(path):
             return []
-        def parse(row: dict, line_no: int, offset: int) -> dict | None:
+        def build_message(row: dict, line_no: int, offset: int, tool_outputs: dict[str, str]) -> dict | None:
             if row.get("type") != "response_item":
                 return None
             payload = row.get("payload", {})
-            if not isinstance(payload, dict) or payload.get("type") != "message":
+            if not isinstance(payload, dict):
+                return None
+            tool = normalize_codex_response_tool(payload, tool_outputs.get(codex_payload_call_id(payload), ""))
+            if tool:
+                ts = self._parse_iso_to_epoch(str(row.get("timestamp") or "")) * 1000
+                return complete_history_message(
+                    source="codex",
+                    source_session_id=resume_id,
+                    source_message_id=f"codex:{resume_id}:line:{line_no}",
+                    role="assistant",
+                    content=tool.command,
+                    timestamp=ts or None,
+                    blocks=[tool.history_block()],
+                )
+            if payload.get("type") != "message":
                 return None
             role = payload.get("role")
             if role not in {"user", "assistant"}:
@@ -317,26 +335,37 @@ class _CodexNativeSessionMixin:
                 blocks=[{"type": "text", "text": text}],
             )
         try:
-            if path.endswith(".gz"):
-                messages: list[dict] = []
-                offset = 0
-                with _open_codex_rollout_text(path) as f:
-                    for line_no, raw in enumerate(f, start=1):
-                        start_offset = offset
-                        offset += len(raw.encode("utf-8", errors="ignore"))
-                        line = raw.strip()
-                        if not line:
-                            continue
-                        try:
-                            row = json.loads(line)
-                        except Exception:
-                            continue
-                        msg = parse(row, line_no, start_offset)
-                        if msg:
-                            messages.append(msg)
-            else:
-                index = load_indexed_jsonl_messages(cache_name=f"codex:{resume_id}", path=path, parse_line=parse)
-                messages = index.messages
+            rows: list[tuple[dict, int, int]] = []
+            offset = 0
+            with _open_codex_rollout_text(path) as f:
+                for line_no, raw in enumerate(f, start=1):
+                    start_offset = offset
+                    offset += len(raw.encode("utf-8", errors="ignore"))
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    rows.append((row, line_no, start_offset))
+
+            tool_outputs: dict[str, str] = {}
+            for row, _line_no, _offset in rows:
+                if row.get("type") != "response_item":
+                    continue
+                payload = row.get("payload", {})
+                if not isinstance(payload, dict):
+                    continue
+                result = codex_response_tool_output(payload)
+                if result:
+                    tool_outputs[result[0]] = result[1]
+
+            messages = []
+            for row, line_no, offset in rows:
+                msg = build_message(row, line_no, offset, tool_outputs)
+                if msg:
+                    messages.append(msg)
         except Exception:
             return []
         return slice_history(
