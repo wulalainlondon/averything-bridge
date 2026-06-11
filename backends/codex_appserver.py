@@ -565,7 +565,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                     "cwd": cwd,
                     "approvalPolicy": "never",
                     "sandbox": self._sandbox_mode(session),
-                }, timeout=15.0)
+                }, timeout=30.0)
                 thread = result.get("thread", {})
                 state.thread_id = thread.get("id") or session.resume_id
             except Exception as exc:
@@ -580,7 +580,7 @@ class CodexAppServerBackend(Backend, _StatesMixin, _CodexNativeSessionMixin, _Co
                 "ephemeral": False,
                 "approvalPolicy": "never",
                 "sandbox": self._sandbox_mode(session),
-            }, timeout=15.0)
+            }, timeout=30.0)
             thread = result.get("thread", {})
             state.thread_id = thread.get("id")
             if not state.thread_id:
