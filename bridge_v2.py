@@ -130,7 +130,7 @@ except ImportError as _ie:
     _SEARCH_AVAILABLE = False
     _SEARCH_IMPORT_ERR = str(_ie)
 from backends.events import (
-    send_event, stream_text, scan_for_media, set_media_base_url, set_http_serve_dir,
+    send_event, stream_text, scan_for_media, set_media_base_url, get_media_base_url, set_http_serve_dir,
     _evt_error, _evt_done, _evt_stopped, _evt_session_warning, _evt_session_died, _evt_session_closed,
     _evt_resume_progress,
     _evt_text_chunk, _evt_tool_start, _evt_tool_result, _evt_tool_end, _evt_media,
@@ -138,6 +138,8 @@ from backends.events import (
     _msg_session_history, _msg_history_snapshot, _msg_history_delta, _msg_resumable_sessions, _msg_session_uuid,
     _msg_shell_created, _msg_shell_output, _msg_shell_closed,
     _msg_tasks_list, _msg_task_killed, _msg_processes_list, _msg_process_killed, _msg_dir_listing, _msg_usage_report,
+    _msg_artifacts_list, _msg_artifact_created, _msg_artifact_updated,
+    _msg_youtube_task_started, _msg_youtube_task_done, _msg_youtube_task_failed,
     _msg_agent_tree,
     set_event_dispatcher,
     stop_session_drain,

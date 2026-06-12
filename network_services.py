@@ -26,7 +26,11 @@ except ImportError:
     _ZEROCONF_AVAILABLE = False
 
 
-_ALLOWED_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".m4v", ".avi"}
+_ALLOWED_MEDIA_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".avif",
+    ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv",
+    ".html", ".htm", ".pdf", ".md", ".txt", ".json", ".csv", ".srt", ".vtt",
+}
 
 _root_dir = ""
 _instance_id = ""

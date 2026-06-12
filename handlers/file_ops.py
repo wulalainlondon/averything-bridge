@@ -8,6 +8,7 @@ import os
 import time
 
 from utils.path_jail import resolve_jailed, JailEscape
+from handlers.artifact_ops import handle_artifact_msg
 
 
 def _dir_hash(entries: list[dict]) -> str:
@@ -188,6 +189,9 @@ async def _resumable_for_path(path: str, backends: dict, active_uuids: set[str])
 
 
 async def handle_file_msg(mtype: str, msg: dict, ws, ctx: dict) -> bool:
+    if mtype in {"scan_artifacts", "youtube_task"}:
+        return await handle_artifact_msg(mtype, msg, ws, ctx)
+
     if mtype == "browse_dir":
         req_path = msg.get("path") or "~"
         root_dir = ctx.get("root_dir", "")

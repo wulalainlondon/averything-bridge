@@ -121,6 +121,19 @@ class OpenFileMsg(TypedDict):
     path: str
 
 
+class ScanArtifactsMsg(TypedDict):
+    type: Literal["scan_artifacts"]
+    path: NotRequired[str]
+    limit: NotRequired[int]
+
+
+class YoutubeTaskMsg(TypedDict):
+    type: Literal["youtube_task"]
+    url: str
+    session_id: NotRequired[str]
+    options: NotRequired[dict]
+
+
 class HelloMsg(TypedDict):
     type: Literal["hello"]
     device_id: NotRequired[str]
@@ -175,6 +188,8 @@ _INBOUND_REQUIRED: dict[str, list[tuple[str, type]]] = {
     "kill_process": [("pid", int)],
     "browse_dir": [],
     "open_file": [("path", str)],
+    "scan_artifacts": [],
+    "youtube_task": [("url", str)],
     "request_history": [("session_id", str)],
     "set_effort": [("session_id", str), ("effort", str)],
     "set_session_meta": [("session_id", str)],
@@ -221,7 +236,7 @@ _KNOWN_MSG_TYPES: frozenset[str] = frozenset({
     "rename_session", "clear_session", "get_usage", "get_resumable_sessions",
     "shell_create", "shell_input", "shell_close", "get_tasks", "kill_task",
     "get_processes", "kill_process",
-    "fcm_token", "tunnel_url_ack", "request_sessions_list", "browse_dir", "open_file", "request_history",
+    "fcm_token", "tunnel_url_ack", "request_sessions_list", "browse_dir", "open_file", "scan_artifacts", "youtube_task", "request_history",
     "set_effort", "hello", "set_session_meta", "switch_session_config",
     "permission_response",
     "user_input_response", "request_user_input_response", "choice_response",
