@@ -49,6 +49,48 @@ def test_gen_is_stable_within_process_and_on_every_event():
     assert buf[0]["gen"] == ev.get_generation()
 
 
+def test_offline_collapses_completed_turn_content():
+    """A terminated turn's buffered streaming content is collapsed so reconnect
+    replay does not re-animate a finished session as if it were streaming. Only
+    the terminal marker survives; the content is recoverable from history."""
+    import backends.events as ev
+    ev.set_event_dispatcher(None)
+
+    async def run():
+        s = _session("s")
+        s.current_request_id = "r1"  # so events are stamped with request_id
+        await ev.send_event(s, {"type": "text_chunk", "content": "Hello "})
+        await ev.send_event(s, {"type": "tool_start", "name": "Bash", "command": "ls"})
+        await ev.send_event(s, {"type": "text_chunk", "content": "world"})
+        await ev.send_event(s, {"type": "done"})
+        return s.offline_buffer
+
+    buf = asyncio.run(run())
+    assert [e["type"] for e in buf] == ["done"]
+
+
+def test_offline_collapse_scoped_to_turn_request():
+    """Collapsing is keyed by (session, request): an in-flight turn (different
+    request_id) is not disturbed when an earlier turn terminates."""
+    import backends.events as ev
+    ev.set_event_dispatcher(None)
+
+    async def run():
+        s = _session("s")
+        s.current_request_id = "r1"
+        await ev.send_event(s, {"type": "text_chunk", "content": "done-turn"})
+        s.current_request_id = "r2"
+        await ev.send_event(s, {"type": "text_chunk", "content": "live-turn"})
+        s.current_request_id = "r1"
+        await ev.send_event(s, {"type": "done"})  # terminate only r1
+        return s.offline_buffer
+
+    buf = asyncio.run(run())
+    # r1 chunk collapsed; survivors: r2 chunk (still in-flight) + r1 done.
+    types = [(e["type"], e.get("request_id")) for e in buf]
+    assert types == [("text_chunk", "r2"), ("done", "r1")]
+
+
 def test_multi_client_dispatch_sees_identical_seq():
     """Stamp happens before _EVENT_DISPATCHER, so all clients see the same seq."""
     import backends.events as ev

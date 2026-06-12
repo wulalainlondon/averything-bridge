@@ -54,6 +54,9 @@ async def ensure_http_server() -> None:
 def set_media_base_url(url: str) -> None:
     global _MEDIA_BASE_URL
     _MEDIA_BASE_URL = url.rstrip("/")
+
+def get_media_base_url() -> str:
+    return _MEDIA_BASE_URL
 _EVENT_DISPATCHER: Callable[[dict, "Session"], Awaitable[bool]] | None = None
 
 MEDIA_RE = re.compile(
@@ -268,6 +271,24 @@ def _msg_process_killed(pid: int, success: bool, message: str = "") -> dict:
 def _msg_dir_listing(path: str, entries: list[dict], sessions: list[dict]) -> dict:
     return {"type": "dir_listing", "path": path, "entries": entries, "sessions": sessions}
 
+def _msg_artifacts_list(artifacts: list[dict]) -> dict:
+    return {"type": "artifacts_list", "artifacts": artifacts}
+
+def _msg_artifact_created(artifact: dict) -> dict:
+    return {"type": "artifact_created", "artifact": artifact}
+
+def _msg_artifact_updated(artifact: dict) -> dict:
+    return {"type": "artifact_updated", "artifact": artifact}
+
+def _msg_youtube_task_started(task_id: str, artifact: dict) -> dict:
+    return {"type": "youtube_task_started", "task_id": task_id, "artifact": artifact}
+
+def _msg_youtube_task_done(task_id: str, artifacts: list[dict]) -> dict:
+    return {"type": "youtube_task_done", "task_id": task_id, "artifacts": artifacts}
+
+def _msg_youtube_task_failed(task_id: str, artifact: dict, message: str) -> dict:
+    return {"type": "youtube_task_failed", "task_id": task_id, "artifact": artifact, "message": message}
+
 def _msg_usage_report(
     five_hour: dict | None,
     seven_day: dict | None,
@@ -292,7 +313,41 @@ def _msg_agent_tree(session_id: str, tree_data: dict) -> dict:
 # send_event — route session-scoped events; buffer when client is offline
 # ---------------------------------------------------------------------------
 
+# Per-turn streaming content that history will faithfully reproduce. Once a turn
+# ends, replaying these on reconnect is redundant (the client fetches a history
+# snapshot on open) and only makes a finished turn briefly animate as if it were
+# still streaming — so a terminal event collapses them away. Kept in sync with
+# the Go bridge's streamingContentEvent (internal/governance/offline.go).
+_OFFLINE_STREAMING_CONTENT_TYPES = frozenset({
+    "text_chunk", "thinking_chunk", "tool_start", "tool_result",
+    "tool_end", "media", "document", "todo_update",
+})
+_OFFLINE_TERMINAL_TYPES = frozenset({"done", "stopped", "error"})
+
+
+def _collapse_completed_turn(session: "Session", session_id, request_id) -> None:
+    """Drop buffered streaming content for a just-terminated turn, keyed by exact
+    (session, request) so an in-flight turn and other sessions are untouched."""
+    session.offline_buffer[:] = [
+        evt for evt in session.offline_buffer
+        if not (
+            evt.get("type") in _OFFLINE_STREAMING_CONTENT_TYPES
+            and evt.get("session_id") == session_id
+            and evt.get("request_id") == request_id
+        )
+    ]
+
+
 def _append_offline(session: "Session", payload: dict) -> None:
+    # A turn is identified by its request id; without one we cannot tell turns
+    # apart, so leave such (rare/legacy) events untouched rather than risk
+    # collapsing a different turn's content.
+    if (
+        payload.get("type") in _OFFLINE_TERMINAL_TYPES
+        and payload.get("session_id")
+        and payload.get("request_id")
+    ):
+        _collapse_completed_turn(session, payload["session_id"], payload["request_id"])
     if len(session.offline_buffer) >= OFFLINE_BUFFER_MAX:
         if payload.get("type") == "text_chunk":
             # Merge into the most recent text_chunk rather than dropping either event.
