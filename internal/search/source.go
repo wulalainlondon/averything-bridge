@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"everything-go/internal/sourcepolicy"
@@ -39,6 +40,7 @@ type sessionMeta struct {
 type source interface {
 	name() string
 	enabled() bool
+	owns(path string) bool
 	discover() []string
 	// iterMessages reads complete lines from startOffset to EOF, returning the
 	// extracted messages and the byte offset after the last complete line.
@@ -64,6 +66,15 @@ func headSig(path string) string {
 // invoking fn(raw, nextOffset) per line. An incomplete trailing line is left
 // for a later resume. Returns the offset after the last complete line.
 func lineReader(path string, startOffset int64, fn func(raw []byte, lineNum int, nextOffset int64)) int64 {
+	return lineReaderUntil(path, startOffset, func(raw []byte, lineNum int, nextOffset int64) bool {
+		fn(raw, lineNum, nextOffset)
+		return false
+	})
+}
+
+// lineReaderUntil is lineReader with an early-stop signal. Metadata readers use
+// it to stop physical I/O as soon as cwd/timestamp/display name are known.
+func lineReaderUntil(path string, startOffset int64, fn func(raw []byte, lineNum int, nextOffset int64) bool) int64 {
 	f, err := os.Open(path)
 	if err != nil {
 		return startOffset
@@ -80,8 +91,11 @@ func lineReader(path string, startOffset int64, fn func(raw []byte, lineNum int,
 		if len(raw) > 0 && raw[len(raw)-1] == '\n' {
 			next := offset + int64(len(raw))
 			lineNum++
-			fn(raw, lineNum, next)
+			stop := fn(raw, lineNum, next)
 			offset = next
+			if stop {
+				return offset
+			}
 		}
 		if err != nil {
 			break // EOF or incomplete trailing line (not emitted)
@@ -95,6 +109,9 @@ func lineReader(path string, startOffset int64, fn func(raw []byte, lineNum int,
 type claudeSource struct{ root string }
 
 func newClaudeSource() claudeSource {
+	if configured := strings.TrimSpace(os.Getenv("EVERYTHING_GO_CLAUDE_PROJECTS_DIR")); configured != "" {
+		return claudeSource{root: configured}
+	}
 	home, _ := os.UserHomeDir()
 	return claudeSource{root: filepath.Join(home, ".claude", "projects")}
 }
@@ -104,6 +121,10 @@ func (c claudeSource) name() string { return "claude" }
 func (c claudeSource) enabled() bool {
 	info, err := os.Stat(c.root)
 	return err == nil && info.IsDir()
+}
+
+func (c claudeSource) owns(path string) bool {
+	return pathWithinRoot(path, c.root) && strings.HasSuffix(filepath.Base(path), ".jsonl")
 }
 
 func (c claudeSource) discover() []string {
@@ -224,13 +245,10 @@ func (c claudeSource) sessionMeta(path string) sessionMeta {
 		meta.ProjectDir = filepath.Dir(path)
 	}
 	cwdSet := false
-	lineReader(path, 0, func(raw []byte, _ int, _ int64) {
-		if meta.Cwd != "" && meta.FirstTS != "" && meta.DisplayName != "" {
-			return
-		}
+	lineReaderUntil(path, 0, func(raw []byte, _ int, _ int64) bool {
 		var rec claudeRecord
 		if json.Unmarshal(raw, &rec) != nil {
-			return
+			return false
 		}
 		if !cwdSet && rec.Cwd != "" {
 			meta.Cwd = rec.Cwd
@@ -245,6 +263,7 @@ func (c claudeSource) sessionMeta(path string) sessionMeta {
 				meta.DisplayName = collapseWS(text, 80)
 			}
 		}
+		return meta.Cwd != "" && meta.FirstTS != "" && meta.DisplayName != ""
 	})
 	return meta
 }
@@ -272,21 +291,23 @@ func (c codexSource) enabled() bool {
 	return err == nil && info.IsDir()
 }
 
+func (c codexSource) owns(path string) bool {
+	name := filepath.Base(path)
+	return pathWithinRoot(path, c.root) && strings.HasPrefix(name, "rollout-") && strings.HasSuffix(name, ".jsonl")
+}
+
 func (c codexSource) discover() []string {
 	matches, _ := filepath.Glob(filepath.Join(c.root, "*", "*", "*", "rollout-*.jsonl"))
-	filtered := make([]string, 0, len(matches))
-	for _, path := range matches {
-		meta := c.sessionMeta(path)
-		if !sourcepolicy.IgnoreCodexSession(
-			meta.Cwd,
-			meta.DisplayName,
-			c.ignoreCWDGlobs,
-			c.ignoreNamePrefixes,
-		) {
-			filtered = append(filtered, path)
-		}
-	}
-	return filtered
+	return matches
+}
+
+func (c codexSource) includeMeta(meta sessionMeta) bool {
+	return !sourcepolicy.IgnoreCodexSession(
+		meta.Cwd,
+		meta.DisplayName,
+		c.ignoreCWDGlobs,
+		c.ignoreNamePrefixes,
+	)
 }
 
 func (c codexSource) headSignature(path string) string { return headSig(path) }
@@ -319,7 +340,7 @@ func (c codexSource) iterMessages(path string, startOffset int64) ([]searchableM
 	cwdResolved := false
 	var msgs []searchableMessage
 
-	final := lineReader(path, startOffset, func(raw []byte, lineNum int, _ int64) {
+	final := lineReader(path, startOffset, func(raw []byte, _ int, nextOffset int64) {
 		var rec codexRecord
 		if json.Unmarshal(raw, &rec) != nil {
 			return
@@ -354,7 +375,10 @@ func (c codexSource) iterMessages(path string, startOffset int64) ([]searchableM
 		}
 		msgUUID := rec.UUID
 		if msgUUID == "" {
-			msgUUID = stem + ":line:" + itoa(lineNum)
+			// Incremental reads restart their local line counter at 1. Using that
+			// counter made later batches collide with the first batch, so SQLite
+			// silently discarded every new UUID-less Codex message.
+			msgUUID = stem + ":offset:" + strconv.FormatInt(nextOffset, 10)
 		}
 		parent := rec.ParentUUID
 		if parent == "" {
@@ -372,13 +396,10 @@ func (c codexSource) iterMessages(path string, startOffset int64) ([]searchableM
 func (c codexSource) sessionMeta(path string) sessionMeta {
 	meta := sessionMeta{ProjectDir: filepath.Dir(path)}
 	cwdSet := false
-	lineReader(path, 0, func(raw []byte, _ int, _ int64) {
-		if meta.Cwd != "" && meta.FirstTS != "" && meta.DisplayName != "" {
-			return
-		}
+	lineReaderUntil(path, 0, func(raw []byte, _ int, _ int64) bool {
 		var rec codexRecord
 		if json.Unmarshal(raw, &rec) != nil {
-			return
+			return false
 		}
 		if meta.FirstTS == "" && rec.Timestamp != "" {
 			meta.FirstTS = rec.Timestamp
@@ -399,6 +420,7 @@ func (c codexSource) sessionMeta(path string) sessionMeta {
 				}
 			}
 		}
+		return meta.Cwd != "" && meta.FirstTS != "" && meta.DisplayName != ""
 	})
 	return meta
 }
@@ -408,6 +430,25 @@ func isCodexBootstrap(text string) bool {
 	return strings.HasPrefix(s, "# AGENTS.md instructions") &&
 		strings.Contains(s, "<environment_context>") &&
 		strings.Contains(s, "<INSTRUCTIONS>")
+}
+
+// pathWithinRoot resolves symlinks before comparing paths. Dirty paths enter
+// the indexer through a local child-process boundary, so the source must still
+// reject traversal and symlink escapes rather than trusting its caller.
+func pathWithinRoot(path, root string) bool {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(root) == "" {
+		return false
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // blocksToText extracts text from a content field that is either a JSON string

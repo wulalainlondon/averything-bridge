@@ -25,22 +25,69 @@ func truncate(s string, n int) string {
 	return s
 }
 
+func sessionConfigValidationError(cmd clientproto.Command) string {
+	if cmd.Backend != "" {
+		switch cmd.Backend {
+		case backend.Claude, backend.Codex, backend.Ollama, backend.RemoteWS:
+		default:
+			return "unsupported_backend"
+		}
+	}
+	if cmd.Sandbox != "" {
+		switch cmd.Sandbox {
+		case "read-only", "workspace-write", "danger-full-access":
+		default:
+			return "invalid_sandbox"
+		}
+	}
+	if cmd.EffortSet && cmd.Effort != "" && cmd.Effort != "auto" {
+		switch cmd.Effort {
+		case "low", "medium", "high", "xhigh", "max", "ultra":
+		default:
+			return "invalid_effort"
+		}
+	}
+	return ""
+}
+
 // route dispatches an inbound frame on its envelope `type`. Transport-cheap
 // commands are answered locally from the Hub's own state; the rest are forwarded
 // to the Executor. The payload beyond {type, session_id} is only inspected by
 // the specific handler that needs it.
 func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
+	if c.inventoryProbe && cmd.Kind != "hello" && cmd.Kind != "claim_bridge" && cmd.Kind != "ping" {
+		c.enqueueEvent(h.client.Error("", "", "Connection probes cannot issue application commands"))
+		return
+	}
 	if c.enrollmentOnly && cmd.Kind != "hello" && cmd.Kind != "claim_bridge" && cmd.Kind != "ping" {
 		c.enqueueEvent(h.client.Error("", "", "Pairing required before this device can use the bridge"))
 		return
 	}
+	if h.rejectToolMaintenanceWrite(c, cmd) {
+		return
+	}
+	if h.rejectPMCommand(c, cmd) {
+		return
+	}
 	switch cmd.Kind {
+	case "human_ai_collaboration":
+		h.handleCollaboration(c, cmd)
+	case "pm_collaboration":
+		h.handlePM(c, cmd)
 	case "hello":
 		c.deviceID = cmd.DeviceID
+		c.clientSurface = strings.ToLower(strings.TrimSpace(cmd.ClientSurface))
+		c.protocolVersion = cmd.ProtocolVersion
 		c.supportsReplayAck = cmd.ReplayAck
+		if b := c.inventoryBinding.Load(); b != nil && b.deviceID == cmd.DeviceID && !cmd.ConnectionProbe && !c.inventoryProbe {
+			promoted := *b
+			promoted.probe = false
+			c.inventoryBinding.Store(&promoted)
+			h.observeClientInfo(c, cmd.DeviceID, cmd.ClientInfo)
+		}
 		// Latest-device-wins: evict any older client from the same device so the
 		// half-disconnect storm can't pile up zombie clients (#1).
-		if !c.enrollmentOnly {
+		if !c.enrollmentOnly && !c.inventoryProbe && !cmd.ConnectionProbe {
 			h.registerLatest(c)
 		}
 		h.tunnelURLMu.RLock()
@@ -54,14 +101,53 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 			PairingOpen:  h.pairing.EnrollmentOpen(),
 			InstanceName: h.cfg.InstanceName,
 		}
+		if !c.enrollmentOnly && h.pmEnabled {
+			helloInput.Capabilities = append(helloInput.Capabilities, "pm_collaboration_v1", "human_ai_collaboration_v2")
+		}
 		if !c.enrollmentOnly {
+			if _, ok := h.exec.(backend.RecapExecutor); ok {
+				helloInput.Capabilities = append(helloInput.Capabilities, "session_recap_v1")
+			}
+			if _, ok := h.exec.(backend.ToolEnvironmentExecutor); ok {
+				helloInput.Capabilities = append(helloInput.Capabilities, "tool_environment_v1")
+			}
 			helloInput.RootDir = h.cfg.RootDir
 			helloInput.DataDir = h.cfg.DataDir
 			helloInput.LanIP = h.cfg.LanIP
+			if h.cfg.ResolveLANIP != nil {
+				helloInput.LanIP = h.cfg.ResolveLANIP()
+			}
 			helloInput.TunnelURL = tunnelURL
 			helloInput.Backends = h.cfg.Backends
+			if h.work != nil {
+				// work_coordination_v1 is the stable product capability. Keep the
+				// provisional work_items_v1 token during the released-client
+				// migration window; both names address the same wire schema.
+				helloInput.Capabilities = append(helloInput.Capabilities, "work_coordination_v1", "work_items_v1", "project_bootstrap_v1", "work_review_feedback_v1")
+			}
+			if h.events != nil {
+				helloInput.Capabilities = append(helloInput.Capabilities, "event_inbox_v1")
+			}
+			if h.automation != nil {
+				helloInput.Capabilities = append(helloInput.Capabilities, "external_automation_v1")
+			}
+		}
+		if !c.enrollmentOnly && h.messageQueue != nil {
+			helloInput.Capabilities = append(helloInput.Capabilities, "message_queue_v1", "queue_message_detail_v1")
+		}
+		if !c.enrollmentOnly && h.deviceInventory != nil {
+			helloInput.Capabilities = append(helloInput.Capabilities, "device_inventory_v1")
+		}
+		if !c.enrollmentOnly {
+			helloInput.Capabilities = append(helloInput.Capabilities, "session_config_revision_v1", "file_attachments_v1", "next_message_config_v1", "bootstrap_snapshot_v1")
 		}
 		c.enqueueEvent(h.client.HelloAck(helloInput))
+		if c.inventoryProbe || cmd.ConnectionProbe {
+			return
+		}
+		if !c.enrollmentOnly && h.pmEnabled {
+			c.enqueueEvent(h.pmSnapshot("", nil, nil))
+		}
 		// A provisional LAN client receives only enough information to complete
 		// claim_bridge. Do not disclose sessions, goals, replay, files or backend
 		// metadata before its per-device credential is persisted.
@@ -75,6 +161,21 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 		// while this (or the previous) client was offline — same ordering as the
 		// Python bridge so the app reconciles before replayed events arrive.
 		c.enqueueEvent(h.client.SessionsList(h.sessionSummaries()))
+		c.enqueueEvent(h.runtimeSnapshot(c.deviceID))
+		if h.events != nil {
+			if snapshot, err := h.events.Snapshot(ctx, c.deviceID, 0); err == nil {
+				c.enqueueEvent(h.client.ExternalEventSnapshot(snapshot))
+			} else {
+				log.Printf("[events] snapshot device=%s: %v", c.deviceID, err)
+			}
+		}
+		if h.automation != nil {
+			c.enqueueEvent(h.automationSnapshotEvent())
+		}
+		// Work reconciliation is client-cursor driven. The client responds to
+		// the advertised capability with work_sync_request using the revision it
+		// has durably applied. Pushing an unconditional snapshot here made every
+		// reconnect O(board size) and could replace a warm cache unnecessarily.
 		// Goal is durable state. Send the full latest snapshot before transient
 		// replay so a dropped historical goal_update cannot leave the UI stale.
 		c.enqueueEvent(h.goals.Snapshot())
@@ -87,11 +188,24 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 		// Python bridge, which re-emits pending file_push frames on hello).
 		h.sendPendingPushes(c)
 
+	case "request_tool_environment":
+		h.handleToolEnvironment(c, cmd)
+	case "prepare_tool_environment_repair":
+		h.handleToolEnvironment(c, cmd)
+	case "apply_tool_environment_repair":
+		h.handleToolEnvironment(c, cmd)
+	case "request_tool_environment_operation":
+		h.handleToolEnvironment(c, cmd)
+	case "cancel_tool_environment_repair":
+		h.handleToolEnvironment(c, cmd)
 	case "ping":
-		c.enqueueEvent(h.client.Pong())
+		if cmd.ClientInfo != nil {
+			h.observeClientInfo(c, c.deviceID, cmd.ClientInfo)
+		}
+		c.enqueuePong()
 
 	case "attachment_upload_init":
-		c.uploads.init(cmd.SessionID, cmd.UploadRequestID, cmd.Name, cmd.MediaType, cmd.SizeBytes)
+		c.uploads.initKind(cmd.SessionID, cmd.UploadRequestID, cmd.Name, cmd.MediaType, cmd.SizeBytes, cmd.UploadKind)
 
 	case "attachment_upload_finish":
 		c.uploads.finish(cmd.UploadID)
@@ -116,7 +230,9 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 		}
 		wasEnrollment := c.enrollmentOnly
 		c.enrollmentOnly = false
-		if wasEnrollment {
+		h.syncDeviceInventory()
+		h.bindDeviceInventory(c, cmd.AuthToken, cmd.DeviceID, c.inventoryName, c.clientSurface, c.inventoryProbe)
+		if wasEnrollment && !c.inventoryProbe {
 			h.registerLatest(c)
 		}
 		c.enqueueEvent(h.client.ClaimAck())
@@ -131,6 +247,7 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 			return
 		}
 		c.enqueueEvent(h.client.UnclaimAck(h.pairing.IsLocked()))
+		h.syncDeviceInventory()
 
 	case "request_sessions_list":
 		c.enqueueEvent(h.client.SessionsList(h.sessionSummaries()))
@@ -143,6 +260,41 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 
 	case "offline_replay_ack":
 		h.ackOfflineReplay(c, cmd.BatchID)
+
+	case "session_runtime_ack":
+		// ACK is intentionally one-way. Echoing the updated session_runtime here
+		// makes legacy clients ACK the echo again forever, rewriting the journal
+		// and eventually starving WebSocket pings. The next authoritative runtime
+		// change or requested snapshot carries the device-specific read state.
+		_, _ = h.runtimes.Ack(c.deviceID, cmd.SessionID, cmd.Revision, cmd.Read)
+
+	case "request_runtime_snapshot":
+		c.enqueueEvent(h.runtimeSnapshot(c.deviceID))
+
+	case "work_sync_request":
+		h.sendWorkSync(c, cmd.Revision)
+
+	case "work_sync_ack":
+		h.handleWorkSyncAck(c, cmd)
+
+	case "work_diagnostics_request":
+		if h.work != nil {
+			diagnostics, err := h.work.Diagnostics(context.Background())
+			if err != nil {
+				c.enqueueEvent(protocol.WorkError{Type: "work_error", Code: "diagnostics_failed", Message: err.Error()})
+			} else {
+				c.enqueueEvent(protocol.WorkDiagnostics{Type: "work_diagnostics", Diagnostics: diagnostics})
+			}
+		}
+
+	case "work_project_create", "work_item_create", "work_session_import", "work_item_update", "work_item_move",
+		"work_item_review_decision",
+		"work_item_archive", "work_item_restore", "work_item_link_session", "work_item_unlink_session",
+		"work_item_dependency_add", "work_item_dependency_remove", "work_item_comment_add",
+		"work_item_comment_edit", "work_item_attachment_add", "work_item_attachment_remove",
+		"work_item_start_run", "work_item_read", "work_workflow_create",
+		"work_project_bootstrap_generate", "work_project_bootstrap_approve":
+		h.handleWorkCommand(c, cmd)
 
 	case "handoff_to_desktop":
 		h.handleDesktopHandoff(c, cmd.SessionID)
@@ -185,6 +337,7 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 			return
 		}
 		s := h.registry.Create(cmd.SessionID, cmd.Name, cwd, cmd.Backend, cmd.Model, cmd.Sandbox, cmd.ResumeClaudeID)
+		h.runtimes.Ensure(cmd.SessionID, "idle", 0)
 		if cmd.EffortSet {
 			s.SetEffort(cmd.Effort)
 		}
@@ -198,38 +351,28 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 		h.Emit(h.client.SessionsList(h.sessionSummaries()))
 
 	case "message":
-		if h.rejectMobileWrite(c, cmd.SessionID) {
-			return
+		h.enqueueChatMessage(c, cmd)
+	case "request_message_queue":
+		go h.reconcileMaintenance(cmd.SessionID, false)
+		h.sendMessageQueue(c, cmd)
+	case "resume_session_queue":
+		go h.resumeMaintenanceQueue(c, cmd)
+	case "promote_queued_message":
+		if queueRequestValid(cmd) {
+			h.promoteQueuedMessage(c, cmd)
 		}
-		s, ok := h.registry.Get(cmd.SessionID)
-		if !ok {
-			h.Emit(h.client.Error(cmd.SessionID, "no_session", "unknown session"))
-			return
-		}
-		// Enqueue on the session's turn worker: turns for one session run one at
-		// a time, in order, so two messages can't interleave a backend's stdin.
-		// The turn outlives this connection, so it gets its own context.
-		reqID, content := cmd.RequestID, cmd.Content
-		images, files := cmd.Images, cmd.Files
-		content, files, err := h.resolveUploadedVideos(cmd.SessionID, content, files)
-		if err != nil {
-			h.Emit(h.client.Error(cmd.SessionID, "invalid_attachment", err.Error()))
-			return
-		}
-		if !s.Submit(func() {
-			if err := h.exec.Send(context.Background(), s, reqID, content, images, files); err != nil {
-				if errors.Is(err, backend.ErrThreadActiveWriter) {
-					h.markDesktopWriter(s)
-					h.Emit(backend.NewError(s.ID, reqID, "session_controlled_by_desktop", "This session is currently controlled by the desktop. Exit the desktop TUI and reclaim mobile control before sending a new turn."))
-					return
-				}
-				log.Printf("[%s] send error: %v", s.ID, err)
-			}
-		}) {
-			h.Emit(h.client.Error(cmd.SessionID, "session_closed", "session is closed"))
+	case "cancel_queued_message":
+		if queueRequestValid(cmd) {
+			h.cancelQueuedMessage(c, cmd)
 		}
 
 	case "steer_message":
+		if h.messageQueue != nil {
+			if _, found, err := h.messageQueue.Get(cmd.SessionID, cmd.RequestID); err == nil && found {
+				h.promoteQueuedMessage(c, cmd)
+				return
+			}
+		}
 		if h.rejectMobileWrite(c, cmd.SessionID) {
 			return
 		}
@@ -286,8 +429,11 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 
 	case "stop":
 		if s, ok := h.registry.Get(cmd.SessionID); ok {
+			releaseQueue := s.HoldQueue()
 			s.MarkStopping()
+			h.updateRuntime(cmd.SessionID, "stopping", "", s.QueueLen(), "", "")
 			go func() {
+				defer releaseQueue()
 				_ = h.exec.Stop(context.Background(), s)
 				s.EndTurn() // release the queue even if the backend emits no terminal event
 			}()
@@ -295,7 +441,9 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 
 	case "clear_session":
 		if s, ok := h.registry.Get(cmd.SessionID); ok {
+			releaseQueue := s.HoldQueue()
 			go func() {
+				defer releaseQueue()
 				_ = h.exec.Clear(context.Background(), s)
 				s.EndTurn() // clear cancels an in-flight turn without a done/stopped
 			}()
@@ -304,7 +452,9 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 	case "close_session":
 		if s, ok := h.registry.Get(cmd.SessionID); ok {
 			go func() { _ = h.exec.Close(context.Background(), s) }()
+			h.closeQueuedMessages(cmd.SessionID)
 			h.registry.Delete(cmd.SessionID) // also stops the session's turn worker
+			h.updateRuntime(cmd.SessionID, "closed", "", 0, "closed", "")
 			h.Emit(h.client.SessionClosed(cmd.SessionID))
 			go h.registry.Persist()
 		}
@@ -317,27 +467,51 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 		}
 		go h.sendHistory(c, s, cmd)
 
+	case "request_session_recap":
+		h.handleSessionRecap(c, cmd)
+	case "generate_session_recap":
+		h.handleSessionRecap(c, cmd)
+
 	case "get_resumable_sessions":
 		go h.sendResumable(c, 100)
 
 	case "rename_session":
-		if s, ok := h.registry.Get(cmd.SessionID); ok {
-			s.SetName(cmd.Name)
-			h.Emit(h.client.SessionRenamed(s.ID, cmd.Name))
-			go h.registry.Persist()
+		name := strings.TrimSpace(cmd.Name)
+		if len([]rune(name)) > 200 {
+			c.enqueueEvent(h.client.SessionRenameRejected(cmd.SessionID, h.cfg.InstanceID,
+				cmd.MutationID, "name_too_long", "", 0))
+			return
+		}
+		snap, changed, err := h.registry.RenameAndPersist(cmd.SessionID, name, c.deviceID,
+			cmd.MutationID, cmd.ExpectedRevision)
+		if err != nil {
+			reason := "persist_failed"
+			switch {
+			case errors.Is(err, session.ErrRenameConflict):
+				reason = "revision_conflict"
+			case errors.Is(err, session.ErrRenameEmpty):
+				reason = "name_empty"
+			case errors.Is(err, session.ErrSessionMissing):
+				reason = "session_not_found"
+			}
+			c.enqueueEvent(h.client.SessionRenameRejected(cmd.SessionID, h.cfg.InstanceID,
+				cmd.MutationID, reason, snap.Name, snap.MetadataRevision))
+			return
+		}
+		event := h.client.SessionRenamed(cmd.SessionID, snap.Name, h.cfg.InstanceID,
+			cmd.MutationID, snap.MetadataRevision, snap.NameUpdatedAt, snap.NameUpdatedBy)
+		if changed {
+			h.Emit(event)
+		} else {
+			// Idempotent retries receive the same authoritative confirmation
+			// without rebroadcasting a duplicate mutation to every device.
+			c.enqueueEvent(event)
 		}
 
 	case "set_session_meta":
 		if s, ok := h.registry.Get(cmd.SessionID); ok {
 			s.SetMeta(cmd.Pinned, cmd.Hidden)
 			h.Emit(h.client.SessionMetaUpdated(cmd.SessionID, cmd.Pinned, cmd.Hidden))
-			go h.registry.Persist()
-		}
-
-	case "set_effort":
-		// Stored on the session; applied as --effort on the next claude spawn.
-		if s, ok := h.registry.Get(cmd.SessionID); ok {
-			s.SetEffort(cmd.Effort)
 			go h.registry.Persist()
 		}
 
@@ -404,20 +578,68 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 			}
 		}()
 
+	case "set_effort":
+		cmd.Kind = "switch_session_config"
+		cmd.EffortSet = true
+		h.route(ctx, c, cmd)
+
 	case "switch_session_config":
-		if s, ok := h.registry.Get(cmd.SessionID); ok {
-			s.ApplyConfig(cmd.Backend, cmd.Model, cmd.Sandbox)
-			if cmd.EffortSet {
-				s.SetEffort(cmd.Effort)
-			}
-			s.ApplyCodexSettings(cmd.ServiceTier, cmd.CollaborationMode, cmd.Personality)
-			if updater, ok := h.exec.(interface {
-				UpdateSessionSettings(context.Context, *session.Session) error
-			}); ok && s.Backend() == backend.Codex {
-				go func() { _ = updater.UpdateSessionSettings(context.Background(), s) }()
-			}
-			go h.registry.Persist()
+		s, ok := h.registry.Get(cmd.SessionID)
+		if !ok {
+			c.enqueueEvent(h.client.SessionConfigResult(cmd.SessionID, cmd.MutationID, false, "session_not_found", session.Snapshot{}))
+			return
 		}
+		if cmd.ConfigScope == "next_message" {
+			h.setNextMessageConfiguration(c, cmd, s)
+			return
+		}
+		if cmd.ConfigScope != "" {
+			c.enqueueEvent(h.client.SessionConfigResult(cmd.SessionID, cmd.MutationID, false, "invalid_config_scope", s.SettingsSnapshot()))
+			return
+		}
+		h.messageQueueMu.Lock()
+		defer h.messageQueueMu.Unlock()
+		before, release, reserveErr := s.ReserveConfiguration(cmd.ExpectedConfigRevision)
+		if reserveErr != nil {
+			c.enqueueEvent(h.client.SessionConfigResult(cmd.SessionID, cmd.MutationID, false, reserveErr.Error(), before))
+			return
+		}
+		defer release()
+		if reason := sessionConfigValidationError(cmd); reason != "" {
+			c.enqueueEvent(h.client.SessionConfigResult(cmd.SessionID, cmd.MutationID, false, reason, before))
+			return
+		}
+
+		s.ApplyConfig(cmd.Backend, cmd.Model, cmd.Sandbox)
+		if cmd.ModelSet {
+			s.SetModel(cmd.Model)
+		}
+		if cmd.EffortSet {
+			s.SetEffort(cmd.Effort)
+		}
+		s.ApplyCodexSettings(cmd.ServiceTier, cmd.CollaborationMode, cmd.Personality)
+		if updater, supported := h.exec.(interface {
+			UpdateSessionSettings(context.Context, *session.Session) error
+		}); supported {
+			if err := updater.UpdateSessionSettings(ctx, s); err != nil {
+				s.RestoreConfig(before)
+				c.enqueueEvent(h.client.SessionConfigResult(cmd.SessionID, cmd.MutationID, false, "runtime_rejected: "+err.Error(), before))
+				return
+			}
+		}
+		s.SetConfigRevision(before.ConfigRevision + 1)
+		if err := h.registry.PersistDurably(); err != nil {
+			s.RestoreConfig(before)
+			s.SetConfigRevision(before.ConfigRevision)
+			if updater, supported := h.exec.(interface {
+				UpdateSessionSettings(context.Context, *session.Session) error
+			}); supported {
+				_ = updater.UpdateSessionSettings(ctx, s)
+			}
+			c.enqueueEvent(h.client.SessionConfigResult(cmd.SessionID, cmd.MutationID, false, "config_persist_failed", before))
+			return
+		}
+		h.Emit(h.client.SessionConfigResult(cmd.SessionID, cmd.MutationID, true, "", s.Snapshot()))
 
 	case "fork_session":
 		go h.handleFork(c, cmd)
@@ -484,12 +706,6 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 	case "scan_markdown_files":
 		go h.sendMarkdownFilesListing(c, cmd)
 
-	case "scan_artifacts":
-		go h.sendArtifactsList(c, cmd)
-
-	case "youtube_task":
-		go h.startYouTubeTask(c, cmd)
-
 	case "save_file":
 		go h.saveFile(c, cmd)
 
@@ -512,7 +728,10 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 
 	case "fcm_token":
 		if h.fcm != nil {
-			h.fcm.SetToken(cmd.Token)
+			// Trust only the authenticated connection's device identity, never
+			// a device_id supplied in this command. Preferences can arrive before
+			// Firebase registration, and must survive later token refreshes.
+			h.fcm.RegisterDevice(c.deviceID, cmd.Token, cmd.Platform, cmd.NotificationPreferences)
 		}
 
 	case "permission_response":
@@ -540,10 +759,7 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 	// implemented; the app polls all of these on connect.
 
 	case "list_instances":
-		h.handleInstanceCommand(c, cmd)
-
-	case "start_instance", "stop_instance", "upsert_instance", "delete_instance":
-		h.handleInstanceCommand(c, cmd)
+		c.enqueueEvent(h.client.InstancesList())
 
 	case "push_file":
 		go h.handlePushFile(c, cmd.Path)
@@ -611,6 +827,41 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 			h.Emit(h.client.FeedUpdated(m.FeedID, m.Read, m.Deleted))
 		}
 
+	case "external_event_list_request":
+		if h.events == nil {
+			return
+		}
+		if snapshot, err := h.events.Snapshot(ctx, c.deviceID, 0); err == nil {
+			for index := range snapshot.Items {
+				h.materializeExternalEvent(&snapshot.Items[index].Event)
+			}
+			c.enqueueEvent(h.client.ExternalEventSnapshot(snapshot))
+		} else {
+			c.enqueueEvent(h.client.Error("", "", "Event inbox unavailable: "+err.Error()))
+		}
+
+	case "external_event_mark_read":
+		if h.events == nil {
+			return
+		}
+		read := true
+		if item, err := h.events.Mark(ctx, cmd.EventID, c.deviceID, &read, nil); err == nil {
+			c.enqueueEvent(h.client.ExternalEventState(item))
+		} else {
+			c.enqueueEvent(h.client.Error("", "", "Event update failed: "+err.Error()))
+		}
+
+	case "external_event_dismiss":
+		if h.events == nil {
+			return
+		}
+		dismissed := true
+		if item, err := h.events.Mark(ctx, cmd.EventID, c.deviceID, nil, &dismissed); err == nil {
+			c.enqueueEvent(h.client.ExternalEventState(item))
+		} else {
+			c.enqueueEvent(h.client.Error("", "", "Event update failed: "+err.Error()))
+		}
+
 	// --- Interactions: AskUserQuestion ------------------------------------
 
 	case "user_input_response":
@@ -626,7 +877,9 @@ func (h *Hub) route(ctx context.Context, c *Client, cmd clientproto.Command) {
 		if ir, ok := h.exec.(interactionResponder); ok {
 			items = ir.PendingInteractions(cmd.SessionID)
 		}
-		c.enqueueEvent(h.client.PendingInteractionsList(items))
+		snapshot := h.client.PendingInteractionsList(items)
+		snapshot.ScopeSessionID, snapshot.SnapshotAll = cmd.SessionID, cmd.SessionID == ""
+		c.enqueueEvent(snapshot)
 
 	// --- Search (FTS5) ----------------------------------------------------
 
@@ -721,11 +974,72 @@ func (h *Hub) sendHistory(c *Client, s *session.Session, cmd clientproto.Command
 	if msgs == nil {
 		msgs = []map[string]any{}
 	}
+	msgs = h.annotateDelegationHistory(s.ID, msgs)
+	latestAssistantAt := int64(0)
+	latestAssistantText := ""
+	toolOnlyPreviews := make(map[string]struct{})
+	previewProjectionChanged := false
+	for _, message := range msgs {
+		if role, _ := message["role"].(string); role != "assistant" {
+			continue
+		}
+		assistantText := historyAssistantPreview(message)
+		if normalizePreviewText(assistantText) == "" {
+			if raw, _ := message["content"].(string); raw != "" {
+				toolOnlyPreviews[truncateGraphemes(normalizePreviewText(raw), 160)] = struct{}{}
+			}
+			continue
+		}
+		var observedAt int64
+		switch timestamp := message["timestamp"].(type) {
+		case int64:
+			observedAt = timestamp
+		case int:
+			observedAt = int64(timestamp)
+		case float64:
+			observedAt = int64(timestamp)
+		}
+		if observedAt >= latestAssistantAt {
+			latestAssistantAt = observedAt
+			latestAssistantText = assistantText
+		}
+	}
+	// Pagination into older history must never move the canonical row backward.
+	// Snapshot/delta requests without a before cursor include the newest tail and
+	// are safe repair sources after a Bridge restart.
+	if latestAssistantAt > 0 && cmd.Before == "" {
+		if preview := truncateGraphemes(normalizePreviewText(latestAssistantText), 160); preview != "" {
+			current := s.Snapshot()
+			_, invalidToolProjection := toolOnlyPreviews[current.PreviewText]
+			var err error
+			if invalidToolProjection && current.PreviewRole == "assistant" {
+				_, previewProjectionChanged, err = h.registry.RepairPreviewAndPersist(s.ID, current.PreviewText, preview, "assistant", latestAssistantAt)
+			} else {
+				_, previewProjectionChanged, err = h.registry.CommitPreviewAndPersist(s.ID, preview, "assistant", latestAssistantAt)
+			}
+			if err != nil {
+				log.Printf("[session-preview] history reconciliation failed session=%s: %v", s.ID, err)
+			}
+		}
+		observedPhase := s.State().String()
+		if observedPhase == "streaming" {
+			observedPhase = "running"
+		}
+		if view, changed := h.runtimes.ReconcileHistoryActivity(s.ID, latestAssistantAt, observedPhase); changed {
+			h.broadcastRuntime(view)
+		}
+	}
 	if res.Kind == "delta" {
 		c.enqueueEvent(h.client.HistoryDelta(s.ID, cmd.KnownLast, msgs, res.SourceCount))
+		if previewProjectionChanged {
+			h.BroadcastSessionSummaries()
+		}
 		return
 	}
 	c.enqueueEvent(h.client.HistorySnapshot(s.ID, msgs, res.SourceCount, res.HasMoreBefore, res.KnownIDFound, res.SnapshotReason))
+	if previewProjectionChanged {
+		h.BroadcastSessionSummaries()
+	}
 }
 
 // loadLogicalSessionHistory merges the bounded tails of archived physical
@@ -778,6 +1092,14 @@ func (h *Hub) sendResumable(c *Client, limit int) {
 func (h *Hub) sessionSummaries() []protocol.SessionSummary {
 	sessions := h.registry.List()
 	out := make([]protocol.SessionSummary, 0, len(sessions))
+	runtimeIDs := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		runtimeIDs = append(runtimeIDs, s.Snapshot().ID)
+	}
+	runtimePhase := make(map[string]string, len(runtimeIDs))
+	for _, view := range h.runtimes.Snapshot("", runtimeIDs) {
+		runtimePhase[view.SessionID] = view.Phase
+	}
 
 	// Batch-fetch recent messages + real last-activity for preview, keyed by hub
 	// session ID. Search DB uses "claude:{resumeID}" or "codex:rollout-{ts}-{uid}"
@@ -799,30 +1121,52 @@ func (h *Hub) sessionSummaries() []protocol.SessionSummary {
 	}
 
 	for _, s := range sessions {
-		snap := s.Snapshot()
+		snap := s.SettingsSnapshot()
+		active := s.Snapshot()
 		var recent []protocol.RecentMessage
-		// last_activity must reflect real activity. The session store's last_used
-		// can be flattened/stale; the search index's newest message ts is the
-		// source of truth, so prefer it when available.
+		// Preview text, role and timestamp are one server-authoritative projection.
+		// The search DB is only a fallback for native CLI activity that is newer
+		// than the persisted projection; it must never pair stale text with a fresh
+		// Registry last_used value.
 		lastActivity := snap.LastActivity
+		previewText, previewRole, previewAt := snap.PreviewText, snap.PreviewRole, snap.PreviewUpdatedAt
 		if pv := previewByHubID[snap.ID]; pv != nil {
 			for _, m := range pv.Recent {
 				recent = append(recent, protocol.RecentMessage{Role: m.Role, Text: m.Text})
 			}
-			if pv.LastTS > 0 {
+			if float64(pv.LastTS) > lastActivity {
 				lastActivity = float64(pv.LastTS)
 			}
+			previewText, previewRole, previewAt = resolveSessionPreview(
+				previewText, previewRole, previewAt, recent, pv, runtimePhase[snap.ID],
+			)
+		}
+		if float64(previewAt)/1000 > lastActivity {
+			lastActivity = float64(previewAt) / 1000
 		}
 		out = append(out, protocol.SessionSummary{
-			ID: snap.ID, Name: snap.Name, IsStreaming: snap.Streaming,
-			CreatedAt: snap.CreatedAt, LastActivity: lastActivity,
+			ActiveModel: active.Model, ActiveEffort: active.Effort, ActiveServiceTier: active.ServiceTier, ActiveConfigRevision: active.ConfigRevision,
+			ConfigRevision: snap.ConfigRevision,
+			ID:             snap.ID, Name: snap.Name, IsStreaming: snap.Streaming || runtimePhaseActive(runtimePhase[snap.ID]),
+			AuthorityInstanceID: h.cfg.InstanceID, MetadataRevision: snap.MetadataRevision,
+			NameUpdatedAt: snap.NameUpdatedAt, NameUpdatedBy: snap.NameUpdatedBy,
+			LastNameMutationID: snap.LastNameMutationID,
+			CreatedAt:          snap.CreatedAt, LastActivity: lastActivity,
 			Cwd: snap.Cwd, Model: snap.Model, Effort: snap.Effort, Backend: snap.Backend,
 			ServiceTier: snap.ServiceTier, CollaborationMode: snap.CollaborationMode, Personality: snap.Personality,
 			Sandbox: snap.Sandbox, Pinned: snap.Pinned, Hidden: snap.Hidden,
 			RecentMessages: recent,
+			PreviewText:    previewText, PreviewRole: previewRole, PreviewVersion: sessionPreviewPolicyVersion,
 		})
 	}
 	return out
+}
+
+// BroadcastSessionSummaries publishes a fresh snapshot after the out-of-process
+// search indexer commits new preview data. Native discovery may announce a file
+// before indexing finishes; this post-index broadcast closes that ordering gap.
+func (h *Hub) BroadcastSessionSummaries() {
+	h.Emit(h.client.SessionsList(h.sessionSummaries()))
 }
 
 func (h *Hub) sendBackendCatalog(c *Client) {
@@ -840,7 +1184,15 @@ func (h *Hub) sendBackendCatalog(c *Client) {
 // enqueueEvent marshals + enqueues a reply to this specific client.
 func (c *Client) enqueueEvent(event any) {
 	logOutbound(event)
-	data, err := marshalEvent(event)
+	c.enqueueEventUnlogged(event)
+}
+
+// enqueueEventUnlogged marshals an event for this client's negotiated wire
+// version without emitting another protocol log entry. Hub fan-out logs the
+// canonical event once, then uses this helper for each client-specific
+// SessionKey projection.
+func (c *Client) enqueueEventUnlogged(event any) {
+	data, err := marshalEvent(event, c.wireAuthority())
 	if err != nil {
 		log.Printf("enqueueEvent marshal: %v", err)
 		return

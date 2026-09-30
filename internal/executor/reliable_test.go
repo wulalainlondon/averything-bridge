@@ -111,3 +111,19 @@ func TestReliableMuxDoesNotHideHistoryCapability(t *testing.T) {
 		t.Fatal("history capability should still be visible through mux")
 	}
 }
+
+type diagnosticFake struct{ reliableFake }
+
+func (d *diagnosticFake) RuntimeDiagnostics() map[string]any {
+	return map[string]any{"codex": map[string]any{"status": "ready", "running_version": "0.153.0"}}
+}
+
+func TestMuxAggregatesRuntimeDiagnostics(t *testing.T) {
+	inner := &diagnosticFake{}
+	mux := NewMux(map[string]Executor{"codex": inner, "alias": inner}, inner)
+	got := mux.RuntimeDiagnostics()
+	codex, ok := got["codex"].(map[string]any)
+	if !ok || codex["status"] != "ready" || codex["running_version"] != "0.153.0" {
+		t.Fatalf("unexpected diagnostics: %+v", got)
+	}
+}

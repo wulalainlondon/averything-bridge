@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,12 +21,16 @@ import (
 // injectable onSend so a test decides what a "turn" emits (a full turn with
 // done, or a long-running turn that emits nothing until stopped).
 type fakeExec struct {
-	sink    executor.Sink
-	onSend  func(s *session.Session, reqID, content string)
-	onSteer func(s *session.Session, reqID, content string) (backend.SteerResult, error)
+	sink          executor.Sink
+	onSend        func(s *session.Session, reqID, content string)
+	onSendContext func(ctx context.Context, s *session.Session, reqID, content string)
+	onSteer       func(s *session.Session, reqID, content string) (backend.SteerResult, error)
 }
 
-func (f *fakeExec) Send(_ context.Context, s *session.Session, reqID, content string, _ []backend.ImageAttachment, _ []backend.FileAttachment) error {
+func (f *fakeExec) Send(ctx context.Context, s *session.Session, reqID, content string, _ []backend.ImageAttachment, _ []backend.FileAttachment) error {
+	if f.onSendContext != nil {
+		f.onSendContext(ctx, s, reqID, content)
+	}
 	if f.onSend != nil {
 		f.onSend(s, reqID, content)
 	}
@@ -54,12 +59,40 @@ func (f *fakeExec) Steer(_ context.Context, s *session.Session, reqID, content s
 func newTestHub(t *testing.T) (*Hub, *fakeExec) {
 	t.Helper()
 	reg := session.NewRegistry()
-	testDataDir := t.TempDir()
-	pairing := governance.NewPairing(filepath.Join(testDataDir, "pairing.json"))
-	h := NewHub(reg, Config{InstanceID: "i1", InstanceName: "test", DataDir: testDataDir}, pairing, 0)
+	pairing := governance.NewPairing(filepath.Join(t.TempDir(), "pairing.json"))
+	h := NewHub(reg, Config{InstanceID: "i1", InstanceName: "test"}, pairing, 0)
+	t.Cleanup(func() { h.messageQueue.Close() })
 	fe := &fakeExec{sink: h}
 	h.SetExecutor(fe)
 	return h, fe
+}
+
+type diagnosticExec struct{ *fakeExec }
+
+func (d *diagnosticExec) RuntimeDiagnostics() map[string]any {
+	return map[string]any{"codex": map[string]any{
+		"status": "restart_required", "managed_version": "0.153.0", "running_version": "0.149.0",
+	}}
+}
+
+type rejectingConfigExec struct{ *fakeExec }
+
+func (r *rejectingConfigExec) UpdateSessionSettings(context.Context, *session.Session) error {
+	return errors.New("runtime refused settings")
+}
+
+func TestStatusResultIncludesBackendRuntimeDiagnostics(t *testing.T) {
+	h, fe := newTestHub(t)
+	h.SetExecutor(&diagnosticExec{fakeExec: fe})
+	status := h.statusResult("s1")
+	runtimes, ok := status.Status["backend_runtimes"].(map[string]any)
+	if !ok {
+		t.Fatalf("backend runtime diagnostics missing: %+v", status.Status)
+	}
+	codex, ok := runtimes["codex"].(map[string]any)
+	if !ok || codex["status"] != "restart_required" || codex["managed_version"] != "0.153.0" {
+		t.Fatalf("unexpected Codex diagnostics: %+v", runtimes)
+	}
 }
 
 // newTestClient registers a client whose send channel we drain directly. The
@@ -299,12 +332,37 @@ func TestRenameSessionBroadcastsToAllClients(t *testing.T) {
 	route(h, c1, `{"type":"new_session","session_id":"s1","name":"Old","backend":"claude"}`)
 	waitForType(t, c1, "session_created")
 
-	route(h, c1, `{"type":"rename_session","session_id":"s1","name":"New"}`)
+	c1.deviceID = "device-a"
+	route(h, c1, `{"type":"rename_session","session_id":"s1","name":"New","mutation_id":"m1","expected_revision":0}`)
 	for _, c := range []*Client{c1, c2} {
 		ev := waitForType(t, c, "session_renamed")
 		if ev["session_id"] != "s1" || ev["name"] != "New" {
 			t.Fatalf("bad rename event: %v", ev)
 		}
+		if ev["authority_instance_id"] != "i1" || ev["mutation_id"] != "m1" || ev["revision"] != float64(1) || ev["updated_by"] != "device-a" {
+			t.Fatalf("rename authority metadata missing: %v", ev)
+		}
+	}
+}
+
+func TestRenameSessionRejectsStaleRevisionWithoutBroadcast(t *testing.T) {
+	h, _ := newTestHub(t)
+	c1 := newTestClient(h)
+	c2 := newTestClient(h)
+	route(h, c1, `{"type":"new_session","session_id":"s1","name":"Old","backend":"claude"}`)
+	waitForType(t, c1, "session_created")
+	route(h, c1, `{"type":"rename_session","session_id":"s1","name":"First","mutation_id":"m1","expected_revision":0}`)
+	waitForType(t, c1, "session_renamed")
+	waitForType(t, c2, "session_renamed")
+	route(h, c1, `{"type":"rename_session","session_id":"s1","name":"Stale","mutation_id":"m2","expected_revision":0}`)
+	rejected := waitForType(t, c1, "session_rename_rejected")
+	if rejected["reason"] != "revision_conflict" || rejected["current_name"] != "First" || rejected["current_revision"] != float64(1) {
+		t.Fatalf("bad stale rename rejection: %v", rejected)
+	}
+	select {
+	case raw := <-c2.send:
+		t.Fatalf("stale rename leaked broadcast: %s", raw)
+	default:
 	}
 }
 
@@ -333,6 +391,92 @@ func TestSetSessionMetaBroadcastsAndUpdatesSummaries(t *testing.T) {
 	ss, _ := sessions[0].(map[string]any)
 	if ss["pinned"] != true || ss["hidden"] != true {
 		t.Fatalf("sessions_list should include updated meta, got %v", ss)
+	}
+}
+
+func TestSwitchSessionConfigReturnsAuthoritativeSnapshotToEveryDevice(t *testing.T) {
+	h, _ := newTestHub(t)
+	c1 := newTestClient(h)
+	c2 := newTestClient(h)
+	route(h, c1, `{"type":"new_session","session_id":"s1","name":"One","backend":"claude"}`)
+	waitForType(t, c1, "session_created")
+
+	route(h, c1, `{"type":"switch_session_config","session_id":"s1","mutation_id":"cfg-1","effort":"high","sandbox":"workspace-write","service_tier":"fast","collaboration_mode":"plan"}`)
+	for _, c := range []*Client{c1, c2} {
+		ev := waitForType(t, c, "session_config_result")
+		if ev["accepted"] != true || ev["mutation_id"] != "cfg-1" || ev["effort"] != "high" || ev["sandbox"] != "workspace-write" || ev["service_tier"] != "fast" || ev["collaboration_mode"] != "plan" {
+			t.Fatalf("bad authoritative config result: %v", ev)
+		}
+	}
+
+	route(h, c1, `{"type":"switch_session_config","session_id":"s1","mutation_id":"cfg-2","collaboration_mode":"default"}`)
+	for _, c := range []*Client{c1, c2} {
+		ev := waitForType(t, c, "session_config_result")
+		if ev["accepted"] != true || ev["mutation_id"] != "cfg-2" || ev["collaboration_mode"] != "default" {
+			t.Fatalf("Default mode was not broadcast authoritatively: %v", ev)
+		}
+	}
+}
+
+func TestSwitchSessionConfigRollsBackWhenRuntimeRejects(t *testing.T) {
+	h, fe := newTestHub(t)
+	h.SetExecutor(&rejectingConfigExec{fakeExec: fe})
+	c := newTestClient(h)
+	route(h, c, `{"type":"new_session","session_id":"s1","name":"One","backend":"codex","effort":"medium","sandbox":"danger-full-access"}`)
+	waitForType(t, c, "session_created")
+
+	route(h, c, `{"type":"switch_session_config","session_id":"s1","mutation_id":"cfg-2","effort":"","sandbox":"read-only"}`)
+	ev := waitForType(t, c, "session_config_result")
+	if ev["accepted"] != false || ev["mutation_id"] != "cfg-2" || !strings.HasPrefix(ev["reason"].(string), "runtime_rejected") {
+		t.Fatalf("bad rejected config result: %v", ev)
+	}
+	snap, _ := h.registry.Get("s1")
+	if got := snap.Snapshot(); got.Effort != "medium" || got.Sandbox != "danger-full-access" {
+		t.Fatalf("rejected config was not rolled back: %+v", got)
+	}
+}
+
+func TestProtocolV3ScopesOutboundIdentityAndAcceptsItOnInbound(t *testing.T) {
+	h, _ := newTestHub(t)
+	c := newTestClient(h)
+	c.protocolVersion = 3
+
+	route(h, c, `{"type":"new_session","session_id":"same","name":"Scoped","backend":"claude"}`)
+	created := waitForType(t, c, "session_created")
+	key, _ := created["session_id"].(string)
+	if key != "sk1:i1:same" || created["authority_instance_id"] != "i1" {
+		t.Fatalf("scoped created event=%v", created)
+	}
+
+	// A client stores the compound key and sends it back unchanged. ParseInbound
+	// must restore the Bridge-local id before registry routing.
+	route(h, c, `{"type":"set_session_meta","session_id":"sk1:i1:same","pinned":true}`)
+	updated := waitForType(t, c, "session_meta_updated")
+	if updated["session_id"] != "sk1:i1:same" || updated["pinned"] != true {
+		t.Fatalf("scoped round trip=%v", updated)
+	}
+	if _, ok := h.registry.Get("same"); !ok {
+		t.Fatal("compound wire id leaked into local registry")
+	}
+}
+
+func TestProtocolNegotiationScopesPerClientWithoutBreakingLegacyClients(t *testing.T) {
+	h, _ := newTestHub(t)
+	legacy := newTestClient(h)
+	legacy.clientID = "legacy"
+	legacy.protocolVersion = 1
+	modern := newTestClient(h)
+	modern.clientID = "modern"
+	modern.protocolVersion = 3
+
+	h.Emit(protocol.NewTextChunk("same", "r1", "hello"))
+	legacyEvent := waitForType(t, legacy, "text_chunk")
+	modernEvent := waitForType(t, modern, "text_chunk")
+	if legacyEvent["session_id"] != "same" {
+		t.Fatalf("legacy id=%v", legacyEvent["session_id"])
+	}
+	if modernEvent["session_id"] != "sk1:i1:same" || modernEvent["authority_instance_id"] != "i1" {
+		t.Fatalf("modern event=%v", modernEvent)
 	}
 }
 
@@ -370,6 +514,54 @@ func TestMessageStreamsAndEndsTurn(t *testing.T) {
 
 	s, _ := h.registry.Get("s1")
 	waitState(t, s, session.Idle)
+	snap := s.Snapshot()
+	if snap.PreviewText != "hello world" || snap.PreviewRole != "assistant" || snap.PreviewRevision != 2 || snap.PreviewUpdatedAt == 0 {
+		t.Fatalf("terminal row projection was not committed after accepted request: %+v", snap)
+	}
+}
+
+func TestDoneWakesExactTranscriptPath(t *testing.T) {
+	h, _ := newTestHub(t)
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	fx := &forkExec{fakeExec: fakeExec{sink: h}, prov: &forkProv{path: path}}
+	h.SetExecutor(fx)
+	s := h.registry.Create("s1", "Work", "/work", "codex", "", "", "thread-1")
+	if s.ResumeID() == "" {
+		t.Fatal("test session missing resume id")
+	}
+	woke := make(chan string, 1)
+	h.SetTranscriptChangeNotifier(func(got string) { woke <- got })
+
+	h.Emit(protocol.NewTextChunk("s1", "r1", "finished"))
+	h.Emit(protocol.NewDone("s1", "r1"))
+	select {
+	case got := <-woke:
+		if got != path {
+			t.Fatalf("notifier path=%q want=%q", got, path)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal turn did not wake transcript indexer")
+	}
+}
+
+func TestMessageAckConfirmsBridgeQueueAcceptance(t *testing.T) {
+	h, fe := newTestHub(t)
+	c := newTestClient(h)
+	release := make(chan struct{})
+	fe.onSend = func(s *session.Session, reqID, content string) {
+		<-release
+		h.Emit(protocol.NewDone(s.ID, reqID))
+	}
+
+	route(h, c, `{"type":"new_session","session_id":"s1","backend":"codex"}`)
+	waitForType(t, c, "session_created")
+	route(h, c, `{"type":"message","session_id":"s1","request_id":"r-ack","content":"hello"}`)
+	ack := waitForType(t, c, "message_ack")
+	if ack["session_id"] != "s1" || ack["request_id"] != "r-ack" || ack["status"] != "queued" {
+		t.Fatalf("unexpected message ACK: %+v", ack)
+	}
+	close(release)
+	waitForType(t, c, "done")
 }
 
 // stop on a long-running turn (one that emits nothing until interrupted) must
@@ -543,10 +735,16 @@ func TestPerSessionTurnsSerialize(t *testing.T) {
 	c := newTestClient(h)
 
 	starts := make(chan string, 2)
-	release := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	releaseSecond := make(chan struct{})
 	fe.onSend = func(s *session.Session, reqID, content string) {
 		starts <- reqID
-		<-release // hold the turn open until the test releases it
+		if reqID == "r1" {
+			<-releaseFirst
+		} else {
+			<-releaseSecond
+		}
+		h.Emit(protocol.NewTextChunk(s.ID, reqID, "answer "+content))
 		h.Emit(protocol.NewDone(s.ID, reqID))
 	}
 
@@ -563,8 +761,97 @@ func TestPerSessionTurnsSerialize(t *testing.T) {
 		t.Fatalf("second turn %s started before first finished", got)
 	case <-time.After(60 * time.Millisecond):
 	}
-	close(release) // let r1 finish → r2 should start
+	close(releaseFirst) // let r1 finish → r2 should start
 	if got := <-starts; got != "r2" {
 		t.Fatalf("second turn should be r2, got %s", got)
+	}
+	// Turn 1's later completion must not overwrite the actor-ordered preview for
+	// turn 2, which is now the active work.
+	s, _ := h.registry.Get("s1")
+	if snap := s.Snapshot(); snap.PreviewText != "b" || snap.PreviewRole != "user" {
+		t.Fatalf("queued turn preview regressed after prior completion: %+v", snap)
+	}
+	close(releaseSecond)
+}
+
+// Once message_ack confirms the Bridge accepted a follow-up, the turn belongs
+// to the server-side Session actor and must run even if the sending app closes.
+func TestAcceptedQueuedTurnSurvivesClientDisconnect(t *testing.T) {
+	h, fe := newTestHub(t)
+	c := newTestClient(h)
+	starts := make(chan string, 2)
+	releaseFirst := make(chan struct{})
+	fe.onSend = func(s *session.Session, reqID, content string) {
+		starts <- reqID
+		if reqID == "r1" {
+			<-releaseFirst
+		}
+		h.Emit(protocol.NewDone(s.ID, reqID))
+	}
+
+	route(h, c, `{"type":"new_session","session_id":"s1","backend":"codex"}`)
+	waitForType(t, c, "session_created")
+	route(h, c, `{"type":"message","session_id":"s1","request_id":"r1","content":"first"}`)
+	waitForType(t, c, "message_ack")
+	if got := <-starts; got != "r1" {
+		t.Fatalf("first start=%q", got)
+	}
+	route(h, c, `{"type":"message","session_id":"s1","request_id":"r2","content":"second"}`)
+	ack := waitForType(t, c, "message_ack")
+	if ack["request_id"] != "r2" || ack["status"] != "queued" {
+		t.Fatalf("follow-up ack=%+v", ack)
+	}
+	view := h.runtimeSnapshot("").Items[0]
+	if view.Phase != "running" || view.ActiveRequestID != "r1" || view.QueueLength != 1 {
+		t.Fatalf("queued follow-up replaced active request: %+v", view)
+	}
+
+	// Simulate the phone process disappearing after the acknowledgement.
+	h.removeClient(c)
+	close(releaseFirst)
+	select {
+	case got := <-starts:
+		if got != "r2" {
+			t.Fatalf("second start=%q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server-owned follow-up did not run after client disconnect")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		view = h.runtimeSnapshot("").Items[0]
+		if view.Phase == "completed" && view.ActiveRequestID == "r2" && view.QueueLength == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("second turn did not reach terminal runtime: %+v", view)
+}
+
+func TestDuplicateMessageRequestIsAcknowledgedWithoutSecondExecution(t *testing.T) {
+	h, fe := newTestHub(t)
+	c := newTestClient(h)
+	executions := make(chan string, 2)
+	fe.onSend = func(s *session.Session, reqID, content string) {
+		executions <- reqID
+		h.Emit(protocol.NewDone(s.ID, reqID))
+	}
+	route(h, c, `{"type":"new_session","session_id":"s1","backend":"codex"}`)
+	waitForType(t, c, "session_created")
+	frame := `{"type":"message","session_id":"s1","request_id":"same","content":"once"}`
+	route(h, c, frame)
+	waitForType(t, c, "message_ack")
+	if got := <-executions; got != "same" {
+		t.Fatalf("execution=%q", got)
+	}
+	route(h, c, frame)
+	ack := waitForType(t, c, "message_ack")
+	if ack["request_id"] != "same" || ack["status"] != "queued" {
+		t.Fatalf("duplicate ack=%+v", ack)
+	}
+	select {
+	case got := <-executions:
+		t.Fatalf("duplicate executed as %q", got)
+	case <-time.After(80 * time.Millisecond):
 	}
 }

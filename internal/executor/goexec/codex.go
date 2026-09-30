@@ -30,6 +30,7 @@ import (
 	"everything-go/internal/backend"
 	"everything-go/internal/executor"
 	"everything-go/internal/protocol"
+	"everything-go/internal/recap"
 	"everything-go/internal/runtime"
 	"everything-go/internal/session"
 	"everything-go/internal/sourcepolicy"
@@ -38,7 +39,6 @@ import (
 const (
 	codexDefaultModel     = "gpt-5.6-sol"
 	codexCompactThreshold = 0.80
-	codexTurnTimeout      = 100 * time.Minute
 	codexStallWarnAfter   = 5 * time.Minute
 	codexStallAbortAfter  = 30 * time.Minute
 	codexStallCheckEvery  = 30 * time.Second
@@ -64,26 +64,39 @@ type codexState struct {
 	mu       sync.Mutex
 	ensureMu sync.Mutex
 
-	threadID        string
-	currentTurnID   string
-	turnActive      bool
-	turnErr         string
-	turnDone        chan struct{}
-	stopping        bool
-	reqID           string
-	tempImages      []string
-	accumulatedText string
-	askExtracted    bool
-	contextUsed     int
-	contextMax      int
-	compactActive   bool
-	compactErr      string
-	compactDone     chan struct{}
-	lastEventAt     time.Time
-	stallWarned     bool
-	pendingHandoff  string
-	pendingRecovery *codexRecovery
-	agents          map[string]*codexAgent
+	threadID          string
+	currentTurnID     string
+	turnStartPending  bool
+	pendingTerminals  map[string]codexTurnTerminal
+	turnActive        bool
+	turnErr           string
+	turnErrorCode     string
+	turnDone          chan struct{}
+	stopping          bool
+	reqID             string
+	observedTurnID    string
+	observedRequestID string
+	retiredTurns      []string
+	// tempImages is keyed by the owning turn request id. A terminal event can
+	// synchronously release the Session actor and start the next turn before the
+	// previous runTurn defer executes; a flat Session-wide slice lets that older
+	// defer delete the newer turn's images.
+	tempImages              map[string][]string
+	accumulatedText         string
+	askExtracted            bool
+	contextUsed             int
+	contextMax              int
+	compactActive           bool
+	compactErr              string
+	compactDone             chan struct{}
+	compactTurnID           string
+	lastEventAt             time.Time
+	stallWarned             bool
+	inactivityStopRequested bool
+	inactivityStopReason    string
+	pendingHandoff          string
+	pendingRecovery         *codexRecovery
+	agents                  map[string]*codexAgent
 }
 
 type codexAgent struct {
@@ -93,7 +106,10 @@ type codexAgent struct {
 }
 
 func newCodexState() *codexState {
-	return &codexState{agents: make(map[string]*codexAgent)}
+	return &codexState{
+		agents:     make(map[string]*codexAgent),
+		tempImages: make(map[string][]string),
+	}
 }
 
 func (st *codexState) finishCompact(errStr string) {
@@ -116,11 +132,18 @@ func (st *codexState) finishCompact(errStr string) {
 func (st *codexState) finish(errStr string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	st.finishTurnLocked(errStr)
+}
+
+func (st *codexState) finishTurnLocked(errStr string) {
 	if !st.turnActive {
 		return
 	}
 	st.turnActive = false
+	st.retireTurnLocked(st.currentTurnID)
 	st.currentTurnID = ""
+	st.turnStartPending = false
+	st.pendingTerminals = nil
 	if st.turnErr == "" {
 		st.turnErr = errStr
 	}
@@ -138,12 +161,19 @@ func (st *codexState) touch(now time.Time) {
 
 // Codex implements executor.Executor over the codex app-server.
 type Codex struct {
-	sink         executor.Sink
-	tools        *toolEmitter
-	codexBin     string
-	sessionsRoot string
-	indexPath    string
-	rpc          *rpcPlumber
+	recapStoreMu       sync.Mutex
+	recapStore         *recap.Store
+	recapSlots         chan struct{}
+	pmProvider         backend.PMProvider
+	delegationProvider backend.DelegationProvider
+	toolEnvironment    toolEnvironmentState
+	toolRPCGate        sync.RWMutex
+	sink               executor.Sink
+	tools              *toolEmitter
+	codexBin           string
+	sessionsRoot       string
+	indexPath          string
+	rpc                *rpcPlumber
 
 	startMu               sync.Mutex
 	proc                  *exec.Cmd
@@ -166,16 +196,29 @@ type Codex struct {
 	catalogMu          sync.RWMutex
 	catalog            backend.Definition
 	collaborationModes map[string]map[string]any
-	turnTimeout        time.Duration
+	rolloutMu          sync.Mutex
+	rolloutRoot        string
+	rolloutScannedAt   time.Time
+	rolloutPaths       []string
+	rolloutByID        map[string]string
 	stallWarnAfter     time.Duration
 	stallAbortAfter    time.Duration
 	stallCheckEvery    time.Duration
 	dataDir            string
+	historyRequestMu   sync.Mutex
+	maintenanceMu      sync.Mutex
+	maintenance        map[string]backend.Maintenance
 	rolloverEnabled    bool
 	coldResumeMaxBytes int64
 	checkpointMaxBytes int
 	appServerMode      string // daemon (default) | stdio (compatibility fallback)
 	appServerSocket    string
+	runtimeMu          sync.RWMutex
+	runtimeDiagnostics map[string]any
+	reconnectMu        sync.Mutex
+	reconnectRunning   bool
+	remoteReconnect    bool
+	health             codexHealth
 }
 
 type codexInteraction struct {
@@ -193,6 +236,7 @@ func NewCodex(sink executor.Sink, codexBin string) *Codex {
 	codexHome := sourcepolicy.CodexHome()
 	home, _ := os.UserHomeDir()
 	return &Codex{
+		recapSlots:         make(chan struct{}, 2),
 		sink:               sink,
 		tools:              newToolEmitter(sink),
 		codexBin:           codexBin,
@@ -205,7 +249,6 @@ func NewCodex(sink executor.Sink, codexBin string) *Codex {
 		activeThreadOwner:  make(map[string]*session.Session),
 		interactions:       make(map[string]codexInteraction),
 		collaborationModes: make(map[string]map[string]any),
-		turnTimeout:        codexTurnTimeout,
 		stallWarnAfter:     codexStallWarnAfter,
 		stallAbortAfter:    codexStallAbortAfter,
 		stallCheckEvery:    codexStallCheckEvery,
@@ -213,6 +256,8 @@ func NewCodex(sink executor.Sink, codexBin string) *Codex {
 		rolloverEnabled:    envBool("EVERYTHING_GO_CODEX_ROLLOVER_ENABLED", false),
 		coldResumeMaxBytes: envInt64("EVERYTHING_GO_CODEX_COLD_RESUME_MAX_BYTES", 256*1024*1024),
 		checkpointMaxBytes: int(envInt64("EVERYTHING_GO_CODEX_CHECKPOINT_MAX_BYTES", 128*1024)),
+		runtimeDiagnostics: map[string]any{"codex": map[string]any{"status": "not_checked"}},
+		remoteReconnect:    true,
 		appServerMode:      codexAppServerMode(),
 		appServerSocket:    strings.TrimSpace(os.Getenv("EVERYTHING_GO_CODEX_APP_SERVER_SOCKET")),
 	}
@@ -226,11 +271,90 @@ func codexAppServerMode() string {
 	return "daemon"
 }
 
+type codexDaemonVersion struct {
+	Status              string `json:"status"`
+	Backend             string `json:"backend"`
+	ManagedCodexPath    string `json:"managedCodexPath"`
+	ManagedCodexVersion string `json:"managedCodexVersion"`
+	SocketPath          string `json:"socketPath"`
+	CLIVersion          string `json:"cliVersion"`
+	AppServerVersion    string `json:"appServerVersion"`
+}
+
+func decodeCodexDaemonVersion(raw []byte) (map[string]any, error) {
+	var version codexDaemonVersion
+	if err := json.Unmarshal(raw, &version); err != nil {
+		return nil, err
+	}
+	status := "ready"
+	if version.Status != "running" || version.AppServerVersion == "" {
+		status = "not_running"
+	} else if version.ManagedCodexVersion != "" && version.ManagedCodexVersion != version.AppServerVersion {
+		status = "restart_required"
+	}
+	return map[string]any{
+		"status":          status,
+		"daemon_status":   version.Status,
+		"backend":         version.Backend,
+		"cli_version":     version.CLIVersion,
+		"managed_version": version.ManagedCodexVersion,
+		"running_version": version.AppServerVersion,
+		"managed_path":    version.ManagedCodexPath,
+		"socket_path":     version.SocketPath,
+		"checked_at_ms":   time.Now().UnixMilli(),
+	}, nil
+}
+
+func (c *Codex) refreshRuntimeDiagnostics(codexHome string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, c.codexBin, "app-server", "daemon", "version")
+	cmd.Env = append(os.Environ(), "CODEX_HOME="+codexHome)
+	raw, err := cmd.Output()
+	diagnostics := map[string]any{"status": "unknown", "checked_at_ms": time.Now().UnixMilli()}
+	if err == nil {
+		if decoded, decodeErr := decodeCodexDaemonVersion(raw); decodeErr == nil {
+			diagnostics = decoded
+		} else {
+			diagnostics["error"] = "invalid daemon version response: " + decodeErr.Error()
+		}
+	} else {
+		diagnostics["error"] = err.Error()
+	}
+	c.runtimeMu.Lock()
+	c.runtimeDiagnostics = map[string]any{"codex": diagnostics}
+	c.runtimeMu.Unlock()
+	if diagnostics["status"] == "restart_required" {
+		log.Printf("[codex] shared daemon runtime mismatch managed=%v running=%v", diagnostics["managed_version"], diagnostics["running_version"])
+	}
+}
+
+// RuntimeDiagnostics returns a copy of the last daemon version probe without
+// starting a process or blocking the status endpoint.
+func (c *Codex) RuntimeDiagnostics() map[string]any {
+	c.runtimeMu.RLock()
+	defer c.runtimeMu.RUnlock()
+	out := make(map[string]any, len(c.runtimeDiagnostics))
+	for key, value := range c.runtimeDiagnostics {
+		if fields, ok := value.(map[string]any); ok {
+			copyFields := make(map[string]any, len(fields))
+			for field, fieldValue := range fields {
+				copyFields[field] = fieldValue
+			}
+			out[key] = copyFields
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
 // SetDataDir points generation manifests at the bridge's configured state
 // directory. It must be called during startup before the executor is shared.
 func (c *Codex) SetDataDir(path string) {
 	if strings.TrimSpace(path) != "" {
 		c.dataDir = runtime.ExpandPath(path)
+		c.loadMaintenance()
 	}
 }
 
@@ -303,6 +427,7 @@ func (c *Codex) startServerLocked() error {
 				return fmt.Errorf("codex app-server daemon %s: %w (%s)", action, err, strings.TrimSpace(string(output)))
 			}
 		}
+		c.refreshRuntimeDiagnostics(codexHome)
 		return c.startRemoteServerLocked(codexHome)
 	}
 	args := []string{"app-server"}
@@ -430,10 +555,24 @@ func (c *Codex) startRemoteServerLocked(codexHome string) error {
 	c.serverAuthFingerprint = "shared-daemon"
 	c.authReloadDeferred = false
 	c.rpc.setWriter(websocketRPCWriter{conn: conn})
+	c.toolEnvironment.epoch.Add(1)
 	go c.readRemoteLoop(readCtx, conn, done)
 	if err := c.initializeRPC(); err != nil {
 		cancelRead()
 		_ = conn.Close(websocket.StatusInternalError, "initialize failed")
+		// readRemoteLoop closes done before taking startMu, so it is safe to wait
+		// here even though the caller holds startMu. Clear the half-open transport
+		// before a reconnect attempt can mistake it for a healthy connection.
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		if c.remoteConn == conn {
+			c.remoteConn = nil
+			c.remoteDone = nil
+			c.remoteCancel = nil
+			c.rpc.setWriter(nil)
+		}
 		return err
 	}
 	log.Printf("[codex] connected shared daemon socket=%s", socketPath)
@@ -444,11 +583,16 @@ func (c *Codex) readRemoteLoop(ctx context.Context, conn *websocket.Conn, done c
 	var readErr error
 	defer func() {
 		failure := error(errProcDead)
-		if readErr != nil && ctx.Err() == nil {
+		unexpected := readErr != nil && ctx.Err() == nil
+		if unexpected {
 			failure = fmt.Errorf("app-server connection lost: %w", readErr)
 			log.Printf("[codex] remote read loop error: %v", readErr)
 		}
 		c.rpc.failAll(failure)
+		if unexpected {
+			c.failLiveOperations(failure.Error())
+			c.expireDisconnectedInteractions()
+		}
 		c.invalidateLiveThreads()
 		close(done)
 		c.startMu.Lock()
@@ -459,6 +603,9 @@ func (c *Codex) readRemoteLoop(ctx context.Context, conn *websocket.Conn, done c
 			c.rpc.setWriter(nil)
 		}
 		c.startMu.Unlock()
+		if unexpected {
+			c.scheduleRemoteReconnect()
+		}
 	}()
 	for {
 		_, payload, err := conn.Read(ctx)
@@ -470,6 +617,81 @@ func (c *Codex) readRemoteLoop(ctx context.Context, conn *websocket.Conn, done c
 			c.dispatch(payload)
 		}
 	}
+}
+
+func (c *Codex) failLiveOperations(message string) {
+	c.mu.Lock()
+	states := make(map[string]*codexState, len(c.states))
+	for sessionID, st := range c.states {
+		states[sessionID] = st
+	}
+	c.mu.Unlock()
+	for sessionID, st := range states {
+		st.mu.Lock()
+		turnActive := st.turnActive
+		compactActive := st.compactActive
+		observedRequestID := st.observedRequestID
+		st.observedTurnID, st.observedRequestID = "", ""
+		st.mu.Unlock()
+		if observedRequestID != "" {
+			// Transport loss is not native completion. Do not retire the native
+			// ID: correlated live activity after reattachment can recover it.
+			c.sink.Emit(backend.ObservedTurn{SessionID: sessionID, RequestID: observedRequestID, Phase: "interrupted", Message: message})
+		}
+		if turnActive {
+			st.finish(message + "; the submitted turn was not retried automatically")
+		}
+		if compactActive {
+			st.finishCompact(message)
+		}
+	}
+}
+
+func (c *Codex) expireDisconnectedInteractions() {
+	c.interMu.Lock()
+	pending := make([]codexInteraction, 0, len(c.interactions))
+	for _, interaction := range c.interactions {
+		pending = append(pending, interaction)
+	}
+	c.interactions = make(map[string]codexInteraction)
+	c.interMu.Unlock()
+	for _, interaction := range pending {
+		c.sink.Emit(backend.NewInteractionResolved(interaction.payload.RequestID, interaction.payload.SessionID, "expired"))
+	}
+}
+
+func (c *Codex) scheduleRemoteReconnect() {
+	if !c.remoteReconnect || c.appServerMode != "daemon" {
+		return
+	}
+	c.reconnectMu.Lock()
+	if c.reconnectRunning {
+		c.reconnectMu.Unlock()
+		return
+	}
+	c.reconnectRunning = true
+	c.reconnectMu.Unlock()
+	go func() {
+		defer func() {
+			c.reconnectMu.Lock()
+			c.reconnectRunning = false
+			c.reconnectMu.Unlock()
+		}()
+		delay := 250 * time.Millisecond
+		for attempt := 1; attempt <= 6; attempt++ {
+			time.Sleep(delay)
+			if err := c.ensureServer(); err == nil {
+				log.Printf("[codex] shared daemon reconnected after %d attempt(s)", attempt)
+				return
+			} else {
+				log.Printf("[codex] shared daemon reconnect attempt=%d failed: %v", attempt, err)
+			}
+			if delay < 4*time.Second {
+				delay *= 2
+			}
+		}
+		log.Printf("[codex] shared daemon reconnect exhausted; the next request will retry")
+	}()
 }
 
 func codexAuthFingerprint(path string) (string, error) {
@@ -719,6 +941,20 @@ func (c *Codex) Catalog(ctx context.Context) (backend.Definition, error) {
 	return def, nil
 }
 
+// defaultModel follows the authenticated app-server catalog when available.
+// The static value is only a transport-startup fallback; keeping the runtime
+// catalog authoritative lets newly rolled-out models become the default without
+// requiring every client to send an explicit model id.
+func (c *Codex) defaultModel() string {
+	c.catalogMu.RLock()
+	model := c.catalog.DefaultModel
+	c.catalogMu.RUnlock()
+	if model != "" {
+		return model
+	}
+	return codexDefaultModel
+}
+
 func (c *Codex) invalidateLiveThreads() {
 	c.mu.Lock()
 	c.threadToSession = make(map[string]*session.Session)
@@ -740,7 +976,24 @@ func (c *Codex) invalidateLiveThreads() {
 // rpcCall sends an RPC and waits for the response. Writes go straight to the
 // pipe, so there is no flush step.
 func (c *Codex) rpcCall(method string, params any, timeout time.Duration) (json.RawMessage, error) {
-	return c.rpc.request(method, params, timeout)
+	// A confirmed tool maintenance window serializes our submission RPCs, not
+	// interrupt/release or read-only diagnostics. It never restarts the daemon.
+	if toolMutationMethod(method) {
+		c.toolRPCGate.RLock()
+		defer c.toolRPCGate.RUnlock()
+	}
+	if c.appServerMode == "daemon" && healthGatedMethod(method) {
+		if err := c.healthAdmission(); err != nil {
+			return nil, err
+		}
+	}
+	raw, err := c.rpc.request(method, params, timeout)
+	var timeoutErr *rpcTimeoutError
+	if c.appServerMode == "daemon" && (errors.As(err, &timeoutErr) || errors.Is(err, context.DeadlineExceeded)) && healthGatedMethod(method) {
+		c.scheduleHealthCheck(method, params)
+		return raw, fmt.Errorf("%w; server outcome unknown; request was not retried; checking Codex health", err)
+	}
+	return raw, err
 }
 
 // readLoop consumes the app-server's newline-delimited stdout. It uses a
@@ -813,24 +1066,27 @@ func (c *Codex) dispatch(raw json.RawMessage) {
 	}
 
 	var p struct {
-		ThreadID string            `json:"threadId"`
-		Diff     string            `json:"diff"`
-		Message  string            `json:"message"`
-		Changes  []map[string]any  `json:"changes"`
-		Delta    string            `json:"delta"`
-		Phase    string            `json:"phase"`
-		Text     string            `json:"text"`
-		Output   json.RawMessage   `json:"output"`
-		ItemID   string            `json:"itemId"`
-		CallID   string            `json:"callId"`
-		Name     string            `json:"name"`
-		Command  json.RawMessage   `json:"command"`
-		Plan     []json.RawMessage `json:"plan"`
-		Turn     struct {
+		ThreadID  string            `json:"threadId"`
+		TurnID    string            `json:"turnId"`
+		RequestID json.RawMessage   `json:"requestId"`
+		Diff      string            `json:"diff"`
+		Message   string            `json:"message"`
+		Changes   []map[string]any  `json:"changes"`
+		Delta     string            `json:"delta"`
+		Phase     string            `json:"phase"`
+		Text      string            `json:"text"`
+		Output    json.RawMessage   `json:"output"`
+		ItemID    string            `json:"itemId"`
+		CallID    string            `json:"callId"`
+		Name      string            `json:"name"`
+		Command   json.RawMessage   `json:"command"`
+		Plan      []json.RawMessage `json:"plan"`
+		Turn      struct {
 			ID     string `json:"id"`
 			Status string `json:"status"`
 			Error  struct {
-				Message string `json:"message"`
+				Message string          `json:"message"`
+				Info    json.RawMessage `json:"codexErrorInfo"`
 			} `json:"error"`
 		} `json:"turn"`
 		Item struct {
@@ -858,7 +1114,8 @@ func (c *Codex) dispatch(raw json.RawMessage) {
 		} `json:"thread"`
 		WillRetry bool `json:"willRetry"`
 		Error     struct {
-			Message string `json:"message"`
+			Message string          `json:"message"`
+			Info    json.RawMessage `json:"codexErrorInfo"`
 		} `json:"error"`
 		TokenUsage codexTokenUsage `json:"tokenUsage"`
 		Usage      codexTokenUsage `json:"usage"`
@@ -894,8 +1151,24 @@ func (c *Codex) dispatch(raw json.RawMessage) {
 	rootThreadID := st.threadID
 	st.mu.Unlock()
 	isRootThread := p.ThreadID == rootThreadID
+	if isRootThread {
+		turnID := firstNonEmpty(p.TurnID, p.Turn.ID)
+		var accept bool
+		reqID, accept = c.observeNativeTurn(s, st, m.Method, turnID)
+		if !accept {
+			return
+		}
+	}
 
 	switch m.Method {
+	case "mcpServer/startupStatus/updated":
+		c.toolEnvironment.epoch.Add(1)
+		c.toolEnvironment.mu.Lock()
+		c.toolEnvironment.cache = nil
+		c.toolEnvironment.mu.Unlock()
+	case "serverRequest/resolved":
+		c.resolveServerRequest(p.RequestID)
+
 	case "thread/started":
 		if p.Thread.ParentThreadID != nil {
 			c.ensureCodexAgent(s, p.Thread.ID, *p.Thread.ParentThreadID, firstPtr(p.Thread.AgentRole, p.Thread.AgentNickname, "subagent"), "")
@@ -907,8 +1180,17 @@ func (c *Codex) dispatch(raw json.RawMessage) {
 			return
 		}
 		st.mu.Lock()
-		st.currentTurnID = p.Turn.ID
+		if st.compactActive {
+			st.compactTurnID = p.Turn.ID
+			st.mu.Unlock()
+			c.updateMaintenance(s.ID, "running", "", p.Turn.ID)
+			return
+		}
+		if st.turnActive {
+			st.currentTurnID = p.Turn.ID
+		}
 		st.mu.Unlock()
+		c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "thinking", ""))
 
 	case "item/agentMessage/delta":
 		if p.Delta == "" {
@@ -983,6 +1265,9 @@ func (c *Codex) dispatch(raw json.RawMessage) {
 			c.emitCodexAgentTree(s)
 			return
 		}
+		if _, isTool := normalizeCodexLiveTool(m.Params); !isTool {
+			return
+		}
 		itemID := firstNonEmpty(p.ItemID, p.Item.ID, "codex_item")
 		rawOutput := p.Output
 		if len(rawOutput) == 0 || string(rawOutput) == "null" {
@@ -1039,25 +1324,39 @@ func (c *Codex) dispatch(raw json.RawMessage) {
 			c.emitCodexAgentTree(s)
 			return
 		}
-		if p.Turn.Status == "failed" {
-			if p.Turn.Error.Message == "" {
-				p.Turn.Error.Message = "turn failed"
-			}
-			if st.compactActive && !st.turnActive {
-				st.finishCompact(p.Turn.Error.Message)
-			} else {
-				st.finish(p.Turn.Error.Message)
-			}
-		} else {
-			if st.compactActive && !st.turnActive {
-				st.finishCompact("")
-			} else {
-				st.finish("")
-			}
+		phase, message := "completed", p.Turn.Error.Message
+		if p.Turn.Status == "interrupted" {
+			phase = "interrupted"
+		} else if p.Turn.Status == "failed" {
+			phase = "failed"
+			message = firstNonEmpty(message, "turn failed")
 		}
+		if c.finishObservedTurn(s, st, p.Turn.ID, phase, codexErrorCode(p.Turn.Error.Info, message), message) {
+			return
+		}
+		st.mu.Lock()
+		compacting := st.compactActive
+		compactTurnID := st.compactTurnID
+		st.mu.Unlock()
+		if compacting {
+			if compactTurnID != "" && p.Turn.ID == compactTurnID {
+				st.finishCompact(p.Turn.Error.Message)
+			}
+			return
+		}
+		st.completeOwnedTurn(codexTurnTerminal{ID: p.Turn.ID, Status: p.Turn.Status,
+			Message: p.Turn.Error.Message, ErrorCode: codexErrorCode(p.Turn.Error.Info, p.Turn.Error.Message)})
 
 	case "thread/compacted":
-		st.finishCompact("")
+		// Modern daemons report a correlated turn/completed as well. Wait for
+		// it so an uncorrelated, delayed compact notification cannot release
+		// a later operation. Legacy daemons do not send turn/started.
+		st.mu.Lock()
+		legacyCompact := isRootThread && st.compactActive && st.compactTurnID == ""
+		st.mu.Unlock()
+		if legacyCompact {
+			st.finishCompact("")
+		}
 
 	case "thread/tokenUsage/updated":
 		if !isRootThread {
@@ -1082,12 +1381,28 @@ func (c *Codex) dispatch(raw json.RawMessage) {
 			c.emitCodexAgentTree(s)
 			return
 		}
-		if !p.WillRetry {
+		if !p.WillRetry || codexErrorCode(p.Error.Info, p.Error.Message) == "misalignment_policy_violation" {
 			msg := p.Error.Message
 			if msg == "" {
 				msg = "unknown codex error"
 			}
-			st.finish(msg)
+			if c.finishObservedTurn(s, st, p.TurnID, "failed", codexErrorCode(p.Error.Info, msg), msg) {
+				return
+			}
+			st.mu.Lock()
+			compacting := st.compactActive
+			st.mu.Unlock()
+			if compacting {
+				st.finishCompact(msg)
+			} else if p.TurnID != "" {
+				st.completeOwnedTurn(codexTurnTerminal{ID: p.TurnID, Status: "failed",
+					Message: msg, ErrorCode: codexErrorCode(p.Error.Info, msg)})
+			} else {
+				st.mu.Lock()
+				st.turnErrorCode = codexErrorCode(p.Error.Info, msg)
+				st.mu.Unlock()
+				st.finish(msg)
+			}
 		}
 	}
 }
@@ -1280,6 +1595,12 @@ func (c *Codex) BuildAgentTree(resumeID string) (int, []*protocol.AgentNode) {
 }
 
 func (c *Codex) handleServerRequest(id any, method string, raw json.RawMessage) {
+	if c.handlePMServerRequest(id, method, raw) {
+		return
+	}
+	if c.handleDelegationServerRequest(id, method, raw) {
+		return
+	}
 	approval := map[string]bool{
 		"item/commandExecution/requestApproval": true,
 		"item/fileChange/requestApproval":       true,
@@ -1348,17 +1669,19 @@ func (c *Codex) emitUnsupportedCodexTool(raw json.RawMessage) string {
 
 func (c *Codex) createUserInputRequest(rpcID any, raw json.RawMessage) bool {
 	var p struct {
-		ThreadID  string                     `json:"threadId"`
-		ItemID    string                     `json:"itemId"`
-		CallID    string                     `json:"callId"`
-		ToolID    string                     `json:"toolUseId"`
-		Kind      string                     `json:"kind"`
-		Header    string                     `json:"header"`
-		Title     string                     `json:"title"`
-		Agent     string                     `json:"requesting_agent"`
-		Questions []map[string]any           `json:"questions"`
-		Thread    map[string]json.RawMessage `json:"thread"`
-		Item      map[string]json.RawMessage `json:"item"`
+		ThreadID         string                     `json:"threadId"`
+		ItemID           string                     `json:"itemId"`
+		CallID           string                     `json:"callId"`
+		ToolID           string                     `json:"toolUseId"`
+		Kind             string                     `json:"kind"`
+		Header           string                     `json:"header"`
+		Title            string                     `json:"title"`
+		Agent            string                     `json:"requesting_agent"`
+		IsBlocking       *bool                      `json:"isBlocking"`
+		AutoResolutionMS *int64                     `json:"autoResolutionMs"`
+		Questions        []map[string]any           `json:"questions"`
+		Thread           map[string]json.RawMessage `json:"thread"`
+		Item             map[string]json.RawMessage `json:"item"`
 	}
 	if json.Unmarshal(raw, &p) != nil {
 		return false
@@ -1382,18 +1705,67 @@ func (c *Codex) createUserInputRequest(rpcID any, raw json.RawMessage) bool {
 	reqID := "ui_" + randHex(12)
 	header := firstNonEmpty(p.Header, p.Title, "Question")
 	kind := firstNonEmpty(p.Kind, "ask_user_question")
+	blocking := true
+	if p.IsBlocking != nil {
+		blocking = *p.IsBlocking
+	}
+	if !blocking {
+		kind = "request_user_input_async"
+	}
 	agent := firstNonEmpty(p.Agent, "codex")
+	createdAt := time.Now().UnixMilli()
+	expiresAt := int64(0)
+	if p.AutoResolutionMS != nil && *p.AutoResolutionMS > 0 {
+		expiresAt = createdAt + *p.AutoResolutionMS
+	}
 	payload := backend.UserInputPayload{
 		RequestID: reqID, SessionID: s.ID, Source: "codex", Kind: kind,
 		Header: header, ToolUseID: toolID, RequestingAgent: agent,
-		Questions: normalizeCodexQuestions(p.Questions), CreatedAt: time.Now().UnixMilli(),
-		Status: "pending",
+		Questions: normalizeCodexQuestions(p.Questions), CreatedAt: createdAt,
+		ExpiresAt: expiresAt, IsBlocking: &blocking, Status: "pending",
+	}
+	responseKind := ""
+	if p.IsBlocking != nil {
+		responseKind = "request_user_input_v2"
 	}
 	c.interMu.Lock()
-	c.interactions[reqID] = codexInteraction{payload: payload, rpcID: rpcID}
+	c.interactions[reqID] = codexInteraction{payload: payload, rpcID: rpcID, responseKind: responseKind}
 	c.interMu.Unlock()
 	c.sink.Emit(backend.NewUserInputRequest(payload))
 	return true
+}
+
+func rpcIDKey(value any) string {
+	if raw, ok := value.(json.RawMessage); ok {
+		var decoded any
+		if json.Unmarshal(raw, &decoded) == nil {
+			value = decoded
+		}
+	}
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func (c *Codex) resolveServerRequest(requestID json.RawMessage) {
+	if len(requestID) == 0 {
+		return
+	}
+	wanted := rpcIDKey(requestID)
+	c.interMu.Lock()
+	var resolved *codexInteraction
+	for bridgeID, interaction := range c.interactions {
+		if rpcIDKey(interaction.rpcID) != wanted {
+			continue
+		}
+		copy := interaction
+		resolved = &copy
+		delete(c.interactions, bridgeID)
+		break
+	}
+	c.interMu.Unlock()
+	if resolved != nil {
+		c.sink.Emit(backend.NewInteractionResolved(resolved.payload.RequestID, resolved.payload.SessionID, "expired"))
+	}
 }
 
 func (c *Codex) createMcpElicitationRequest(rpcID any, raw json.RawMessage) bool {
@@ -1594,11 +1966,25 @@ func codexJSON(v any) string {
 // --- Executor interface ----------------------------------------------------
 
 func (c *Codex) Send(ctx context.Context, s *session.Session, reqID, content string, images []backend.ImageAttachment, files []backend.FileAttachment) error {
+	if err := validateCodexInlineFiles(files); err != nil {
+		return err
+	}
+	sandboxOverride, _ := backend.SandboxOverride(ctx)
 	if err := c.ensureServer(); err != nil {
 		c.sink.Emit(backend.NewError(s.ID, reqID, backend.ErrProcessDied, "codex app-server failed: "+err.Error()))
 		return err
 	}
 	st := c.state(s.ID)
+	st.mu.Lock()
+	threadAlreadyLoaded := st.threadID != ""
+	st.mu.Unlock()
+	if !threadAlreadyLoaded {
+		if s.ResumeID() != "" {
+			c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "resuming_thread", "Loading the existing Codex conversation"))
+		} else {
+			c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "starting_thread", "Creating a Codex conversation"))
+		}
+	}
 
 	if err := c.ensureThread(s, st); err != nil {
 		if !errors.Is(err, backend.ErrThreadActiveWriter) {
@@ -1606,6 +1992,16 @@ func (c *Codex) Send(ctx context.Context, s *session.Session, reqID, content str
 		}
 		return err
 	}
+	// Durable chat admission pins a configuration per message. Apply it only
+	// after Mux authorization and after the prior turn is terminal; no daemon
+	// restart, fork or mutation of a currently running turn is involved.
+	if s.ActiveQueuedID() != "" {
+		if err := c.UpdateSessionSettings(ctx, s); err != nil && err.Error() != "pm_role_settings_locked" {
+			c.sink.Emit(backend.NewError(s.ID, reqID, "queued_configuration_rejected", err.Error()))
+			return err
+		}
+	}
+	c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "submitting_turn", "Sending the turn to Codex"))
 	isCompactCommand := strings.TrimSpace(content) == "/compact"
 	if isCompactCommand {
 		st.mu.Lock()
@@ -1628,13 +2024,18 @@ func (c *Codex) Send(ctx context.Context, s *session.Session, reqID, content str
 	st.reqID = reqID
 	st.stopping = false
 	st.turnErr = ""
+	st.turnErrorCode = ""
 	st.turnActive = true
 	st.turnDone = make(chan struct{})
 	st.accumulatedText = ""
 	st.askExtracted = false
 	st.currentTurnID = ""
+	st.turnStartPending = true
+	st.pendingTerminals = nil
 	st.lastEventAt = time.Now()
 	st.stallWarned = false
+	st.inactivityStopRequested = false
+	st.inactivityStopReason = ""
 	threadID := st.threadID
 	done := st.turnDone
 	st.mu.Unlock()
@@ -1643,8 +2044,8 @@ func (c *Codex) Send(ctx context.Context, s *session.Session, reqID, content str
 		st.finish(err.Error())
 		return err
 	}
-	input := c.codexInput(s, reqID, content, images, files, st)
-	go c.runTurn(s, st, threadID, input, done)
+	input := c.codexInput(s, reqID, reqID, content, images, files, st)
+	go c.runTurn(s, st, threadID, input, done, sandboxOverride)
 	return nil
 }
 
@@ -1653,8 +2054,11 @@ func (c *Codex) Send(ctx context.Context, s *session.Session, reqID, content str
 // between the local snapshot and the RPC is safely rejected instead of being
 // attached to the next turn.
 func (c *Codex) Steer(ctx context.Context, s *session.Session, clientUserMessageID, content string, images []backend.ImageAttachment, files []backend.FileAttachment) (backend.SteerResult, error) {
+	if err := validateCodexInlineFiles(files); err != nil {
+		return backend.SteerResult{}, fmt.Errorf("%w: %v", backend.ErrSteerRejected, err)
+	}
 	if err := c.ensureServer(); err != nil {
-		return backend.SteerResult{}, err
+		return backend.SteerResult{}, fmt.Errorf("%w: %v", backend.ErrSteerRejected, err)
 	}
 	return c.steerActiveTurn(s, clientUserMessageID, content, images, files)
 }
@@ -1671,7 +2075,7 @@ func (c *Codex) steerActiveTurn(s *session.Session, clientUserMessageID, content
 		return backend.SteerResult{}, backend.ErrNoActiveTurn
 	}
 
-	input := c.codexInput(s, clientUserMessageID, content, images, files, st)
+	input := c.codexInput(s, clientUserMessageID, activeRequestID, content, images, files, st)
 	params := map[string]any{
 		"threadId":            threadID,
 		"expectedTurnId":      turnID,
@@ -1680,6 +2084,10 @@ func (c *Codex) steerActiveTurn(s *session.Session, clientUserMessageID, content
 	}
 	raw, err := c.rpcCall("turn/steer", params, 15*time.Second)
 	if err != nil {
+		var rejected *rpcResponseError
+		if errors.As(err, &rejected) {
+			return backend.SteerResult{}, fmt.Errorf("%w: %v", backend.ErrSteerRejected, err)
+		}
 		return backend.SteerResult{}, err
 	}
 	var response struct {
@@ -1692,63 +2100,21 @@ func (c *Codex) steerActiveTurn(s *session.Session, clientUserMessageID, content
 	return backend.SteerResult{TurnID: response.TurnID, RequestID: activeRequestID}, nil
 }
 
-func (c *Codex) runTurn(s *session.Session, st *codexState, threadID string, input []map[string]any, done chan struct{}) {
-	defer c.cleanupTempImages(st)
-	if err := c.startTurnWithStaleRetry(s, st, threadID, input); err != nil {
+func (c *Codex) runTurn(s *session.Session, st *codexState, threadID string, input []map[string]any, done chan struct{}, sandboxOverride string) {
+	st.mu.Lock()
+	requestID := st.reqID
+	st.mu.Unlock()
+	defer c.cleanupTempImages(st, requestID)
+	c.sink.Emit(backend.NewTurnProgress(s.ID, requestID, "waiting_model", "Waiting for Codex to accept the turn"))
+	if err := c.startTurnWithStaleRetry(s, st, threadID, input, sandboxOverride); err != nil {
 		st.finish("turn/start failed: " + err.Error())
 	}
 
-	timeout := time.NewTimer(c.turnTimeout)
-	defer timeout.Stop()
 	stallTicker := time.NewTicker(c.stallCheckEvery)
 	defer stallTicker.Stop()
-
-	waiting := true
-	for waiting {
-		select {
-		case <-done:
-			waiting = false
-		case <-timeout.C:
-			// A request_user_input / MCP elicitation is an explicit hand-off to a
-			// human. Human think time must not consume the turn deadline: the app
-			// may be backgrounded or disconnected for hours and will recover the
-			// pending interaction when it reconnects. Re-arm the full execution
-			// window while any interaction for this session remains unresolved.
-			// Once the user answers (or explicitly cancels), the next deadline is
-			// again an ordinary execution deadline.
-			if c.deferTurnDeadlineForInput(s.ID, timeout) {
-				continue
-			}
-			c.interruptCodexTurn(st)
-			st.finish("Codex turn timed out")
-			<-done
-			waiting = false
-		case now := <-stallTicker.C:
-			st.mu.Lock()
-			lastEventAt := st.lastEventAt
-			warned := st.stallWarned
-			st.mu.Unlock()
-			action := codexLivenessActionAt(
-				now, lastEventAt, warned, c.hasPendingInteraction(s.ID),
-				c.stallWarnAfter, c.stallAbortAfter,
-			)
-			switch action {
-			case codexLivenessWarn:
-				st.mu.Lock()
-				st.stallWarned = true
-				st.mu.Unlock()
-				c.sink.Emit(backend.NewSessionWarning(s.ID, fmt.Sprintf(
-					"Codex has produced no events for %s; it is still running and will be interrupted after %s of inactivity.",
-					c.stallWarnAfter.Round(time.Second), c.stallAbortAfter.Round(time.Second),
-				)))
-			case codexLivenessAbort:
-				c.interruptCodexTurn(st)
-				st.finish(fmt.Sprintf("Codex turn stalled for %s and was interrupted", c.stallAbortAfter.Round(time.Second)))
-				<-done
-				waiting = false
-			}
-		}
-	}
+	// Long turns remain live while progress continues. Only inactivity (not
+	// total wall-clock runtime) is subject to the watchdog.
+	c.waitForCodexTurn(s, st, done, stallTicker.C)
 
 	st.mu.Lock()
 	completedThreadID := st.threadID
@@ -1763,13 +2129,19 @@ func (c *Codex) runTurn(s *session.Session, st *codexState, threadID string, inp
 	// immediately unlocks the per-session queue, so a deferred release could
 	// race the next turn from the same session and delete its newly acquired
 	// route.
-	c.releaseActiveThreads(s)
-
 	switch {
 	case stopping || turnErr == "stopped":
-		c.sink.Emit(backend.NewStopped(s.ID, st.reqID))
+		c.releaseActiveThreads(s)
+		c.sink.Emit(backend.NewStopped(s.ID, requestID))
 	case turnErr != "":
-		c.sink.Emit(backend.NewError(s.ID, st.reqID, backend.ErrTurn, turnErr))
+		st.mu.Lock()
+		code := st.turnErrorCode
+		st.mu.Unlock()
+		if code == "" {
+			code = codexErrorCode(nil, turnErr)
+		}
+		c.releaseActiveThreads(s)
+		c.sink.Emit(backend.NewError(s.ID, requestID, code, turnErr))
 	default:
 		c.emitExtractedAskUserQuestion(s, st)
 		// Goal state is durable thread metadata, separate from turn/completed.
@@ -1777,19 +2149,21 @@ func (c *Codex) runTurn(s *session.Session, st *codexState, threadID string, inp
 		// transition when the app-server notification was dropped or arrived while
 		// they were reconnecting.
 		c.reconcileGoalAfterTurn(s, st)
-		c.sink.Emit(backend.NewDone(s.ID, st.reqID))
 		if c.shouldAutoCompact(st) {
-			go c.runAutoCompact(s, st)
+			// Keep the durable session worker occupied until maintenance ends.
+			// Emitting Done first lets the next queued Send race compact/start.
+			c.runAutoCompact(s, st)
+		}
+		st.mu.Lock()
+		stopping = st.stopping
+		st.mu.Unlock()
+		c.releaseActiveThreads(s)
+		if stopping {
+			c.sink.Emit(backend.NewStopped(s.ID, requestID))
+		} else {
+			c.sink.Emit(backend.NewDone(s.ID, requestID))
 		}
 	}
-}
-
-func (c *Codex) deferTurnDeadlineForInput(sessionID string, timer *time.Timer) bool {
-	if !c.hasPendingInteraction(sessionID) {
-		return false
-	}
-	timer.Reset(c.turnTimeout)
-	return true
 }
 
 type codexLivenessAction uint8
@@ -1818,27 +2192,29 @@ func (c *Codex) hasPendingInteraction(sessionID string) bool {
 	c.interMu.Lock()
 	defer c.interMu.Unlock()
 	for _, interaction := range c.interactions {
-		if interaction.payload.SessionID == sessionID {
+		blocking := interaction.payload.IsBlocking == nil || *interaction.payload.IsBlocking
+		if interaction.payload.SessionID == sessionID && blocking {
 			return true
 		}
 	}
 	return false
 }
 
-func (c *Codex) interruptCodexTurn(st *codexState) {
-	st.mu.Lock()
-	threadID, turnID := st.threadID, st.currentTurnID
-	st.mu.Unlock()
+func (c *Codex) interruptCodexTurn(threadID, turnID string) error {
 	if threadID == "" || turnID == "" {
-		return
+		return fmt.Errorf("cannot interrupt without an active thread and turn id")
 	}
 	if _, err := c.rpcCall("turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}, 5*time.Second); err != nil {
 		log.Printf("[codex] turn interrupt failed thread=%s turn=%s: %v", threadID, turnID, err)
+		return err
 	}
+	return nil
 }
 
 func (c *Codex) runCompactCommand(s *session.Session, st *codexState, reqID string) {
-	if err := c.runCompact(st, 120*time.Second); err != nil {
+	if err := c.runCompact(st, 120*time.Second, func() {
+		c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "composing", "整理上下文耗時較久，仍在等待執行端確認"))
+	}); err != nil {
 		c.sink.Emit(backend.NewSessionCommandFailed(s.ID, reqID, "compact failed: "+err.Error(), 0))
 		c.sink.Emit(backend.NewError(s.ID, reqID, backend.ErrTurn, "compact failed: "+err.Error()))
 		return
@@ -1848,27 +2224,29 @@ func (c *Codex) runCompactCommand(s *session.Session, st *codexState, reqID stri
 }
 
 func (c *Codex) runAutoCompact(s *session.Session, st *codexState) {
-	reqID := "compact_" + s.ID
-	c.sink.Emit(backend.NewSessionCommandStarted(s.ID, reqID, 0))
-	if err := c.runCompact(st, 120*time.Second); err != nil {
-		c.sink.Emit(backend.NewSessionCommandFailed(s.ID, reqID, "compact failed: "+err.Error(), 0))
+	c.sink.Emit(backend.NewTurnProgress(s.ID, st.reqID, "composing", "正在整理上下文；後續訊息會依序處理"))
+	if err := c.runCompact(st, 120*time.Second, func() {
+		c.sink.Emit(backend.NewTurnProgress(s.ID, st.reqID, "composing", "整理上下文耗時較久，仍在等待執行端確認"))
+	}); err != nil {
+		c.sink.Emit(backend.NewSessionWarning(s.ID, "上下文整理未完成："+err.Error()))
 		log.Printf("[codex] auto compact failed session=%s: %v", s.ID, err)
 		return
 	}
-	c.sink.Emit(backend.NewSessionCommandDone(s.ID, reqID, 0))
 }
 
-func (c *Codex) runCompact(st *codexState, timeout time.Duration) error {
+func (c *Codex) runCompact(st *codexState, timeout time.Duration, onSlow ...func()) error {
 	st.mu.Lock()
 	if st.compactActive {
 		done := st.compactDone
 		st.mu.Unlock()
 		if done != nil {
-			select {
-			case <-done:
-			case <-time.After(timeout):
-				return fmt.Errorf("compact timed out")
-			}
+			<-done
+		}
+		st.mu.Lock()
+		errStr := st.compactErr
+		st.mu.Unlock()
+		if errStr != "" {
+			return errors.New(errStr)
 		}
 		return nil
 	}
@@ -1880,8 +2258,14 @@ func (c *Codex) runCompact(st *codexState, timeout time.Duration) error {
 	st.compactActive = true
 	st.compactErr = ""
 	st.compactDone = make(chan struct{})
+	st.compactTurnID = ""
 	done := st.compactDone
 	st.mu.Unlock()
+	maintenanceID, persistErr := c.beginMaintenance(st)
+	if persistErr != nil {
+		st.finishCompact(persistErr.Error())
+		return persistErr
+	}
 
 	if _, err := c.rpcCall("thread/compact/start", map[string]any{"threadId": threadID}, 30*time.Second); err != nil {
 		st.finishCompact(err.Error())
@@ -1890,7 +2274,13 @@ func (c *Codex) runCompact(st *codexState, timeout time.Duration) error {
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		st.finishCompact("compact timed out")
+		// The deadline measures our wait, not the daemon operation. Only an
+		// actual terminal event or transport loss may settle this operation.
+		log.Printf("[codex] compact still running thread=%s after=%s", threadID, timeout)
+		c.updateMaintenance(maintenanceID, "running", "整理上下文耗時較久，仍在等待執行端確認", "")
+		for _, notify := range onSlow {
+			notify()
+		}
 		<-done
 	}
 
@@ -1898,20 +2288,25 @@ func (c *Codex) runCompact(st *codexState, timeout time.Duration) error {
 	errStr := st.compactErr
 	st.mu.Unlock()
 	if errStr != "" {
+		c.updateMaintenance(maintenanceID, "unknown", errStr, "")
 		return fmt.Errorf("%s", errStr)
 	}
+	c.updateMaintenance(maintenanceID, "completed", "上下文整理完成", "")
 	return nil
 }
 
+// Goal operations are independent of generation. Their failures must remain
+// warnings: a request-less Error would settle the active turn in both the Hub
+// and TerminalSink and falsely fail the client's streaming assistant message.
 func (c *Codex) SetGoal(ctx context.Context, s *session.Session, objective, status string, tokenBudget *int) error {
 	if err := c.ensureServer(); err != nil {
-		c.sink.Emit(backend.NewError(s.ID, "", backend.ErrProcessDied, "codex app-server failed: "+err.Error()))
+		c.sink.Emit(backend.NewSessionWarning(s.ID, "codex app-server failed: "+err.Error()))
 		return err
 	}
 	st := c.state(s.ID)
 	if err := c.ensureThread(s, st); err != nil {
 		if !errors.Is(err, backend.ErrThreadActiveWriter) {
-			c.sink.Emit(backend.NewError(s.ID, "", backend.ErrProcessDied, "failed to start codex thread: "+err.Error()))
+			c.sink.Emit(backend.NewSessionWarning(s.ID, "failed to start codex thread: "+err.Error()))
 		}
 		return err
 	}
@@ -1930,13 +2325,13 @@ func (c *Codex) SetGoal(ctx context.Context, s *session.Session, objective, stat
 	}
 	raw, err := c.rpcCall("thread/goal/set", params, 30*time.Second)
 	if err != nil {
-		c.sink.Emit(backend.NewError(s.ID, "", backend.ErrTurn, "goal set failed: "+err.Error()))
+		c.sink.Emit(backend.NewSessionWarning(s.ID, "goal set failed: "+err.Error()))
 		return err
 	}
 	goal, ok := decodeCodexGoal(raw)
 	if !ok {
 		err := fmt.Errorf("thread/goal/set returned no goal")
-		c.sink.Emit(backend.NewError(s.ID, "", backend.ErrTurn, err.Error()))
+		c.sink.Emit(backend.NewSessionWarning(s.ID, err.Error()))
 		return err
 	}
 	c.sink.Emit(backend.NewGoalUpdate(s.ID, goal))
@@ -1945,7 +2340,7 @@ func (c *Codex) SetGoal(ctx context.Context, s *session.Session, objective, stat
 
 func (c *Codex) GetGoal(ctx context.Context, s *session.Session) error {
 	if err := c.ensureServer(); err != nil {
-		c.sink.Emit(backend.NewError(s.ID, "", backend.ErrProcessDied, "codex app-server failed: "+err.Error()))
+		c.sink.Emit(backend.NewSessionWarning(s.ID, "codex app-server failed: "+err.Error()))
 		return err
 	}
 	st := c.state(s.ID)
@@ -1961,7 +2356,7 @@ func (c *Codex) GetGoal(ctx context.Context, s *session.Session) error {
 	if threadID == "" {
 		if err := c.ensureThread(s, st); err != nil {
 			if !errors.Is(err, backend.ErrThreadActiveWriter) {
-				c.sink.Emit(backend.NewError(s.ID, "", backend.ErrProcessDied, "failed to start codex thread: "+err.Error()))
+				c.sink.Emit(backend.NewSessionWarning(s.ID, "failed to start codex thread: "+err.Error()))
 			}
 			return err
 		}
@@ -1975,7 +2370,7 @@ func (c *Codex) GetGoal(ctx context.Context, s *session.Session) error {
 		// already loaded by a desktop client takes the fast read-only path above.
 		if resumeErr := c.ensureThread(s, st); resumeErr != nil {
 			if !errors.Is(resumeErr, backend.ErrThreadActiveWriter) {
-				c.sink.Emit(backend.NewError(s.ID, "", backend.ErrProcessDied, "failed to start codex thread: "+resumeErr.Error()))
+				c.sink.Emit(backend.NewSessionWarning(s.ID, "failed to start codex thread: "+resumeErr.Error()))
 			}
 			return resumeErr
 		}
@@ -1985,7 +2380,7 @@ func (c *Codex) GetGoal(ctx context.Context, s *session.Session) error {
 		raw, err = c.rpcCall("thread/goal/get", map[string]any{"threadId": threadID}, 30*time.Second)
 	}
 	if err != nil {
-		c.sink.Emit(backend.NewError(s.ID, "", backend.ErrTurn, "goal get failed: "+err.Error()))
+		c.sink.Emit(backend.NewSessionWarning(s.ID, "goal get failed: "+err.Error()))
 		return err
 	}
 	goal, ok := decodeCodexGoal(raw)
@@ -2038,13 +2433,13 @@ func (c *Codex) reconcileGoalAfterTurn(s *session.Session, st *codexState) {
 
 func (c *Codex) ClearGoal(ctx context.Context, s *session.Session) error {
 	if err := c.ensureServer(); err != nil {
-		c.sink.Emit(backend.NewError(s.ID, "", backend.ErrProcessDied, "codex app-server failed: "+err.Error()))
+		c.sink.Emit(backend.NewSessionWarning(s.ID, "codex app-server failed: "+err.Error()))
 		return err
 	}
 	st := c.state(s.ID)
 	if err := c.ensureThread(s, st); err != nil {
 		if !errors.Is(err, backend.ErrThreadActiveWriter) {
-			c.sink.Emit(backend.NewError(s.ID, "", backend.ErrProcessDied, "failed to start codex thread: "+err.Error()))
+			c.sink.Emit(backend.NewSessionWarning(s.ID, "failed to start codex thread: "+err.Error()))
 		}
 		return err
 	}
@@ -2052,7 +2447,7 @@ func (c *Codex) ClearGoal(ctx context.Context, s *session.Session) error {
 	threadID := st.threadID
 	st.mu.Unlock()
 	if _, err := c.rpcCall("thread/goal/clear", map[string]any{"threadId": threadID}, 30*time.Second); err != nil {
-		c.sink.Emit(backend.NewError(s.ID, "", backend.ErrTurn, "goal clear failed: "+err.Error()))
+		c.sink.Emit(backend.NewSessionWarning(s.ID, "goal clear failed: "+err.Error()))
 		return err
 	}
 	c.sink.Emit(backend.NewGoalCleared(s.ID))
@@ -2078,9 +2473,12 @@ func (c *Codex) shouldAutoCompact(st *codexState) bool {
 	return float64(st.contextUsed)/float64(st.contextMax) >= codexCompactThreshold
 }
 
-func (c *Codex) startTurnWithStaleRetry(s *session.Session, st *codexState, threadID string, input []map[string]any) error {
+func (c *Codex) startTurnWithStaleRetry(s *session.Session, st *codexState, threadID string, input []map[string]any, sandboxOverride string) error {
 	snap := s.Snapshot()
-	err := c.startTurn(threadID, input, snap)
+	st.mu.Lock()
+	requestID := st.reqID
+	st.mu.Unlock()
+	err := c.startTurn(threadID, input, snap, sandboxOverride, requestID)
 	if err == nil {
 		c.finalizePendingRecovery(s, st, threadID)
 		return nil
@@ -2100,7 +2498,7 @@ func (c *Codex) startTurnWithStaleRetry(s *session.Session, st *codexState, thre
 	if err := c.moveActiveThreadClaim(threadID, newThreadID, s); err != nil {
 		return err
 	}
-	if err := c.startTurn(newThreadID, input, snap); err != nil {
+	if err := c.startTurn(newThreadID, input, snap, sandboxOverride, requestID); err != nil {
 		return err
 	}
 	c.finalizePendingRecovery(s, st, newThreadID)
@@ -2211,8 +2609,9 @@ func codexTurnParams(threadID string, input []map[string]any, effort string) map
 	return params
 }
 
-func (c *Codex) codexTurnParamsForSession(threadID string, input []map[string]any, snap session.Snapshot) map[string]any {
+func (c *Codex) codexTurnParamsForSession(threadID string, input []map[string]any, snap session.Snapshot, sandboxOverride string) map[string]any {
 	params := codexTurnParams(threadID, input, snap.Effort)
+	params["sandboxPolicy"] = codexTurnSandboxPolicy(snap, sandboxOverride)
 	if snap.ServiceTier != "" {
 		params["serviceTier"] = snap.ServiceTier
 	}
@@ -2225,19 +2624,52 @@ func (c *Codex) codexTurnParamsForSession(threadID string, input []map[string]an
 	return params
 }
 
-func (c *Codex) startTurn(threadID string, input []map[string]any, snap session.Snapshot) error {
-	_, err := c.rpcCall("turn/start", c.codexTurnParamsForSession(threadID, input, snap), 30*time.Second)
+func (c *Codex) startTurn(threadID string, input []map[string]any, snap session.Snapshot, sandboxOverride, requestID string) error {
+	params := c.codexTurnParamsForSession(threadID, input, snap, sandboxOverride)
+	if err := c.applyPMTurnPolicy(snap.ID, params); err != nil {
+		return err
+	}
+	st := c.state(snap.ID)
+	st.mu.Lock()
+	if st.turnActive && st.reqID == requestID && st.threadID == threadID {
+		st.turnStartPending = true
+	}
+	st.mu.Unlock()
+	raw, err := c.rpcCall("turn/start", params, 30*time.Second)
+	if err == nil {
+		var response struct {
+			Turn codexTurnResponse `json:"turn"`
+		}
+		if json.Unmarshal(raw, &response) == nil && response.Turn.ID != "" {
+			c.confirmOwnedTurnSubmission(st, threadID, requestID, response.Turn)
+		}
+	}
 	return err
 }
 
 func (c *Codex) collaborationModeValue(snap session.Snapshot) map[string]any {
+	modeName := strings.ToLower(strings.TrimSpace(snap.CollaborationMode))
+	if modeName == "default" {
+		// Codex treats a null collaborationMode as "keep the current mode".
+		// Send an explicit Default preset while retaining this session's model and
+		// effort, instead of silently leaving a previously selected Plan active.
+		model := strings.TrimSpace(snap.Model)
+		if model == "" {
+			model = c.defaultModel()
+		}
+		var effort any
+		if snap.Effort != "" && snap.Effort != "auto" {
+			effort = snap.Effort
+		}
+		return map[string]any{"mode": "default", "settings": map[string]any{"model": model, "reasoning_effort": effort, "developer_instructions": nil}}
+	}
 	c.catalogMu.RLock()
-	mode := c.collaborationModes[strings.ToLower(snap.CollaborationMode)]
+	mode := c.collaborationModes[modeName]
 	c.catalogMu.RUnlock()
 	if mode != nil {
 		return mode
 	}
-	return map[string]any{"mode": strings.ToLower(snap.CollaborationMode), "settings": map[string]any{"model": snap.Model, "reasoning_effort": nil, "developer_instructions": nil}}
+	return map[string]any{"mode": modeName, "settings": map[string]any{"model": snap.Model, "reasoning_effort": nil, "developer_instructions": nil}}
 }
 
 func (c *Codex) forgetThread(s *session.Session, st *codexState, threadID string) {
@@ -2293,6 +2725,23 @@ func (c *Codex) ensureThread(s *session.Session, st *codexState) error {
 	have := st.threadID
 	st.mu.Unlock()
 	if have != "" {
+		// Rebind managed tools on the SAME thread, including v1 -> v2 upgrades.
+		// No global daemon config or native history is reset.
+		if c.pmProvider != nil {
+			policy, err := c.pmProvider.PMConfiguration(s.ID)
+			if err != nil {
+				return err
+			}
+			if policy != nil {
+				params := map[string]any{"threadId": have, "excludeTurns": true, "approvalPolicy": "never"}
+				if err := c.applyPMThreadPolicy(s, params); err != nil {
+					return err
+				}
+				if _, err := c.rpcCall("thread/resume", params, 15*time.Second); err != nil {
+					return fmt.Errorf("collaboration policy rebind: %w", err)
+				}
+			}
+		}
 		return nil
 	}
 
@@ -2304,11 +2753,17 @@ func (c *Codex) ensureThread(s *session.Session, st *codexState) error {
 	sandbox := codexSandboxForSession(snap)
 
 	var threadID string
+	var threadMetadataRaw json.RawMessage
 	var recovery *codexRecovery
 	if snap.ResumeID != "" {
 		rolloutPath := c.findCodexSessionFile(snap.ResumeID)
 		rolloutBytes := fileSize(rolloutPath)
-		if c.rolloverEnabled && rolloutBytes > c.coldResumeMaxBytes {
+		// The shared daemon can rejoin a running or persisted thread without
+		// returning its history (excludeTurns below), so rollout byte size is no
+		// longer a reason to fork that canonical thread. Keep checkpoint rollover
+		// only for the legacy private stdio transport whose resume response still
+		// contains the complete history.
+		if c.appServerMode != "daemon" && c.rolloverEnabled && rolloutBytes > c.coldResumeMaxBytes {
 			var err error
 			recovery, err = c.prepareColdRecovery(snap, rolloutPath, rolloutBytes, "cold_resume_hard_limit")
 			if err != nil {
@@ -2316,12 +2771,26 @@ func (c *Codex) ensureThread(s *session.Session, st *codexState) error {
 			}
 			log.Printf("[codex] cold resume guarded session=%s thread=%s bytes=%d", s.ID, snap.ResumeID, rolloutBytes)
 		} else {
-			raw, err := c.rpcCall("thread/resume", map[string]any{
+			resumeParams := map[string]any{
 				"threadId": snap.ResumeID, "cwd": cwd,
 				"approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": sandbox,
-			}, 15*time.Second)
+			}
+			if c.appServerMode == "daemon" {
+				// A shared daemon already owns the canonical rollout and only needs
+				// to subscribe this Bridge connection. Returning every historical
+				// turn can produce a hundreds-of-MiB JSON-RPC frame and time out even
+				// though the thread itself is healthy. excludeTurns preserves resume
+				// and notification subscription semantics while returning metadata.
+				resumeParams["excludeTurns"] = true
+			}
+			c.applyDelegationThreadTools(s, resumeParams)
+			if err := c.applyPMThreadPolicy(s, resumeParams); err != nil {
+				return err
+			}
+			raw, err := c.rpcCall("thread/resume", resumeParams, 15*time.Second)
 			if err == nil {
 				threadID = extractThreadID(raw, snap.ResumeID)
+				threadMetadataRaw = append(json.RawMessage(nil), raw...)
 			} else if isActiveWriterError(err) {
 				return fmt.Errorf("thread/resume refused: %w: %v", backend.ErrThreadActiveWriter, err)
 			} else if isStaleThreadError(err) {
@@ -2344,9 +2813,9 @@ func (c *Codex) ensureThread(s *session.Session, st *codexState) error {
 	if threadID == "" {
 		model := snap.Model
 		if model == "" {
-			model = codexDefaultModel
+			model = c.defaultModel()
 		}
-		raw, err := c.rpcCall("thread/start", map[string]any{
+		startParams := map[string]any{
 			"model": model, "cwd": cwd, "ephemeral": false,
 			"approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": sandbox,
 			"serviceTier": func() any {
@@ -2361,11 +2830,17 @@ func (c *Codex) ensureThread(s *session.Session, st *codexState) error {
 				}
 				return snap.Personality
 			}(),
-		}, 15*time.Second)
+		}
+		c.applyDelegationThreadTools(s, startParams)
+		if err := c.applyPMThreadPolicy(s, startParams); err != nil {
+			return err
+		}
+		raw, err := c.rpcCall("thread/start", startParams, 15*time.Second)
 		if err != nil {
 			return err
 		}
 		threadID = extractThreadID(raw, "")
+		threadMetadataRaw = append(json.RawMessage(nil), raw...)
 		if threadID == "" {
 			return errNoThreadID
 		}
@@ -2380,6 +2855,7 @@ func (c *Codex) ensureThread(s *session.Session, st *codexState) error {
 	c.mu.Lock()
 	c.threadToSession[threadID] = s
 	c.mu.Unlock()
+	c.applyThreadRuntimeMetadata(s, threadMetadataRaw)
 
 	if recovery == nil {
 		s.SetResumeID(threadID)
@@ -2392,28 +2868,100 @@ func (c *Codex) ensureThread(s *session.Session, st *codexState) error {
 }
 
 func (c *Codex) UpdateSessionSettings(ctx context.Context, s *session.Session) error {
+	if c.pmProvider != nil {
+		p, err := c.pmProvider.PMConfiguration(s.ID)
+		if err != nil {
+			return err
+		}
+		if p != nil {
+			return errors.New("pm_role_settings_locked")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	st := c.state(s.ID)
+	st.ensureMu.Lock()
+	defer st.ensureMu.Unlock()
 	st.mu.Lock()
 	threadID := st.threadID
 	st.mu.Unlock()
 	if threadID == "" {
+		// A native Codex Desktop/CLI may already own the durable thread while
+		// Bridge has no local live state. Address the persisted thread directly
+		// so the caller receives a real runtime ACK/rejection instead of a false
+		// success that only changes Bridge's next-turn snapshot.
+		threadID = s.ResumeID()
+	}
+	if threadID == "" {
+		// Brand-new session: there is no runtime object to update yet. Persisted
+		// settings are authoritative and will be applied by thread/start.
 		return nil
 	}
 	snap := s.Snapshot()
-	params := map[string]any{"threadId": threadID, "model": snap.Model, "serviceTier": nil, "personality": nil}
+	params := map[string]any{
+		"threadId":          threadID,
+		"model":             nil,
+		"effort":            nil,
+		"serviceTier":       nil,
+		"personality":       nil,
+		"collaborationMode": nil,
+	}
+	if snap.Model != "" {
+		params["model"] = snap.Model
+	}
 	if snap.ServiceTier != "" {
 		params["serviceTier"] = snap.ServiceTier
 	}
 	if snap.Personality != "" {
 		params["personality"] = snap.Personality
 	}
-	if snap.Effort != "" {
+	if snap.Effort != "" && snap.Effort != "auto" {
 		params["effort"] = snap.Effort
 	}
 	if snap.CollaborationMode != "" {
 		params["collaborationMode"] = c.collaborationModeValue(snap)
 	}
+	// Settings can be the first operation after Bridge startup; catalog warmup
+	// may not have connected the daemon yet. Initialize before writing the RPC.
+	if !c.rpc.hasWriter() {
+		if err := c.ensureServer(); err != nil {
+			return err
+		}
+	}
 	_, err := c.rpcCall("thread/settings/update", params, 15*time.Second)
+	if err == nil || !isStaleThreadError(err) {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// settings/update only addresses loaded threads. A durable thread can still
+	// exist on disk after daemon/Bridge restarts. Resume that exact ID, never use
+	// ensureThread's missing-history recovery (which may create a new thread).
+	resumeParams := map[string]any{"threadId": threadID}
+	if c.appServerMode == "daemon" {
+		resumeParams["excludeTurns"] = true
+	}
+	raw, resumeErr := c.rpcCall("thread/resume", resumeParams, 15*time.Second)
+	if resumeErr != nil {
+		return fmt.Errorf("load existing thread for settings: %w", resumeErr)
+	}
+	if extractThreadID(raw, "") != threadID {
+		return fmt.Errorf("load existing thread for settings returned an unexpected thread id")
+	}
+	st.mu.Lock()
+	st.threadID = threadID
+	st.mu.Unlock()
+	c.mu.Lock()
+	c.threadToSession[threadID] = s
+	c.mu.Unlock()
+	// Preserve the requested settings snapshot; resume metadata describes the
+	// old settings. Only an explicit rejection is retried, never a timeout.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err = c.rpcCall("thread/settings/update", params, 15*time.Second)
 	return err
 }
 
@@ -2422,7 +2970,29 @@ func (c *Codex) Stop(ctx context.Context, s *session.Session) error {
 	st.mu.Lock()
 	st.stopping = true
 	threadID, turnID, active := st.threadID, st.currentTurnID, st.turnActive
+	observedTurnID := st.observedTurnID
+	compacting := st.compactActive
+	if compacting {
+		turnID = st.compactTurnID
+	}
 	st.mu.Unlock()
+	if !active && !compacting && observedTurnID != "" {
+		if threadID == "" {
+			threadID = s.ResumeID()
+		}
+		// Wait for the exact native terminal notification; never report an
+		// unconfirmed interrupt as completed or release the Bridge queue.
+		_, err := c.rpcCall("turn/interrupt", map[string]any{"threadId": threadID, "turnId": observedTurnID}, 5*time.Second)
+		return err
+	}
+	if compacting {
+		if threadID == "" || turnID == "" {
+			return fmt.Errorf("context maintenance is awaiting its operation ID; stop is not yet confirmed")
+		}
+		_, err := c.rpcCall("turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}, 5*time.Second)
+		// Let the correlated terminal notification settle the waiter and queue.
+		return err
+	}
 
 	if threadID != "" && turnID != "" {
 		_, _ = c.rpcCall("turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}, 5*time.Second)
@@ -2548,6 +3118,9 @@ func (c *Codex) RespondUserInput(id string, answers map[string]any, cancelled bo
 	if !ok {
 		return false
 	}
+	// Human wait time is not model inactivity. Start a fresh liveness window
+	// when the answer is submitted, even before the next model event arrives.
+	c.state(ci.payload.SessionID).touch(time.Now())
 	if answers == nil {
 		answers = map[string]any{}
 	}
@@ -2560,6 +3133,8 @@ func (c *Codex) RespondUserInput(id string, answers map[string]any, cancelled bo
 			text := codexAnyString(answers["result"])
 			result = map[string]any{"contentItems": []any{map[string]any{"type": "inputText", "text": text}}, "success": !cancelled}
 			c.tools.ResultEnd(ci.payload.SessionID, ci.reqID, ci.payload.ToolUseID, text)
+		case "request_user_input_v2":
+			result = map[string]any{"answers": codexV2UserInputAnswers(ci.payload.Questions, answers, cancelled)}
 		default:
 			result = map[string]any{"answers": answers, "cancelled": cancelled}
 		}
@@ -2571,6 +3146,35 @@ func (c *Codex) RespondUserInput(id string, answers map[string]any, cancelled bo
 	}
 	c.sink.Emit(backend.NewInteractionResolved(ci.payload.RequestID, ci.payload.SessionID, status))
 	return true
+}
+
+func codexV2UserInputAnswers(questions []backend.UserInputQuestion, answers map[string]any, cancelled bool) map[string]any {
+	out := make(map[string]any, len(questions))
+	for _, question := range questions {
+		values := []string{}
+		if !cancelled {
+			switch value := answers[question.QuestionID].(type) {
+			case string:
+				if value != "" {
+					values = []string{value}
+				}
+			case []string:
+				values = append(values, value...)
+			case []any:
+				for _, item := range value {
+					if text := codexAnyString(item); text != "" {
+						values = append(values, text)
+					}
+				}
+			default:
+				if text := codexAnyString(value); text != "" {
+					values = []string{text}
+				}
+			}
+		}
+		out[question.QuestionID] = map[string]any{"answers": values}
+	}
+	return out
 }
 
 func (c *Codex) PendingInteractions(sessionID string) []backend.UserInputPayload {
@@ -2587,7 +3191,16 @@ func (c *Codex) PendingInteractions(sessionID string) []backend.UserInputPayload
 
 // --- helpers ---------------------------------------------------------------
 
-func (c *Codex) codexInput(s *session.Session, reqID, content string, images []backend.ImageAttachment, files []backend.FileAttachment, st *codexState) []map[string]any {
+func validateCodexInlineFiles(files []backend.FileAttachment) error {
+	for _, file := range files {
+		if file.MediaType == "application/pdf" || file.RemotePath != "" || file.AttachmentID != "" {
+			return errors.New("binary attachments must be materialized and validated by Bridge admission before Codex execution")
+		}
+	}
+	return nil
+}
+
+func (c *Codex) codexInput(s *session.Session, reqID, imageOwnerID, content string, images []backend.ImageAttachment, files []backend.FileAttachment, st *codexState) []map[string]any {
 	userText := content
 	for _, f := range files {
 		name := f.Name
@@ -2598,14 +3211,14 @@ func (c *Codex) codexInput(s *session.Session, reqID, content string, images []b
 	}
 	input := []map[string]any{{"type": "text", "text": userText, "text_elements": []any{}}}
 	for _, img := range images {
-		if item := c.prepareCodexImageInput(s, reqID, img, st); item != nil {
+		if item := c.prepareCodexImageInput(s, reqID, imageOwnerID, img, st); item != nil {
 			input = append(input, item)
 		}
 	}
 	return input
 }
 
-func (c *Codex) prepareCodexImageInput(s *session.Session, reqID string, img backend.ImageAttachment, st *codexState) map[string]any {
+func (c *Codex) prepareCodexImageInput(s *session.Session, reqID, imageOwnerID string, img backend.ImageAttachment, st *codexState) map[string]any {
 	raw := strings.TrimSpace(img.Data)
 	if raw == "" {
 		return nil
@@ -2619,30 +3232,34 @@ func (c *Codex) prepareCodexImageInput(s *session.Session, reqID string, img bac
 	if err != nil {
 		return nil
 	}
-	snap := s.Snapshot()
-	base := runtime.ExpandPath(snap.Cwd)
-	if fi, err := os.Stat(base); err != nil || !fi.IsDir() {
-		base, _ = os.UserHomeDir()
-	}
-	root := filepath.Join(base, ".bridge_images")
+	// Stage prompt images under Bridge runtime state, not the Session cwd.
+	// Downloads/Desktop/Documents are TCC-protected on macOS and the shared
+	// Codex daemon (rather than Everything Go.app) is the process that opens a
+	// localImage. Keeping the short-lived handoff outside those folders avoids a
+	// fresh protected-folder prompt after Codex binary updates.
+	root := filepath.Join(c.dataDir, "codex-input-images")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil
 	}
-	safeReqID := strings.ReplaceAll(reqID, "/", "_")
-	path := filepath.Join(root, s.ID+"_"+safeReqID+"_"+randHex(8)+codexImageExt(img.MediaType))
+	sessionHash := sha256.Sum256([]byte(s.ID))
+	requestHash := sha256.Sum256([]byte(reqID))
+	path := filepath.Join(root, fmt.Sprintf("%x_%x_%s%s", sessionHash[:6], requestHash[:6], randHex(8), codexImageExt(img.MediaType)))
 	if err := os.WriteFile(path, blob, 0o600); err != nil {
 		return nil
 	}
 	st.mu.Lock()
-	st.tempImages = append(st.tempImages, path)
+	if st.tempImages == nil {
+		st.tempImages = make(map[string][]string)
+	}
+	st.tempImages[imageOwnerID] = append(st.tempImages[imageOwnerID], path)
 	st.mu.Unlock()
 	return map[string]any{"type": "localImage", "path": path}
 }
 
-func (c *Codex) cleanupTempImages(st *codexState) {
+func (c *Codex) cleanupTempImages(st *codexState, imageOwnerID string) {
 	st.mu.Lock()
-	paths := append([]string(nil), st.tempImages...)
-	st.tempImages = nil
+	paths := append([]string(nil), st.tempImages[imageOwnerID]...)
+	delete(st.tempImages, imageOwnerID)
 	st.mu.Unlock()
 	for _, path := range paths {
 		_ = os.Remove(path)
@@ -2664,8 +3281,12 @@ func normalizeCodexQuestions(raw []map[string]any) []backend.UserInputQuestion {
 		qtype := codexFirstString(q, "type", "kind")
 		multi := codexBoolField(q, "multiSelect", "multi_select", "multiple")
 		freeForm := codexBoolField(q, "freeForm", "free_form", "allowFreeForm")
+		secret := codexBoolField(q, "isSecret", "is_secret", "secret")
 		if qtype == "" {
 			switch {
+			case secret:
+				qtype = "secret"
+				freeForm = true
 			case multi:
 				qtype = "multi_choice"
 			case len(options) > 0:
@@ -2685,7 +3306,7 @@ func normalizeCodexQuestions(raw []map[string]any) []backend.UserInputQuestion {
 		}
 		out = append(out, backend.UserInputQuestion{
 			QuestionID: qid, Text: text, Header: codexFirstString(q, "header", "title"),
-			Type: qtype, Options: options, MultiSelect: multi, FreeForm: freeForm,
+			Type: qtype, Options: options, MultiSelect: multi, FreeForm: freeForm, Secret: secret,
 		})
 	}
 	return out
@@ -2807,6 +3428,25 @@ func codexSandboxForSession(snap session.Snapshot) string {
 	return "danger-full-access"
 }
 
+func codexTurnSandboxPolicy(snap session.Snapshot, override string) map[string]any {
+	sandbox := strings.TrimSpace(override)
+	if sandbox == "" {
+		sandbox = codexSandboxForSession(snap)
+	}
+	switch sandbox {
+	case "read-only":
+		return map[string]any{"type": "readOnly", "networkAccess": false}
+	case "workspace-write":
+		roots := []string{}
+		if cwd := runtime.ExpandPath(snap.Cwd); filepath.IsAbs(cwd) {
+			roots = append(roots, cwd)
+		}
+		return map[string]any{"type": "workspaceWrite", "networkAccess": false, "writableRoots": roots}
+	default:
+		return map[string]any{"type": "dangerFullAccess"}
+	}
+}
+
 func extractThreadID(raw json.RawMessage, fallback string) string {
 	var r struct {
 		Thread struct {
@@ -2817,6 +3457,47 @@ func extractThreadID(raw json.RawMessage, fallback string) string {
 		return r.Thread.ID
 	}
 	return fallback
+}
+
+func decodeThreadRuntimeMetadata(raw json.RawMessage) (model, effort *string) {
+	var response struct {
+		Model           *string `json:"model"`
+		ReasoningEffort *string `json:"reasoningEffort"`
+		Thread          struct {
+			Model           *string `json:"model"`
+			ReasoningEffort *string `json:"reasoningEffort"`
+		} `json:"thread"`
+	}
+	if json.Unmarshal(raw, &response) != nil {
+		return nil, nil
+	}
+	model, effort = response.Thread.Model, response.Thread.ReasoningEffort
+	if model == nil {
+		model = response.Model
+	}
+	if effort == nil {
+		effort = response.ReasoningEffort
+	}
+	return model, effort
+}
+
+func (c *Codex) applyThreadRuntimeMetadata(s *session.Session, raw json.RawMessage) {
+	model, effort := decodeThreadRuntimeMetadata(raw)
+	snap := s.Snapshot()
+	var changedModel, changedEffort *string
+	if model != nil && strings.TrimSpace(*model) != "" && snap.Model != *model {
+		value := *model
+		s.ApplyConfig("", value, "")
+		changedModel = &value
+	}
+	if effort != nil && strings.TrimSpace(*effort) != "" && snap.Effort != *effort {
+		value := *effort
+		s.SetEffort(value)
+		changedEffort = &value
+	}
+	if changedModel != nil || changedEffort != nil {
+		c.sink.Emit(backend.NewSessionRuntimeMetadata(s.ID, changedModel, changedEffort))
+	}
 }
 
 func firstNonEmpty(vals ...string) string {

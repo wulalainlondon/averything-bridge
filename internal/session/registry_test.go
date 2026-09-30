@@ -2,10 +2,13 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCreateIsIdempotent(t *testing.T) {
@@ -86,6 +89,144 @@ func TestPersistRestartRoundTrip(t *testing.T) {
 	}
 	if got.State() != Idle {
 		t.Fatalf("restored session should be Idle, got %s", got.State())
+	}
+}
+
+func TestPreviewCommitIsDurableMonotonicAndIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	r := NewRegistry()
+	r.AttachStore(NewStore(path))
+	r.Create("s1", "Work", "/work", "codex", "", "", "thread-1")
+	base := time.Now().Add(time.Hour).UnixMilli()
+
+	first, changed, err := r.CommitPreviewAndPersist("s1", "accepted request", "user", base)
+	if err != nil || !changed || first.PreviewRevision != 1 {
+		t.Fatalf("first preview commit failed: changed=%v err=%v snapshot=%+v", changed, err, first)
+	}
+	terminal, changed, err := r.CommitPreviewAndPersist("s1", "completed result", "assistant", base+1_000)
+	if err != nil || !changed || terminal.PreviewRevision != 2 || math.Abs(terminal.LastActivity-float64(base+1_000)/1000) > 0.001 {
+		t.Fatalf("terminal preview commit failed: changed=%v err=%v snapshot=%+v", changed, err, terminal)
+	}
+	if retry, changed, err := r.CommitPreviewAndPersist("s1", "completed result", "assistant", base+1_000); err != nil || changed || retry.PreviewRevision != 2 {
+		t.Fatalf("idempotent retry changed projection: changed=%v err=%v snapshot=%+v", changed, err, retry)
+	}
+	if stale, changed, err := r.CommitPreviewAndPersist("s1", "stale search row", "assistant", base+500); err != nil || changed || stale.PreviewText != "completed result" {
+		t.Fatalf("stale observation replaced projection: changed=%v err=%v snapshot=%+v", changed, err, stale)
+	}
+
+	restarted := NewRegistry()
+	restarted.AttachStore(NewStore(path))
+	got, ok := restarted.Get("s1")
+	if !ok {
+		t.Fatal("session missing after restart")
+	}
+	snap := got.Snapshot()
+	if snap.PreviewText != "completed result" || snap.PreviewRole != "assistant" || snap.PreviewUpdatedAt != base+1_000 || snap.PreviewRevision != 2 || math.Abs(snap.LastActivity-float64(base+1_000)/1000) > 0.001 {
+		t.Fatalf("preview projection did not survive restart: %+v", snap)
+	}
+}
+
+func TestPreviewCommitRollsBackWhenDiskCommitFails(t *testing.T) {
+	dir := t.TempDir()
+	blockingFile := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blockingFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRegistry()
+	r.AttachStore(NewStore(filepath.Join(blockingFile, "sessions.json")))
+	s := r.Create("s1", "Work", "/work", "codex", "", "", "thread-1")
+	before := s.Snapshot()
+
+	if _, changed, err := r.CommitPreviewAndPersist("s1", "must roll back", "assistant", time.Now().UnixMilli()); err == nil || changed {
+		t.Fatalf("preview unexpectedly survived failed persistence: changed=%v err=%v", changed, err)
+	}
+	after := s.Snapshot()
+	if after.PreviewText != before.PreviewText || after.PreviewRevision != before.PreviewRevision || after.LastActivity != before.LastActivity {
+		t.Fatalf("failed commit leaked into memory: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestPreviewRepairRequiresExactInvalidToolProjection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	r := NewRegistry()
+	r.AttachStore(NewStore(path))
+	r.Create("s1", "Work", "/work", "codex", "", "", "thread-1")
+	base := time.Now().UnixMilli()
+	if _, changed, err := r.CommitPreviewAndPersist("s1", "const r = await tools.exec(...) ", "assistant", base+2_000); err != nil || !changed {
+		t.Fatalf("seed invalid projection: changed=%v err=%v", changed, err)
+	}
+	if snap, changed, err := r.RepairPreviewAndPersist("s1", "different command", "human update", "assistant", base+1_000); err != nil || changed || snap.PreviewText != "const r = await tools.exec(...)" {
+		t.Fatalf("non-matching repair changed projection: changed=%v err=%v snapshot=%+v", changed, err, snap)
+	}
+	repaired, changed, err := r.RepairPreviewAndPersist("s1", "const r = await tools.exec(...)", "human update", "assistant", base+1_000)
+	if err != nil || !changed || repaired.PreviewText != "human update" || repaired.PreviewUpdatedAt != base+1_000 || repaired.PreviewRevision != 2 {
+		t.Fatalf("exact repair failed: changed=%v err=%v snapshot=%+v", changed, err, repaired)
+	}
+	if repaired.LastActivity < float64(base+2_000)/1000 {
+		t.Fatalf("repair reduced last activity: %+v", repaired)
+	}
+
+	restarted := NewRegistry()
+	restarted.AttachStore(NewStore(path))
+	got, _ := restarted.Get("s1")
+	if snap := got.Snapshot(); snap.PreviewText != "human update" || snap.PreviewRevision != 2 {
+		t.Fatalf("repair was not durable: %+v", snap)
+	}
+}
+
+func TestRenameAndPersistIsDurableRevisionedAndIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	r := NewRegistry()
+	r.AttachStore(NewStore(path))
+	r.Create("s1", "Old", "/work", "codex", "", "", "thread-1")
+	expected := uint64(0)
+
+	committed, changed, err := r.RenameAndPersist("s1", "New", "device-a", "mutation-1", &expected)
+	if err != nil || !changed {
+		t.Fatalf("rename commit failed changed=%v err=%v", changed, err)
+	}
+	if committed.MetadataRevision != 1 || committed.NameUpdatedBy != "device-a" || committed.NameUpdatedAt == 0 {
+		t.Fatalf("rename metadata missing: %+v", committed)
+	}
+
+	restarted := NewRegistry()
+	restarted.AttachStore(NewStore(path))
+	loaded, ok := restarted.Get("s1")
+	if !ok {
+		t.Fatal("renamed session missing after restart")
+	}
+	got := loaded.Snapshot()
+	if got.Name != "New" || got.MetadataRevision != 1 || got.LastNameMutationID != "mutation-1" {
+		t.Fatalf("durable rename mismatch: %+v", got)
+	}
+
+	retry, changed, err := restarted.RenameAndPersist("s1", "New", "device-a", "mutation-1", &expected)
+	if err != nil || changed || retry.MetadataRevision != 1 {
+		t.Fatalf("idempotent retry changed state: changed=%v err=%v snapshot=%+v", changed, err, retry)
+	}
+
+	stale := uint64(0)
+	current, changed, err := restarted.RenameAndPersist("s1", "Stale", "device-b", "mutation-2", &stale)
+	if !errors.Is(err, ErrRenameConflict) || changed || current.Name != "New" || current.MetadataRevision != 1 {
+		t.Fatalf("stale rename was not rejected: changed=%v err=%v snapshot=%+v", changed, err, current)
+	}
+}
+
+func TestRenameAndPersistRollsBackWhenDiskCommitFails(t *testing.T) {
+	dir := t.TempDir()
+	blockingFile := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blockingFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRegistry()
+	r.AttachStore(NewStore(filepath.Join(blockingFile, "sessions.json")))
+	r.Create("s1", "Old", "/work", "codex", "", "", "")
+
+	if _, changed, err := r.RenameAndPersist("s1", "New", "device-a", "mutation-1", nil); err == nil || changed {
+		t.Fatalf("rename unexpectedly survived failed persistence: changed=%v err=%v", changed, err)
+	}
+	if got, _ := r.Get("s1"); got.Name() != "Old" {
+		t.Fatalf("memory was not rolled back, name=%q", got.Name())
 	}
 }
 

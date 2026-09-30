@@ -1,0 +1,658 @@
+{
+  "protocol_version": 3,
+  "events": [
+    {
+      "type": "agent_tree"
+    },
+    {
+      "type": "artifact_created"
+    },
+    {
+      "type": "artifact_updated"
+    },
+    {
+      "type": "artifacts_list"
+    },
+    {
+      "type": "attachment_upload_ack"
+    },
+    {
+      "type": "attachment_upload_complete"
+    },
+    {
+      "type": "attachment_upload_error"
+    },
+    {
+      "type": "attachment_upload_ready"
+    },
+    {
+      "type": "automation_error"
+    },
+    {
+      "type": "automation_snapshot"
+    },
+    {
+      "type": "backend_registry_updated"
+    },
+    {
+      "type": "claim_ack"
+    },
+    {
+      "type": "codex_live_diff"
+    },
+    {
+      "type": "dir_listing"
+    },
+    {
+      "type": "document"
+    },
+    {
+      "type": "done"
+    },
+    {
+      "type": "error"
+    },
+    {
+      "type": "external_event_snapshot"
+    },
+    {
+      "type": "external_event_state"
+    },
+    {
+      "type": "external_event_upsert"
+    },
+    {
+      "type": "feed_ack"
+    },
+    {
+      "type": "feed_detail"
+    },
+    {
+      "type": "feed_list"
+    },
+    {
+      "type": "feed_new"
+    },
+    {
+      "type": "feed_updated"
+    },
+    {
+      "type": "file_opened"
+    },
+    {
+      "type": "file_push"
+    },
+    {
+      "type": "file_saved"
+    },
+    {
+      "type": "fork_error"
+    },
+    {
+      "type": "git_diff_result"
+    },
+    {
+      "type": "goal_cleared"
+    },
+    {
+      "type": "goal_update"
+    },
+    {
+      "type": "goals_snapshot"
+    },
+    {
+      "type": "hello_ack"
+    },
+    {
+      "type": "history_delta"
+    },
+    {
+      "type": "history_snapshot"
+    },
+    {
+      "type": "history_sync_hint"
+    },
+    {
+      "type": "human_ai_collaboration_snapshot"
+    },
+    {
+      "type": "inbox_list"
+    },
+    {
+      "type": "instance_deleted"
+    },
+    {
+      "type": "instance_error"
+    },
+    {
+      "type": "instance_started"
+    },
+    {
+      "type": "instance_stopped"
+    },
+    {
+      "type": "instance_upserted"
+    },
+    {
+      "type": "instances_list"
+    },
+    {
+      "type": "interaction_expired"
+    },
+    {
+      "type": "interaction_resolved"
+    },
+    {
+      "type": "markdown_files_listing"
+    },
+    {
+      "type": "media"
+    },
+    {
+      "type": "message_ack"
+    },
+    {
+      "type": "message_queue_snapshot"
+    },
+    {
+      "type": "offline_replay_batch"
+    },
+    {
+      "type": "pairing_window_ack"
+    },
+    {
+      "type": "pending_interactions_list"
+    },
+    {
+      "type": "permission_request"
+    },
+    {
+      "type": "permission_result"
+    },
+    {
+      "type": "pm_collaboration_snapshot"
+    },
+    {
+      "type": "pong"
+    },
+    {
+      "type": "process_killed"
+    },
+    {
+      "type": "processes_list"
+    },
+    {
+      "type": "prompt"
+    },
+    {
+      "type": "queue_action_result"
+    },
+    {
+      "type": "resumable_sessions"
+    },
+    {
+      "type": "resume_progress"
+    },
+    {
+      "type": "search_context"
+    },
+    {
+      "type": "search_health"
+    },
+    {
+      "type": "search_result"
+    },
+    {
+      "type": "session_closed"
+    },
+    {
+      "type": "session_command_done"
+    },
+    {
+      "type": "session_command_failed"
+    },
+    {
+      "type": "session_command_queued"
+    },
+    {
+      "type": "session_command_started"
+    },
+    {
+      "type": "session_config_result"
+    },
+    {
+      "type": "session_control"
+    },
+    {
+      "type": "session_created"
+    },
+    {
+      "type": "session_died"
+    },
+    {
+      "type": "session_forked"
+    },
+    {
+      "type": "session_history"
+    },
+    {
+      "type": "session_init_info"
+    },
+    {
+      "type": "session_list"
+    },
+    {
+      "type": "session_meta_updated"
+    },
+    {
+      "type": "session_recap"
+    },
+    {
+      "type": "session_rename_rejected"
+    },
+    {
+      "type": "session_renamed"
+    },
+    {
+      "type": "session_runtime"
+    },
+    {
+      "type": "session_runtime_snapshot"
+    },
+    {
+      "type": "session_switched"
+    },
+    {
+      "type": "session_unread"
+    },
+    {
+      "type": "session_unread_snapshot"
+    },
+    {
+      "type": "session_uuid"
+    },
+    {
+      "type": "session_warning"
+    },
+    {
+      "type": "sessions_list"
+    },
+    {
+      "type": "sessions_list_append"
+    },
+    {
+      "type": "shell_closed"
+    },
+    {
+      "type": "shell_created"
+    },
+    {
+      "type": "shell_output"
+    },
+    {
+      "type": "status_result"
+    },
+    {
+      "type": "steer_result"
+    },
+    {
+      "type": "stopped"
+    },
+    {
+      "type": "task_killed"
+    },
+    {
+      "type": "tasks_list"
+    },
+    {
+      "type": "text_chunk"
+    },
+    {
+      "type": "thinking_chunk"
+    },
+    {
+      "type": "todo_update"
+    },
+    {
+      "type": "tool_end"
+    },
+    {
+      "type": "tool_environment_operation"
+    },
+    {
+      "type": "tool_environment_snapshot"
+    },
+    {
+      "type": "tool_result"
+    },
+    {
+      "type": "tool_start"
+    },
+    {
+      "type": "unclaim_ack"
+    },
+    {
+      "type": "usage_report"
+    },
+    {
+      "type": "user_input_request"
+    },
+    {
+      "type": "webrtc_answer"
+    },
+    {
+      "type": "webrtc_ice"
+    },
+    {
+      "type": "webrtc_ready"
+    },
+    {
+      "type": "work_conflict"
+    },
+    {
+      "type": "work_delta_batch"
+    },
+    {
+      "type": "work_diagnostics"
+    },
+    {
+      "type": "work_error"
+    },
+    {
+      "type": "work_mutation_ack"
+    },
+    {
+      "type": "work_read_ack"
+    },
+    {
+      "type": "work_snapshot"
+    },
+    {
+      "type": "youtube_task_done"
+    },
+    {
+      "type": "youtube_task_failed"
+    },
+    {
+      "type": "youtube_task_started"
+    }
+  ],
+  "commands": [
+    {
+      "type": "apply_tool_environment_repair"
+    },
+    {
+      "type": "attachment_upload_cancel"
+    },
+    {
+      "type": "attachment_upload_finish"
+    },
+    {
+      "type": "attachment_upload_init"
+    },
+    {
+      "type": "browse_dir"
+    },
+    {
+      "type": "cancel_queued_message"
+    },
+    {
+      "type": "cancel_tool_environment_repair"
+    },
+    {
+      "type": "claim_bridge"
+    },
+    {
+      "type": "clear_session"
+    },
+    {
+      "type": "close_session"
+    },
+    {
+      "type": "codex_goal_clear"
+    },
+    {
+      "type": "codex_goal_get"
+    },
+    {
+      "type": "codex_goal_set"
+    },
+    {
+      "type": "external_event_dismiss"
+    },
+    {
+      "type": "external_event_list_request"
+    },
+    {
+      "type": "external_event_mark_read"
+    },
+    {
+      "type": "fcm_token"
+    },
+    {
+      "type": "feed_delete"
+    },
+    {
+      "type": "feed_fetch"
+    },
+    {
+      "type": "feed_list_request"
+    },
+    {
+      "type": "feed_mark_read"
+    },
+    {
+      "type": "feed_push"
+    },
+    {
+      "type": "file_push_ack"
+    },
+    {
+      "type": "fork_session"
+    },
+    {
+      "type": "generate_session_recap"
+    },
+    {
+      "type": "get_agent_tree"
+    },
+    {
+      "type": "get_all_sessions"
+    },
+    {
+      "type": "get_git_diff"
+    },
+    {
+      "type": "get_inbox"
+    },
+    {
+      "type": "get_processes"
+    },
+    {
+      "type": "get_resumable_sessions"
+    },
+    {
+      "type": "get_tasks"
+    },
+    {
+      "type": "get_usage"
+    },
+    {
+      "type": "handoff_to_desktop"
+    },
+    {
+      "type": "hello"
+    },
+    {
+      "type": "human_ai_collaboration"
+    },
+    {
+      "type": "kill_process"
+    },
+    {
+      "type": "kill_task"
+    },
+    {
+      "type": "list_instances"
+    },
+    {
+      "type": "message"
+    },
+    {
+      "type": "new_session"
+    },
+    {
+      "type": "offline_replay_ack"
+    },
+    {
+      "type": "open_file"
+    },
+    {
+      "type": "open_pairing_window"
+    },
+    {
+      "type": "pending_interactions_list"
+    },
+    {
+      "type": "permission_response"
+    },
+    {
+      "type": "ping"
+    },
+    {
+      "type": "pm_collaboration"
+    },
+    {
+      "type": "prepare_tool_environment_repair"
+    },
+    {
+      "type": "promote_queued_message"
+    },
+    {
+      "type": "push_file"
+    },
+    {
+      "type": "reclaim_from_desktop"
+    },
+    {
+      "type": "rename_session"
+    },
+    {
+      "type": "request_attachment_replay"
+    },
+    {
+      "type": "request_backend_catalog"
+    },
+    {
+      "type": "request_goals_snapshot"
+    },
+    {
+      "type": "request_history"
+    },
+    {
+      "type": "request_message_queue"
+    },
+    {
+      "type": "request_runtime_snapshot"
+    },
+    {
+      "type": "request_search"
+    },
+    {
+      "type": "request_search_context"
+    },
+    {
+      "type": "request_search_health"
+    },
+    {
+      "type": "request_session_control"
+    },
+    {
+      "type": "request_session_list"
+    },
+    {
+      "type": "request_session_recap"
+    },
+    {
+      "type": "request_sessions_list"
+    },
+    {
+      "type": "request_status"
+    },
+    {
+      "type": "request_tool_environment"
+    },
+    {
+      "type": "request_tool_environment_operation"
+    },
+    {
+      "type": "restart_bridge"
+    },
+    {
+      "type": "resume_session_queue"
+    },
+    {
+      "type": "save_file"
+    },
+    {
+      "type": "scan_markdown_files"
+    },
+    {
+      "type": "session_runtime_ack"
+    },
+    {
+      "type": "set_effort"
+    },
+    {
+      "type": "set_session_meta"
+    },
+    {
+      "type": "shell_close"
+    },
+    {
+      "type": "shell_create"
+    },
+    {
+      "type": "shell_input"
+    },
+    {
+      "type": "steer_message"
+    },
+    {
+      "type": "stop"
+    },
+    {
+      "type": "switch_session_config"
+    },
+    {
+      "type": "tunnel_url_ack"
+    },
+    {
+      "type": "unclaim_bridge"
+    },
+    {
+      "type": "user_input_response"
+    },
+    {
+      "type": "webrtc_answer"
+    },
+    {
+      "type": "webrtc_ice"
+    },
+    {
+      "type": "webrtc_offer"
+    },
+    {
+      "type": "work_diagnostics_request"
+    },
+    {
+      "type": "work_project_create"
+    },
+    {
+      "type": "work_sync_ack"
+    },
+    {
+      "type": "work_sync_request"
+    }
+  ]
+}

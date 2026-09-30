@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://averything.local/contracts/v3/protocol.schema.json",
+  "title": "Averything Bridge protocol v3 semantic model",
+  "type": "object",
+  "required": [
+    "protocol_version",
+    "identity",
+    "runtime",
+    "payload_versions",
+    "compatibility",
+    "event_types",
+    "command_types"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 3
+    },
+    "identity": {
+      "type": "object",
+      "required": [
+        "session_key_prefix",
+        "session_key_components",
+        "authority_field"
+      ],
+      "properties": {
+        "session_key_prefix": {
+          "const": "sk1:"
+        },
+        "session_key_components": {
+          "const": [
+            "authority_instance_id",
+            "session_id"
+          ]
+        },
+        "authority_field": {
+          "const": "authority_instance_id"
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "phases",
+        "stages",
+        "terminal_phases"
+      ],
+      "properties": {
+        "phases": {
+          "$ref": "#/$defs/runtimePhases"
+        },
+        "stages": {
+          "$ref": "#/$defs/runtimeStages"
+        },
+        "terminal_phases": {
+          "const": [
+            "completed",
+            "failed",
+            "interrupted",
+            "closed"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "payload_versions": {
+      "type": "object",
+      "required": [
+        "runtime",
+        "work",
+        "external_event",
+        "attachment",
+        "fcm"
+      ],
+      "properties": {
+        "runtime": {
+          "const": 3
+        },
+        "work": {
+          "const": 3
+        },
+        "external_event": {
+          "const": 3
+        },
+        "attachment": {
+          "const": 3
+        },
+        "fcm": {
+          "const": 3
+        }
+      },
+      "additionalProperties": false
+    },
+    "compatibility": {
+      "type": "object",
+      "required": [
+        "additive",
+        "deprecated",
+        "breaking"
+      ],
+      "properties": {
+        "additive": {
+          "const": "optional fields only; old readers must ignore them"
+        },
+        "deprecated": {
+          "const": "supported for at least one published mobile version"
+        },
+        "breaking": {
+          "const": "requires a new protocol_version and explicit negotiation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "event_types": {
+      "const": [
+        "agent_tree",
+        "artifact_created",
+        "artifact_updated",
+        "artifacts_list",
+        "attachment_upload_ack",
+        "attachment_upload_complete",
+        "attachment_upload_error",
+        "attachment_upload_ready",
+        "automation_error",
+        "automation_snapshot",
+        "backend_registry_updated",
+        "claim_ack",
+        "codex_live_diff",
+        "dir_listing",
+        "document",
+        "done",
+        "error",
+        "external_event_snapshot",
+        "external_event_state",
+        "external_event_upsert",
+        "feed_ack",
+        "feed_detail",
+        "feed_list",
+        "feed_new",
+        "feed_updated",
+        "file_opened",
+        "file_push",
+        "file_saved",
+        "fork_error",
+        "git_diff_result",
+        "goal_cleared",
+        "goal_update",
+        "goals_snapshot",
+        "hello_ack",
+        "history_delta",
+        "history_snapshot",
+        "history_sync_hint",
+        "human_ai_collaboration_snapshot",
+        "inbox_list",
+        "instance_deleted",
+        "instance_error",
+        "instance_started",
+        "instance_stopped",
+        "instance_upserted",
+        "instances_list",
+        "interaction_expired",
+        "interaction_resolved",
+        "markdown_files_listing",
+        "media",
+        "message_ack",
+        "message_queue_snapshot",
+        "offline_replay_batch",
+        "pairing_window_ack",
+        "pending_interactions_list",
+        "permission_request",
+        "permission_result",
+        "pm_collaboration_snapshot",
+        "pong",
+        "process_killed",
+        "processes_list",
+        "prompt",
+        "queue_action_result",
+        "resumable_sessions",
+        "resume_progress",
+        "search_context",
+        "search_health",
+        "search_result",
+        "session_closed",
+        "session_command_done",
+        "session_command_failed",
+        "session_command_queued",
+        "session_command_started",
+        "session_config_result",
+        "session_control",
+        "session_created",
+        "session_died",
+        "session_forked",
+        "session_history",
+        "session_init_info",
+        "session_list",
+        "session_meta_updated",
+        "session_recap",
+        "session_rename_rejected",
+        "session_renamed",
+        "session_runtime",
+        "session_runtime_snapshot",
+        "session_switched",
+        "session_unread",
+        "session_unread_snapshot",
+        "session_uuid",
+        "session_warning",
+        "sessions_list",
+        "sessions_list_append",
+        "shell_closed",
+        "shell_created",
+        "shell_output",
+        "status_result",
+        "steer_result",
+        "stopped",
+        "task_killed",
+        "tasks_list",
+        "text_chunk",
+        "thinking_chunk",
+        "todo_update",
+        "tool_end",
+        "tool_environment_operation",
+        "tool_environment_snapshot",
+        "tool_result",
+        "tool_start",
+        "unclaim_ack",
+        "usage_report",
+        "user_input_request",
+        "webrtc_answer",
+        "webrtc_ice",
+        "webrtc_ready",
+        "work_conflict",
+        "work_delta_batch",
+        "work_diagnostics",
+        "work_error",
+        "work_mutation_ack",
+        "work_read_ack",
+        "work_snapshot",
+        "youtube_task_done",
+        "youtube_task_failed",
+        "youtube_task_started"
+      ]
+    },
+    "command_types": {
+      "const": [
+        "apply_tool_environment_repair",
+        "attachment_upload_cancel",
+        "attachment_upload_finish",
+        "attachment_upload_init",
+        "browse_dir",
+        "cancel_queued_message",
+        "cancel_tool_environment_repair",
+        "claim_bridge",
+        "clear_session",
+        "close_session",
+        "codex_goal_clear",
+        "codex_goal_get",
+        "codex_goal_set",
+        "external_event_dismiss",
+        "external_event_list_request",
+        "external_event_mark_read",
+        "fcm_token",
+        "feed_delete",
+        "feed_fetch",
+        "feed_list_request",
+        "feed_mark_read",
+        "feed_push",
+        "file_push_ack",
+        "fork_session",
+        "generate_session_recap",
+        "get_agent_tree",
+        "get_all_sessions",
+        "get_git_diff",
+        "get_inbox",
+        "get_processes",
+        "get_resumable_sessions",
+        "get_tasks",
+        "get_usage",
+        "handoff_to_desktop",
+        "hello",
+        "human_ai_collaboration",
+        "kill_process",
+        "kill_task",
+        "list_instances",
+        "message",
+        "new_session",
+        "offline_replay_ack",
+        "open_file",
+        "open_pairing_window",
+        "pending_interactions_list",
+        "permission_response",
+        "ping",
+        "pm_collaboration",
+        "prepare_tool_environment_repair",
+        "promote_queued_message",
+        "push_file",
+        "reclaim_from_desktop",
+        "rename_session",
+        "request_attachment_replay",
+        "request_backend_catalog",
+        "request_goals_snapshot",
+        "request_history",
+        "request_message_queue",
+        "request_runtime_snapshot",
+        "request_search",
+        "request_search_context",
+        "request_search_health",
+        "request_session_control",
+        "request_session_list",
+        "request_session_recap",
+        "request_sessions_list",
+        "request_status",
+        "request_tool_environment",
+        "request_tool_environment_operation",
+        "restart_bridge",
+        "resume_session_queue",
+        "save_file",
+        "scan_markdown_files",
+        "session_runtime_ack",
+        "set_effort",
+        "set_session_meta",
+        "shell_close",
+        "shell_create",
+        "shell_input",
+        "steer_message",
+        "stop",
+        "switch_session_config",
+        "tunnel_url_ack",
+        "unclaim_bridge",
+        "user_input_response",
+        "webrtc_answer",
+        "webrtc_ice",
+        "webrtc_offer",
+        "work_diagnostics_request",
+        "work_project_create",
+        "work_sync_ack",
+        "work_sync_request"
+      ]
+    }
+  },
+  "$defs": {
+    "runtimePhases": {
+      "const": [
+        "idle",
+        "queued",
+        "running",
+        "stopping",
+        "waiting",
+        "completed",
+        "failed",
+        "interrupted",
+        "closed"
+      ]
+    },
+    "runtimeStages": {
+      "const": [
+        "idle",
+        "transmitting",
+        "received",
+        "queued",
+        "preparing",
+        "resuming_thread",
+        "starting_thread",
+        "submitting_turn",
+        "waiting_model",
+        "thinking",
+        "composing",
+        "running_tool",
+        "waiting_user",
+        "stopping",
+        "completed",
+        "failed",
+        "interrupted",
+        "closed"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

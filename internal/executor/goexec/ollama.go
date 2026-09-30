@@ -52,6 +52,7 @@ func NewOllama(sink executor.Sink, host, model string) *Ollama {
 
 func (o *Ollama) Send(ctx context.Context, s *session.Session, reqID, content string, _ []backend.ImageAttachment, _ []backend.FileAttachment) error {
 	// Ollama backend is text-only for now; image/file attachments are ignored.
+	o.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "submitting_turn", "Sending the turn to Ollama"))
 	o.mu.Lock()
 	hist := append(o.histories[s.ID], ollamaMsg{Role: "user", Content: content})
 	hist = capHistory(hist)
@@ -98,6 +99,7 @@ func (o *Ollama) runTurn(ctx context.Context, s *session.Session, reqID string, 
 		o.fail(s, reqID, fmt.Errorf("ollama HTTP %d: %s", resp.StatusCode, msg))
 		return
 	}
+	o.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "waiting_model", "Ollama accepted the turn"))
 
 	full := ""
 	sc := bufio.NewScanner(resp.Body)

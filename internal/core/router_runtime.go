@@ -443,17 +443,23 @@ func (h *Hub) statusResult(sessionID string) protocol.StatusResult {
 		}
 		queued += s.QueueLen()
 	}
+	status := map[string]any{
+		"server_time_ms":     time.Now().UnixMilli(),
+		"platform":           runtime.GOOS + "/" + runtime.GOARCH,
+		"go_version":         runtime.Version(),
+		"sessions_total":     len(sessions),
+		"sessions_streaming": streaming,
+		"queued_commands":    queued,
+		"permission_mode":    "enforce",
+	}
+	if provider, ok := h.exec.(interface{ RuntimeDiagnostics() map[string]any }); ok {
+		if diagnostics := provider.RuntimeDiagnostics(); len(diagnostics) > 0 {
+			status["backend_runtimes"] = diagnostics
+		}
+	}
 	return protocol.StatusResult{
 		Type:      "status_result",
 		SessionID: sessionID,
-		Status: map[string]any{
-			"server_time_ms":     time.Now().UnixMilli(),
-			"platform":           runtime.GOOS + "/" + runtime.GOARCH,
-			"go_version":         runtime.Version(),
-			"sessions_total":     len(sessions),
-			"sessions_streaming": streaming,
-			"queued_commands":    queued,
-			"permission_mode":    "enforce",
-		},
+		Status:    status,
 	}
 }

@@ -102,6 +102,10 @@ func normalizeCodexLiveTool(params json.RawMessage) (codexToolCall, bool) {
 		raw, _ := json.Marshal(p.Item)
 		return normalizeCodexResponseTool(raw, "")
 	}
+	itemType := firstNonEmpty(p.Type, p.Item.Type)
+	if !isCodexLiveToolType(itemType) {
+		return codexToolCall{}, false
+	}
 	rawName := firstNonEmpty(p.Name, p.Item.Name, p.Type, p.Item.Type, "codex_tool")
 	if rawName == "update_plan" {
 		return codexToolCall{}, false
@@ -113,6 +117,26 @@ func normalizeCodexLiveTool(params json.RawMessage) (codexToolCall, bool) {
 		Name:    name,
 		Command: command,
 	}, true
+}
+
+// isCodexLiveToolType is intentionally an allow-list. App-server emits
+// item/started and item/completed for conversational lifecycle items such as
+// userMessage, agentMessage, reasoning and plan as well as real tool calls.
+// Treating every unknown item as a tool makes an ordinary first response flash
+// "running tool: userMessage/agentMessage" in the authoritative runtime UI.
+func isCodexLiveToolType(itemType string) bool {
+	switch itemType {
+	case "commandExecution", "command_execution", "command",
+		"fileChange", "file_change", "applyPatch",
+		"mcpToolCall", "mcp_tool_call",
+		"dynamicToolCall", "dynamic_tool_call",
+		"webSearch", "web_search",
+		"imageGeneration", "image_generation",
+		"imageView", "image_view":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeCodexToolNameCommand(rawName string, raw json.RawMessage) (string, string) {

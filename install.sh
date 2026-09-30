@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Averything Bridge installer (native Go)
+# everything-go bridge installer
 # ------------------------------------------------------------------
 # One-liner (paste to your claude/codex CLI, or run in a terminal):
 #
-#   curl -fsSL https://github.com/wulalainlondon/averything-bridge/releases/latest/download/install.sh | bash
+#   curl -fsSL https://github.com/wulalainlondon/everything-go/releases/latest/download/install.sh | bash
 #
 # What it does:
 #   1. downloads and verifies the signed, notarized macOS app (or Linux binary)
@@ -19,7 +19,7 @@
 # ------------------------------------------------------------------
 set -euo pipefail
 
-REPO="${EVERYTHING_GO_REPO:-wulalainlondon/averything-bridge}"
+REPO="${EVERYTHING_GO_REPO:-wulalainlondon/everything-go}"
 PORT="${EVERYTHING_GO_PORT:-8766}"
 RUNTIME_DIR="${EVERYTHING_GO_HOME:-$HOME/.everything-go-runtime}"
 LABEL="com.everything-go.app"
@@ -30,19 +30,45 @@ EXPECTED_SIGNING_AUTHORITY="Developer ID Application: YuDi Huang (UPWLTJL6S2)"
 EXPECTED_TEAM_ID="UPWLTJL6S2"
 LAUNCH="$RUNTIME_DIR/everything_go_launch.sh"
 SESSION_STORE="${EVERYTHING_GO_SESSION_STORE:-$HOME/.claude-bridge-runtime/saved_sessions.json}"
-SERVICE_ACCOUNT="${EVERYTHING_GO_SERVICE_ACCOUNT:-$HOME/.config/claude-bridge/serviceAccountKey.json}"
 SERVICE_BIN="$BIN"
 PERMISSION_TARGET="$BIN"
-BROWSER_ORIGIN_MODE="${BRIDGE_BROWSER_ORIGIN_MODE:-ask}"
-BROWSER_ALLOWED_ORIGINS="${BRIDGE_BROWSER_ALLOWED_ORIGINS:-}"
-BROWSER_MANAGE_AUTO_REVIEW="${BRIDGE_BROWSER_MANAGE_AUTO_REVIEW:-1}"
-BROWSER_ENABLE_NETWORK="${BRIDGE_BROWSER_ENABLE_NETWORK:-1}"
-CODEX_SESSIONS_DIR="${EVERYTHING_GO_CODEX_SESSIONS_DIR:-${CODEX_HOME:-$HOME/.codex}/sessions}"
-CODEX_IGNORE_CWD_GLOBS="${EVERYTHING_GO_CODEX_IGNORE_CWD_GLOBS:-}"
-CODEX_IGNORE_NAME_PREFIXES="${EVERYTHING_GO_CODEX_IGNORE_NAME_PREFIXES:-}"
-CODEX_ROLLOVER_ENABLED="${EVERYTHING_GO_CODEX_ROLLOVER_ENABLED:-false}"
-CODEX_COLD_RESUME_MAX_BYTES="${EVERYTHING_GO_CODEX_COLD_RESUME_MAX_BYTES:-268435456}"
-CODEX_CHECKPOINT_MAX_BYTES="${EVERYTHING_GO_CODEX_CHECKPOINT_MAX_BYTES:-131072}"
+
+# Preserve generated launch-wrapper settings across upgrades unless the caller
+# explicitly supplies an environment override. Replacing these with defaults
+# can change source-policy fingerprints, force multi-gigabyte reindexing, or
+# silently switch Codex transport behavior.
+existing_launch_export() {
+  local name="$1"
+  [ -f "$LAUNCH" ] || return 0
+  sed -n "s/^export ${name}=\"\(.*\)\"$/\1/p" "$LAUNCH" | tail -1
+}
+
+resolve_launch_export() {
+  local name="$1" fallback="$2" existing
+  if printenv "$name" >/dev/null 2>&1; then
+    printenv "$name"
+    return 0
+  fi
+  existing=$(existing_launch_export "$name")
+  if [ -n "$existing" ]; then
+    printf '%s\n' "$existing"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+BROWSER_ORIGIN_MODE=$(resolve_launch_export BRIDGE_BROWSER_ORIGIN_MODE ask)
+BROWSER_ALLOWED_ORIGINS=$(resolve_launch_export BRIDGE_BROWSER_ALLOWED_ORIGINS "")
+BROWSER_MANAGE_AUTO_REVIEW=$(resolve_launch_export BRIDGE_BROWSER_MANAGE_AUTO_REVIEW 1)
+BROWSER_ENABLE_NETWORK=$(resolve_launch_export BRIDGE_BROWSER_ENABLE_NETWORK 1)
+CODEX_SESSIONS_DIR=$(resolve_launch_export EVERYTHING_GO_CODEX_SESSIONS_DIR "${CODEX_HOME:-$HOME/.codex}/sessions")
+CODEX_IGNORE_CWD_GLOBS=$(resolve_launch_export EVERYTHING_GO_CODEX_IGNORE_CWD_GLOBS "")
+CODEX_IGNORE_NAME_PREFIXES=$(resolve_launch_export EVERYTHING_GO_CODEX_IGNORE_NAME_PREFIXES "")
+CODEX_ROLLOVER_ENABLED=$(resolve_launch_export EVERYTHING_GO_CODEX_ROLLOVER_ENABLED false)
+CODEX_COLD_RESUME_MAX_BYTES=$(resolve_launch_export EVERYTHING_GO_CODEX_COLD_RESUME_MAX_BYTES 268435456)
+CODEX_CHECKPOINT_MAX_BYTES=$(resolve_launch_export EVERYTHING_GO_CODEX_CHECKPOINT_MAX_BYTES 131072)
+CODEX_APP_SERVER_MODE=$(resolve_launch_export EVERYTHING_GO_CODEX_APP_SERVER_MODE daemon)
+CODEX_APP_SERVER_SOCKET=$(resolve_launch_export EVERYTHING_GO_CODEX_APP_SERVER_SOCKET "")
 
 say()  { printf '\033[1;36m[everything-go]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[everything-go]\033[0m %s\n' "$*" >&2; }
@@ -166,16 +192,8 @@ install_bridge_binary() {
   say "downloading $ASSET ..."
   curl -fSL --proto '=https' --tlsv1.2 "$URL" -o "$BIN.tmp" \
     || die "download failed: $URL"
-  curl -fsSL --proto '=https' --tlsv1.2 "$(base_url SHA256SUMS)" -o "$RUNTIME_DIR/SHA256SUMS.tmp" \
-    || die "checksum download failed"
-  local expected_sha actual_sha
-  expected_sha=$(awk -v asset="$ASSET" '$2 == asset { print $1 }' "$RUNTIME_DIR/SHA256SUMS.tmp")
-  [ -n "$expected_sha" ] || die "release checksum does not contain $ASSET"
-  actual_sha=$(shasum -a 256 "$BIN.tmp" | awk '{print $1}')
-  [ "$actual_sha" = "$expected_sha" ] || die "checksum mismatch for $ASSET"
   chmod +x "$BIN.tmp"
   mv -f "$BIN.tmp" "$BIN"
-  rm -f "$RUNTIME_DIR/SHA256SUMS.tmp"
   SERVICE_BIN="$BIN"
   PERMISSION_TARGET="$BIN"
   say "binary installed: $BIN"
@@ -237,7 +255,13 @@ fi
 
 # ── 5. generate the launch wrapper ─────────────────────────────────
 # Service-managers start with a bare PATH; bake in the CLI + cloudflared dirs.
-SERVICE_PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin${CLI_PATHS}${CF_PATH:+:$CF_PATH}"
+SERVICE_PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+if [ -n "$CLI_PATHS" ]; then
+  # Prefer the exact CLI locations discovered above.  A stale global Codex
+  # installation must not shadow the managed/current CLI for launchd.
+  SERVICE_PATH="${CLI_PATHS#:}:$SERVICE_PATH"
+fi
+[ -n "$CF_PATH" ] && SERVICE_PATH="$SERVICE_PATH:$CF_PATH"
 cat > "$LAUNCH" <<EOF
 #!/usr/bin/env bash
 set -uo pipefail
@@ -252,19 +276,21 @@ export EVERYTHING_GO_CODEX_IGNORE_NAME_PREFIXES="$CODEX_IGNORE_NAME_PREFIXES"
 export EVERYTHING_GO_CODEX_ROLLOVER_ENABLED="$CODEX_ROLLOVER_ENABLED"
 export EVERYTHING_GO_CODEX_COLD_RESUME_MAX_BYTES="$CODEX_COLD_RESUME_MAX_BYTES"
 export EVERYTHING_GO_CODEX_CHECKPOINT_MAX_BYTES="$CODEX_CHECKPOINT_MAX_BYTES"
-service_account_args=()
-if [[ -f "$SERVICE_ACCOUNT" ]]; then
-  service_account_args+=(--service-account "$SERVICE_ACCOUNT")
+export EVERYTHING_GO_CODEX_APP_SERVER_MODE="$CODEX_APP_SERVER_MODE"
+export EVERYTHING_GO_CODEX_APP_SERVER_SOCKET="$CODEX_APP_SERVER_SOCKET"
+
+if [ -r "$RUNTIME_DIR/monitoring_env.sh" ]; then
+  . "$RUNTIME_DIR/monitoring_env.sh"
 fi
 exec "$SERVICE_BIN" \\
   --port "$PORT" \\
+  --executor go \\
   --data-dir "$RUNTIME_DIR" \\
   --session-store "$SESSION_STORE" \\
   --discovery \\
   --mdns \\
   --tunnel \\
-  --instance-name "\$(hostname -s 2>/dev/null || echo everything-go)" \\
-  "\${service_account_args[@]}"
+  --instance-name "\$(hostname -s 2>/dev/null || echo everything-go)"
 EOF
 chmod +x "$LAUNCH"
 say "launch script written: $LAUNCH"

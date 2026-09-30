@@ -86,6 +86,7 @@ func TestRemoteTransportReadsLargeThreadResumeResponse(t *testing.T) {
 	sink := &capSink{}
 	c := NewCodex(sink, "codex")
 	c.appServerSocket = socketPath
+	c.remoteReconnect = false
 	if err := c.startRemoteServerLocked(codexHome); err != nil {
 		t.Fatalf("connect remote transport: %v", err)
 	}

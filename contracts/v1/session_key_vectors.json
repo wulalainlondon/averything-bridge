@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "authority_instance_id": "wulala",
+      "session_id": "same-local-id",
+      "session_key": "sk1:wulala:same-local-id"
+    },
+    {
+      "authority_instance_id": "morrie",
+      "session_id": "same-local-id",
+      "session_key": "sk1:morrie:same-local-id"
+    },
+    {
+      "authority_instance_id": "台灣 Bridge/一號",
+      "session_id": "對話:01/測試",
+      "session_key": "sk1:%E5%8F%B0%E7%81%A3%20Bridge%2F%E4%B8%80%E8%99%9F:%E5%B0%8D%E8%A9%B1%3A01%2F%E6%B8%AC%E8%A9%A6"
+    },
+    {
+      "authority_instance_id": "relay%edge:1",
+      "session_id": "jl_x_01a028c5-67b",
+      "session_key": "sk1:relay%25edge%3A1:jl_x_01a028c5-67b"
+    },
+    {
+      "authority_instance_id": "a~!*'()",
+      "session_id": "s +/%",
+      "session_key": "sk1:a~%21%2A%27%28%29:s%20%2B%2F%25"
+    }
+  ]
+}

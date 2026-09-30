@@ -37,24 +37,34 @@ func (c *Codex) LoadHistory(resumeID string, opts history.Opts) (*history.Result
 	}
 	if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
 		key := history.FileKey{Path: path, MtimeNS: fi.ModTime().UnixNano(), Size: fi.Size()}
-		cacheName := "codex:" + resumeID
+		// Parsed cache v2 preserves native turn boundaries for request identity.
+		cacheName := "codex:turns-v2:" + resumeID
 		if messages, ok := history.DefaultCache().Load(cacheName, key); ok {
 			if !opts.IncludeThinking {
 				messages = history.StripThinkingBlocks(messages)
 			}
-			return history.Slice(messages, opts), nil
+			res := history.Slice(c.withHistoryRequestIDs(messages, resumeID), opts)
+			if fi.Size() > int64(history.LoadMaxBytes()) {
+				res.HasMoreBefore = true
+			}
+			return res, nil
 		}
 		messages, truncated, err := c.readCodexHistory(path, resumeID)
 		if err != nil {
 			return history.Slice(nil, opts), nil
 		}
-		if !truncated {
-			history.DefaultCache().SaveAsync(cacheName, key, messages)
-		}
+		// A bounded tail is still canonical for this exact file key. Persist it so
+		// completed large sessions do not rescan hundreds of MB on every open or
+		// after a Bridge restart.
+		history.DefaultCache().SaveAsync(cacheName, key, messages)
 		if !opts.IncludeThinking {
 			messages = history.StripThinkingBlocks(messages)
 		}
-		return history.Slice(messages, opts), nil
+		res := history.Slice(c.withHistoryRequestIDs(messages, resumeID), opts)
+		if truncated {
+			res.HasMoreBefore = true
+		}
+		return res, nil
 	}
 	messages, _, err := c.readCodexHistory(path, resumeID)
 	if err != nil {
@@ -63,7 +73,7 @@ func (c *Codex) LoadHistory(resumeID string, opts history.Opts) (*history.Result
 	if !opts.IncludeThinking {
 		messages = history.StripThinkingBlocks(messages)
 	}
-	return history.Slice(messages, opts), nil
+	return history.Slice(c.withHistoryRequestIDs(messages, resumeID), opts), nil
 }
 
 func (c *Codex) ResumableSessions(limit int) ([]history.ResumableSession, error) {
@@ -156,8 +166,9 @@ func (c *Codex) findCodexSessionFile(resumeID string) string {
 	if resumeID == "" {
 		return ""
 	}
-	for _, path := range c.codexRolloutFiles() {
-		if codexRolloutUID(filepath.Base(path)) == resumeID {
+	for _, force := range []bool{false, true} {
+		_, byID := c.codexRolloutCatalog(force)
+		if path := byID[resumeID]; path != "" {
 			return path
 		}
 	}
@@ -165,6 +176,16 @@ func (c *Codex) findCodexSessionFile(resumeID string) string {
 }
 
 func (c *Codex) codexRolloutFiles() []string {
+	paths, _ := c.codexRolloutCatalog(false)
+	return paths
+}
+
+func (c *Codex) codexRolloutCatalog(force bool) ([]string, map[string]string) {
+	c.rolloutMu.Lock()
+	defer c.rolloutMu.Unlock()
+	if !force && c.rolloutRoot == c.sessionsRoot && len(c.rolloutPaths) > 0 && time.Since(c.rolloutScannedAt) < 30*time.Second {
+		return append([]string(nil), c.rolloutPaths...), cloneStringMap(c.rolloutByID)
+	}
 	var out []string
 	_ = filepath.WalkDir(c.sessionsRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d == nil || d.IsDir() {
@@ -176,40 +197,91 @@ func (c *Codex) codexRolloutFiles() []string {
 		}
 		return nil
 	})
+	byID := make(map[string]string, len(out))
+	for _, path := range out {
+		if uid := codexRolloutUID(filepath.Base(path)); uid != "" {
+			byID[uid] = path
+		}
+	}
+	c.rolloutRoot = c.sessionsRoot
+	c.rolloutScannedAt = time.Now()
+	c.rolloutPaths = append(c.rolloutPaths[:0], out...)
+	c.rolloutByID = byID
+	return append([]string(nil), out...), cloneStringMap(byID)
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
 	return out
 }
 
 // readCodexHistory parses the rollout and returns its wire messages plus whether
-// the file was tail-truncated (too large to hold whole). A truncated result must
-// not be cached, since it is only the most recent window.
+// the file was tail-truncated (too large to hold whole).
 func (c *Codex) readCodexHistory(path, resumeID string) ([]map[string]any, bool, error) {
-	r, closeFn, err := openCodexRollout(path)
-	if err != nil {
-		return nil, false, err
+	var lines []history.TailLine
+	var truncated bool
+	if strings.HasSuffix(path, ".gz") {
+		r, closeFn, err := openCodexRollout(path)
+		if err != nil {
+			return nil, false, err
+		}
+		defer closeFn()
+		lines, truncated, err = history.StreamTailLines(r, history.LoadMaxBytes())
+		if err != nil {
+			return nil, truncated, err
+		}
+	} else {
+		cache := history.DefaultCache()
+		prior, hasPrior := cache.LoadTailState(path)
+		var next history.TailState
+		var err error
+		lines, truncated, next, err = history.ReadTailFileLines(path, history.LoadMaxBytes(), prior, hasPrior)
+		if err != nil {
+			return nil, truncated, err
+		}
+		cache.SaveTailState(next)
 	}
-	defer closeFn()
+	return parseCodexHistoryLines(lines, resumeID, truncated)
+}
 
-	lines, truncated, err := history.StreamTailLines(r, history.LoadMaxBytes())
-	if err != nil {
-		return nil, truncated, err
-	}
+func parseCodexHistoryLines(lines []history.TailLine, resumeID string, truncated bool) ([]map[string]any, bool, error) {
 
 	type rec struct {
 		lineNo int
 		row    codexHistoryRow
+		turnID string
 	}
 	var records []rec
 	toolOutputs := map[string]string{}
 	var messages []map[string]any
+	turnID := ""
+	turnBySource := map[string]string{}
 	for _, ln := range lines {
 		var row codexHistoryRow
 		if json.Unmarshal(ln.Data, &row) != nil {
 			continue
 		}
+		if row.Type == "turn_context" || row.Type == "event_msg" {
+			var event struct {
+				Type   string `json:"type"`
+				TurnID string `json:"turn_id"`
+			}
+			if json.Unmarshal(row.Payload, &event) == nil {
+				if row.Type == "turn_context" || event.Type == "task_started" {
+					turnID = event.TurnID
+				} else if event.Type == "task_complete" || event.Type == "turn_aborted" {
+					turnID = ""
+				}
+			}
+		}
 		if row.Type != "response_item" {
 			continue
 		}
-		records = append(records, rec{lineNo: ln.LineNo, row: row})
+		records = append(records, rec{lineNo: ln.LineNo, row: row, turnID: turnID})
+		turnBySource["codex:"+resumeID+":line:"+itoa(ln.LineNo)] = turnID
 		if id, out, ok := codexResponseToolOutput(row.Payload); ok {
 			toolOutputs[id] = out
 		}
@@ -240,7 +312,12 @@ func (c *Codex) readCodexHistory(path, resumeID string) ([]map[string]any, bool,
 		return merged
 	}
 
+	previousTurn := ""
 	for _, rc := range records {
+		if rc.turnID != previousTurn {
+			flushPendingCommentary()
+		}
+		previousTurn = rc.turnID
 		if tool, ok := normalizeCodexResponseTool(rc.row.Payload, toolOutputs[codexPayloadCallID(rc.row.Payload)]); ok {
 			blocks := attachPendingCommentary([]map[string]any{tool.historyBlock()})
 			messages = append(messages, history.CompleteMsg(
@@ -283,6 +360,12 @@ func (c *Codex) readCodexHistory(path, resumeID string) ([]map[string]any, bool,
 		))
 	}
 	flushPendingCommentary()
+	for _, message := range messages {
+		sourceID, _ := message["source_message_id"].(string)
+		if turn := turnBySource[sourceID]; turn != "" {
+			message["source_turn_id"] = turn
+		}
+	}
 	return messages, truncated, nil
 }
 

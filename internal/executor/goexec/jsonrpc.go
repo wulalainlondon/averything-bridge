@@ -13,8 +13,7 @@ import (
 // we do too: requests are {id, method, params}, responses {id, result|error},
 // notifications {method, params}.
 type rpcPlumber struct {
-	name    string
-	jsonRPC bool
+	name string
 
 	wmu sync.Mutex
 	w   io.Writer
@@ -29,20 +28,35 @@ type rpcReply struct {
 	err    error
 }
 
-func newRPCPlumber(name string) *rpcPlumber {
-	return &rpcPlumber{name: name, nextID: 1, pending: make(map[int]chan rpcReply)}
+// rpcTimeoutError means the response is unknown, not that the server cancelled
+// the operation. In particular, callers must not replay mutations on this error.
+type rpcResponseError struct{ raw string }
+
+func (e *rpcResponseError) Error() string { return e.raw }
+
+type rpcTimeoutError struct {
+	Name, Method string
+	Timeout      time.Duration
 }
 
-func newJSONRPCPlumber(name string) *rpcPlumber {
-	p := newRPCPlumber(name)
-	p.jsonRPC = true
-	return p
+func (e *rpcTimeoutError) Error() string {
+	return fmt.Sprintf("[%s] %q timed out after %s", e.Name, e.Method, e.Timeout)
+}
+
+func newRPCPlumber(name string) *rpcPlumber {
+	return &rpcPlumber{name: name, nextID: 1, pending: make(map[int]chan rpcReply)}
 }
 
 func (p *rpcPlumber) setWriter(w io.Writer) {
 	p.wmu.Lock()
 	p.w = w
 	p.wmu.Unlock()
+}
+
+func (p *rpcPlumber) hasWriter() bool {
+	p.wmu.Lock()
+	defer p.wmu.Unlock()
+	return p.w != nil
 }
 
 func (p *rpcPlumber) write(obj any) error {
@@ -70,9 +84,6 @@ func (p *rpcPlumber) request(method string, params any, timeout time.Duration) (
 	p.mu.Unlock()
 
 	req := map[string]any{"id": id, "method": method}
-	if p.jsonRPC {
-		req["jsonrpc"] = "2.0"
-	}
 	if params != nil {
 		req["params"] = params
 	}
@@ -90,15 +101,12 @@ func (p *rpcPlumber) request(method string, params any, timeout time.Duration) (
 		p.mu.Lock()
 		delete(p.pending, id)
 		p.mu.Unlock()
-		return nil, fmt.Errorf("[%s] %q timed out after %s", p.name, method, timeout)
+		return nil, &rpcTimeoutError{Name: p.name, Method: method, Timeout: timeout}
 	}
 }
 
 func (p *rpcPlumber) notify(method string, params any) error {
 	msg := map[string]any{"method": method}
-	if p.jsonRPC {
-		msg["jsonrpc"] = "2.0"
-	}
 	if params != nil {
 		msg["params"] = params
 	}
@@ -128,7 +136,7 @@ func (p *rpcPlumber) dispatchResponse(raw json.RawMessage) bool {
 		return true
 	}
 	if probe.Error != nil {
-		ch <- rpcReply{err: fmt.Errorf("%s", string(probe.Error))}
+		ch <- rpcReply{err: &rpcResponseError{raw: string(probe.Error)}}
 	} else {
 		ch <- rpcReply{result: probe.Result}
 	}

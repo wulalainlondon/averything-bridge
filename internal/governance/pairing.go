@@ -26,6 +26,22 @@ type pairedDevice struct {
 	PairedAt int64  `json:"paired_at"`
 }
 
+// DeviceBinding is an internal snapshot. Credentials are never JSON-encoded.
+type DeviceBinding struct {
+	Token    string `json:"-"`
+	DeviceID string `json:"-"`
+}
+
+func (p *Pairing) DeviceBindings() []DeviceBinding {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]DeviceBinding, 0, len(p.devices))
+	for _, device := range p.devices {
+		out = append(out, DeviceBinding{Token: device.Token, DeviceID: device.DeviceID})
+	}
+	return out
+}
+
 type pairingFile struct {
 	Version int            `json:"version,omitempty"`
 	Devices []pairedDevice `json:"devices,omitempty"`

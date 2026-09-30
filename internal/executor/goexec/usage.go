@@ -52,6 +52,16 @@ func (c *Claude) FetchUsage(ctx context.Context) (*backend.UsageReport, error) {
 		data.SevenDay.window(),
 		data.SevenDaySonnet.window(),
 	)
+	rep.BackendID, rep.Source, rep.CollectedAt = "claude", "provider_quota", time.Now().UnixMilli()
+	if rep.FiveHour != nil {
+		rep.FiveHour.Label, rep.FiveHour.DurationMinutes = "5 小時", 300
+	}
+	if rep.SevenDay != nil {
+		rep.SevenDay.Label, rep.SevenDay.DurationMinutes = "7 天", 10080
+	}
+	if rep.SevenDaySonnet != nil {
+		rep.SevenDaySonnet.Label, rep.SevenDaySonnet.DurationMinutes = "Sonnet 7 天", 10080
+	}
 	return &rep, nil
 }
 
@@ -71,7 +81,7 @@ func (e *claudeUsageEntry) window() *backend.UsageWindow {
 		f := *e.Utilization / 100.0
 		util = &f
 	}
-	return &backend.UsageWindow{Utilization: util, ResetsAt: e.ResetsAt}
+	return &backend.UsageWindow{Utilization: util, ResetsAt: e.ResetsAt, Unit: "fraction"}
 }
 
 // FetchUsage queries the Codex app-server rate limits and maps primary/secondary
@@ -98,6 +108,13 @@ func (c *Codex) FetchUsage(ctx context.Context) (*backend.UsageReport, error) {
 	five := codexWindow(limits["primary"])
 	seven := codexWindow(limits["secondary"])
 	rep := backend.NewUsageReport(five, seven, nil)
+	rep.BackendID, rep.Source, rep.CollectedAt = "codex", "provider_quota", time.Now().UnixMilli()
+	if five != nil {
+		five.Label = "主要額度"
+	}
+	if seven != nil {
+		seven.Label = "次要額度"
+	}
 	return &rep, nil
 }
 
@@ -108,10 +125,11 @@ func codexWindow(raw json.RawMessage) *backend.UsageWindow {
 		return nil
 	}
 	var w struct {
-		UsedPercent  *float64        `json:"usedPercent"`
-		UsedPercent2 *float64        `json:"used_percent"`
-		ResetsAt     json.RawMessage `json:"resetsAt"`
-		ResetsAt2    json.RawMessage `json:"resets_at"`
+		UsedPercent     *float64        `json:"usedPercent"`
+		UsedPercent2    *float64        `json:"used_percent"`
+		ResetsAt        json.RawMessage `json:"resetsAt"`
+		ResetsAt2       json.RawMessage `json:"resets_at"`
+		DurationMinutes int             `json:"windowDurationMins"`
 	}
 	if err := json.Unmarshal(raw, &w); err != nil {
 		return nil
@@ -129,7 +147,7 @@ func codexWindow(raw json.RawMessage) *backend.UsageWindow {
 	if len(resets) == 0 {
 		resets = w.ResetsAt2
 	}
-	return &backend.UsageWindow{Utilization: util, ResetsAt: resetsAtString(resets)}
+	return &backend.UsageWindow{Utilization: util, ResetsAt: resetsAtString(resets), Unit: "fraction", DurationMinutes: w.DurationMinutes}
 }
 
 // resetsAtString accepts a JSON value that is either a string or an epoch

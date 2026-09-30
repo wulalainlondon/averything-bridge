@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Active Morrie 8766 job. The -9453 suffix is the retained launchd label,
+       not a second port; do not load the retired com.morrie.everything-go job. -->
+  <key>Label</key><string>com.morrie.everything-go-9453</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec /Users/morrie/.everything-go-runtime-9453/everything_go_launch.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/morrie/.everything-go-runtime-9453</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/morrie/.everything-go-runtime-9453/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/morrie/.everything-go-runtime-9453/launchd.err.log</string>
+</dict>
+</plist>

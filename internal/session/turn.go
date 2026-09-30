@@ -1,7 +1,9 @@
 package session
 
 import (
+	"errors"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -61,80 +63,217 @@ func (s *Session) State() State {
 // as status_result.queued_commands.
 func (s *Session) QueueLen() int {
 	s.mu.Lock()
-	mb := s.mailbox
-	s.mu.Unlock()
-	if mb == nil {
-		return 0
+	defer s.mu.Unlock()
+	return len(s.mailbox)
+}
+
+// CanDispatchAutomatic reports whether an automatic durable Run may be handed
+// to this Session without pre-filling its in-memory mailbox. Human commands
+// that race after this check are still serialized by Submit; this gate keeps a
+// busy Session's automatic work authoritative in the durable Work queue.
+func (s *Session) CanDispatchAutomatic() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != Idle {
+		return false
 	}
-	return len(mb)
+	return s.mailbox == nil || len(s.mailbox) == 0
 }
 
 // Submit enqueues a turn for serial execution. The worker runs fn, then waits
 // for the turn's terminal event (EndTurn) before pulling the next one, so two
 // turns for the same session never overlap. Returns false if the session is
 // closed.
-func (s *Session) Submit(fn func()) bool {
-	s.mu.Lock()
-	if s.state == Closed {
-		s.mu.Unlock()
-		return false
-	}
-	if !s.workerUp {
-		s.workerUp = true
-		s.mailbox = make(chan func(), mailboxSize)
-		s.quit = make(chan struct{})
-		go s.runWorker(s.mailbox, s.quit)
-	}
-	mb, quit := s.mailbox, s.quit
-	s.mu.Unlock()
+type queuedTurn struct {
+	id   string
+	run  func()
+	held bool
+}
 
-	// The mailbox is never closed, so this send can't panic. If Close races us
-	// after the state check above, quit fires and we report the session closed
-	// instead of blocking on a worker that has already exited.
-	select {
-	case mb <- fn:
-		return true
-	case <-quit:
-		return false
+var ErrQueueNotWaiting = errors.New("message is no longer waiting")
+var ErrQueueBusy = errors.New("a queue operation is already in progress")
+var ErrQueueNoActiveTurn = errors.New("no active turn to steer")
+
+// Submit preserves blocking semantics for existing automatic/anonymous tasks.
+func (s *Session) Submit(fn func()) bool { return s.submit("", fn, true) }
+
+// SubmitNamed never blocks a transport handler if the bounded mailbox is full.
+func (s *Session) SubmitNamed(id string, fn func()) bool { return s.submit(id, fn, false) }
+
+func (s *Session) submit(id string, fn func(), wait bool) bool {
+	for {
+		s.mu.Lock()
+		if s.state == Closed {
+			s.mu.Unlock()
+			return false
+		}
+		if !s.workerUp {
+			s.workerUp = true
+			s.quit = make(chan struct{})
+			s.queueChanged = make(chan struct{})
+			go s.runWorker(s.quit)
+		}
+		if id != "" {
+			if s.activeQueuedID == id {
+				s.mu.Unlock()
+				return true
+			}
+			for _, item := range s.mailbox {
+				if item.id == id {
+					s.mu.Unlock()
+					return true
+				}
+			}
+		}
+		if len(s.mailbox) < mailboxSize {
+			s.mailbox = append(s.mailbox, &queuedTurn{id: id, run: fn})
+			s.signalQueueLocked()
+			s.mu.Unlock()
+			return true
+		}
+		changed, quit := s.queueChanged, s.quit
+		s.mu.Unlock()
+		if !wait {
+			return false
+		}
+		select {
+		case <-changed:
+		case <-quit:
+			return false
+		}
 	}
 }
 
-// runWorker is the per-session actor loop: one turn at a time, in submission
-// order. It owns the Idle→Streaming transition and blocks until the turn ends.
-// It stops when quit is closed (by Close), not by the mailbox closing.
-func (s *Session) runWorker(mailbox chan func(), quit chan struct{}) {
+func (s *Session) signalQueueLocked() {
+	if s.queueChanged != nil {
+		close(s.queueChanged)
+	}
+	s.queueChanged = make(chan struct{})
+}
+
+// ReserveQueued holds the dequeue boundary while a steering RPC is in flight.
+// finish(true) removes the item; finish(false) restores its original FIFO place.
+// The closure is idempotent and must be called after persisting the outcome.
+func (s *Session) ReserveQueued(id string) (finish func(bool), err error) {
+	return s.reserveQueued(id, true)
+}
+func (s *Session) ReserveWaiting(id string) (finish func(bool), err error) {
+	return s.reserveQueued(id, false)
+}
+func (s *Session) reserveQueued(id string, requireActive bool) (finish func(bool), err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if requireActive && s.state != Streaming {
+		return nil, ErrQueueNoActiveTurn
+	}
+	if requireActive && s.queueHolds > 0 {
+		return nil, ErrQueueBusy
+	}
+	var target *queuedTurn
+	for _, item := range s.mailbox {
+		if item.id == id {
+			target = item
+			break
+		}
+	}
+	if target == nil {
+		return nil, ErrQueueNotWaiting
+	}
+	if target.held {
+		return nil, ErrQueueBusy
+	}
+	target.held = true
+	s.queueHolds++
+	var once sync.Once
+	return func(remove bool) {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if target.held {
+				target.held = false
+				s.queueHolds--
+			}
+			if remove {
+				for index, item := range s.mailbox {
+					if item == target {
+						s.mailbox = append(s.mailbox[:index], s.mailbox[index+1:]...)
+						break
+					}
+				}
+			}
+			s.signalQueueLocked()
+		})
+	}, nil
+}
+
+func (s *Session) CancelQueued(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index, item := range s.mailbox {
+		if item.id != id {
+			continue
+		}
+		if item.held {
+			return ErrQueueBusy
+		}
+		s.mailbox = append(s.mailbox[:index], s.mailbox[index+1:]...)
+		s.signalQueueLocked()
+		return nil
+	}
+	return ErrQueueNotWaiting
+}
+
+func (s *Session) runWorker(quit <-chan struct{}) {
 	for {
-		select {
-		case <-quit:
+		s.mu.Lock()
+		if s.state == Closed {
+			s.mu.Unlock()
 			return
-		case fn := <-mailbox:
-			done := s.beginTurn()
-			fn() // typically executor.Send: returns quickly, then streams async
+		}
+		if len(s.mailbox) == 0 || s.queueHolds > 0 {
+			changed := s.queueChanged
+			s.mu.Unlock()
 			select {
-			case <-done:
-				// terminal event arrived (EndTurn) — pull the next turn
+			case <-changed:
 			case <-quit:
 				return
-			case <-time.After(turnWatchdog):
-				log.Printf("[%s] turn watchdog fired after %s — releasing queue", s.ID, turnWatchdog)
-				s.EndTurn()
 			}
+			continue
 		}
+		item := s.mailbox[0]
+		s.mailbox = s.mailbox[1:]
+		s.activeQueuedID = item.id
+		done := s.beginTurnLocked()
+		s.signalQueueLocked()
+		s.mu.Unlock()
+		item.run()
+		select {
+		case <-done:
+		case <-quit:
+			return
+		case <-time.After(turnWatchdog):
+			log.Printf("[%s] turn watchdog fired after %s — releasing queue", s.ID, turnWatchdog)
+			s.EndTurn()
+		}
+		s.mu.Lock()
+		s.activeQueuedID = ""
+		s.mu.Unlock()
 	}
 }
 
 // beginTurn moves Idle→Streaming and arms a fresh completion signal for the
 // worker. Returns the channel the worker waits on. No-op intent if already
 // closed (returns an already-fired channel so the worker won't block).
-func (s *Session) beginTurn() <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Session) beginTurnLocked() <-chan struct{} {
 	if s.state == Closed {
 		ch := make(chan struct{})
 		close(ch)
 		return ch
 	}
 	s.state = Streaming
+	if s.futureConfig != nil {
+		s.applyConfigurationLocked(*s.futureConfig)
+	}
 	s.lastActivity = nowSeconds()
 	s.turnDone = make(chan struct{})
 	return s.turnDone
@@ -144,16 +283,34 @@ func (s *Session) beginTurn() <-chan struct{} {
 // the connection core when the executor emits a terminal event (done/stopped/
 // error) and by stop/clear/kill paths that forcibly cancel a turn. Idempotent.
 func (s *Session) EndTurn() {
+	s.PrepareEndTurn()()
+}
+
+// PrepareEndTurn marks the active turn idle immediately but holds the actor
+// release signal until the returned closure is called. The Hub uses this tiny
+// two-phase boundary to publish done -> terminal runtime in order before the
+// next queued turn can begin. Close/duplicate terminal races cannot double
+// close turnDone because ownership is detached under the Session lock.
+func (s *Session) PrepareEndTurn() func() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.state == Streaming || s.state == Stopping {
 		s.state = Idle
+		if s.futureConfig != nil {
+			s.applyConfigurationLocked(*s.futureConfig)
+		}
 	}
-	if s.turnDone != nil {
-		close(s.turnDone)
-		s.turnDone = nil
-	}
+	done := s.turnDone
+	s.turnDone = nil
 	s.lastActivity = nowSeconds()
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if done != nil {
+				close(done)
+			}
+		})
+	}
 }
 
 // MarkStopping records that a stop was requested for the in-flight turn. Purely
@@ -187,7 +344,36 @@ func (s *Session) Close() {
 		close(s.quit)
 		s.quit = nil
 	}
+	for _, item := range s.mailbox {
+		item.held = false
+	}
 	s.mailbox = nil
+	s.queueHolds = 0
+	s.signalQueueLocked()
 	s.workerUp = false
 	s.mu.Unlock()
+}
+
+func (s *Session) ActiveQueuedID() string { s.mu.Lock(); defer s.mu.Unlock(); return s.activeQueuedID }
+
+// HoldQueue prevents a stop/clear RPC from racing the start of the next turn.
+func (s *Session) HoldQueue() func() {
+	s.mu.Lock()
+	if s.state == Closed {
+		s.mu.Unlock()
+		return func() {}
+	}
+	s.queueHolds++
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.state != Closed {
+				s.queueHolds--
+			}
+			s.signalQueueLocked()
+		})
+	}
 }

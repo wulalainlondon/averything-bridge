@@ -41,10 +41,11 @@ type lruItem struct {
 }
 
 type Cache struct {
-	mu       sync.Mutex
-	mem      map[string]*list.Element // cacheName -> *list.Element holding *lruItem
-	ll       *list.List               // front = most recently used
-	curBytes int
+	mu         sync.Mutex
+	mem        map[string]*list.Element // cacheName -> *list.Element holding *lruItem
+	tailStates map[string]TailState
+	ll         *list.List // front = most recently used
+	curBytes   int
 
 	maxBytes      int
 	maxEntryBytes int
@@ -80,6 +81,7 @@ func defaultCachePath() string {
 func newCache(db *sql.DB) *Cache {
 	return &Cache{
 		mem:           map[string]*list.Element{},
+		tailStates:    map[string]TailState{},
 		ll:            list.New(),
 		maxBytes:      envBytes("EVERYTHING_GO_HISTORY_CACHE_MAX_BYTES", defaultMaxMemBytes),
 		maxEntryBytes: envBytes("EVERYTHING_GO_HISTORY_CACHE_MAX_ENTRY_BYTES", defaultMaxEntryBytes),
@@ -118,6 +120,15 @@ CREATE TABLE IF NOT EXISTS history_cache (
 	mtime_ns INTEGER NOT NULL,
 	size INTEGER NOT NULL,
 	messages_json TEXT NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS history_tail_state (
+	path TEXT PRIMARY KEY,
+	size INTEGER NOT NULL,
+	mtime_ns INTEGER NOT NULL,
+	head_sha256 TEXT NOT NULL,
+	line_count INTEGER NOT NULL,
+	ended_with_newline INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL
 )`)
 	return err
@@ -179,6 +190,67 @@ func (c *Cache) SaveAsync(cacheName string, key FileKey, messages []map[string]a
 	}
 	snapshot := cloneMessages(messages)
 	go c.store(cacheName, key, snapshot)
+}
+
+// LoadTailState returns the persisted physical-line cursor used to avoid
+// recounting an append-only rollout from byte zero on every history request.
+func (c *Cache) LoadTailState(path string) (TailState, bool) {
+	if c == nil || path == "" {
+		return TailState{}, false
+	}
+	c.mu.Lock()
+	if state, ok := c.tailStates[path]; ok {
+		c.mu.Unlock()
+		return state, true
+	}
+	c.mu.Unlock()
+	if c.db == nil {
+		return TailState{}, false
+	}
+	var state TailState
+	var ended int
+	err := c.db.QueryRow(
+		`SELECT path,size,mtime_ns,head_sha256,line_count,ended_with_newline
+		 FROM history_tail_state WHERE path=?`, path,
+	).Scan(&state.Path, &state.Size, &state.MtimeNS, &state.HeadSHA256, &state.LineCount, &ended)
+	if err != nil {
+		return TailState{}, false
+	}
+	state.EndedWithNewline = ended != 0
+	c.mu.Lock()
+	c.tailStates[path] = state
+	c.mu.Unlock()
+	return state, true
+}
+
+// SaveTailState persists the line cursor synchronously. It is tiny and must be
+// durable before a later request attempts an incremental count after restart.
+func (c *Cache) SaveTailState(state TailState) {
+	if c == nil || state.Path == "" {
+		return
+	}
+	c.mu.Lock()
+	c.tailStates[state.Path] = state
+	c.mu.Unlock()
+	if c.db == nil {
+		return
+	}
+	ended := 0
+	if state.EndedWithNewline {
+		ended = 1
+	}
+	_, _ = c.db.Exec(
+		`INSERT INTO history_tail_state(path,size,mtime_ns,head_sha256,line_count,ended_with_newline,updated_at)
+		 VALUES(?,?,?,?,?,?,?)
+		 ON CONFLICT(path) DO UPDATE SET
+		  size=excluded.size,
+		  mtime_ns=excluded.mtime_ns,
+		  head_sha256=excluded.head_sha256,
+		  line_count=excluded.line_count,
+		  ended_with_newline=excluded.ended_with_newline,
+		  updated_at=excluded.updated_at`,
+		state.Path, state.Size, state.MtimeNS, state.HeadSHA256, state.LineCount, ended, time.Now().Unix(),
+	)
 }
 
 // store takes ownership of stored — the caller must not mutate it afterwards.

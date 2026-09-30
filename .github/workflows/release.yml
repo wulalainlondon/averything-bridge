@@ -41,15 +41,18 @@ jobs:
       - name: Cross-compile binaries (CGO-free, modernc sqlite)
         run: |
           mkdir -p dist
-          for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64 windows/amd64 windows/arm64; do
+          for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
             os=${target%/*}; arch=${target#*/}
-            suffix=""
-            [ "$os" = windows ] && suffix=".exe"
-            echo "building everything-go-$os-$arch$suffix"
+            echo "building everything-go-$os-$arch"
             CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
               go build -trimpath -ldflags="-s -w" \
-              -o "dist/everything-go-$os-$arch$suffix" ./cmd/everything-go
+              -o "dist/everything-go-$os-$arch" ./cmd/everything-go
           done
+
+      - name: Verify release binaries contain no private keys
+        run: |
+          node --test scripts/check_release_secrets.test.mjs
+          node scripts/check_release_secrets.mjs dist/everything-go-*
 
       - name: Package macOS app bundles
         env:
@@ -95,7 +98,6 @@ jobs:
         run: |
           rm dist/everything-go-darwin-arm64 dist/everything-go-darwin-amd64
           cp install.sh dist/install.sh
-          cp install.ps1 dist/install.ps1
           (cd dist && shasum -a 256 * > SHA256SUMS)
           ls -la dist
 

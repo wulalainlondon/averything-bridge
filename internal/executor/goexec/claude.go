@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -43,11 +44,14 @@ var todoTools = map[string]bool{
 }
 
 type proc struct {
-	cmd    *exec.Cmd
-	stdin  *bufWriteCloser
-	cancel context.CancelFunc
-	reqID  string // request_id of the in-flight turn, stamped onto events
-	model  string
+	pmSession      bool
+	readOnlyWorker bool
+	cmd            *exec.Cmd
+	stdin          *bufWriteCloser
+	cancel         context.CancelFunc
+	exited         chan struct{}
+	reqID          string // request_id of the in-flight turn, stamped onto events
+	model          string
 
 	// Tool/todo presentation state, touched only by this proc's readStdout goroutine.
 	tools *toolNormalizer
@@ -114,6 +118,7 @@ type claudeState struct {
 
 // Claude implements executor.Executor over the local `claude` CLI.
 type Claude struct {
+	pmProvider  backend.PMProvider
 	sink        executor.Sink
 	tools       *toolEmitter
 	claudeBin   string
@@ -131,6 +136,8 @@ type Claude struct {
 	treeScanMu    sync.Mutex                 // guards treeScanCache
 	treeScanCache map[string]cachedAgentScan // agent jsonl path -> mtime-keyed parse
 }
+
+func (c *Claude) SetPMProvider(provider backend.PMProvider) { c.pmProvider = provider }
 
 func NewClaude(sink executor.Sink, claudeBin string) *Claude {
 	if claudeBin == "" {
@@ -177,6 +184,11 @@ func (c *Claude) Send(ctx context.Context, s *session.Session, reqID, content st
 	c.mu.Lock()
 	p := c.procs[s.ID]
 	if p == nil {
+		if s.ResumeID() != "" {
+			c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "resuming_thread", "Loading the existing Claude conversation"))
+		} else {
+			c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "starting_thread", "Starting Claude"))
+		}
 		var err error
 		p, err = c.spawn(s)
 		if err != nil {
@@ -189,6 +201,7 @@ func (c *Claude) Send(ctx context.Context, s *session.Session, reqID, content st
 	isCompact := strings.TrimSpace(content) == "/compact"
 	p.beginTurn(reqID, isCompact)
 	c.mu.Unlock()
+	c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "submitting_turn", "Sending the turn to Claude"))
 	if isCompact {
 		c.sink.Emit(backend.NewSessionCommandStarted(s.ID, reqID, 0))
 	}
@@ -207,7 +220,49 @@ func (c *Claude) Send(ctx context.Context, s *session.Session, reqID, content st
 		}
 		return err
 	}
+	c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "waiting_model", "Claude accepted the turn"))
 	go c.agentTreePoller(s, p)
+	return nil
+}
+
+// The CLI's spawn arguments are immutable. An idle process is retired before
+// acknowledging new settings, and the next turn resumes the SAME conversation
+// with the persisted configuration. Never restart an active writer.
+func (c *Claude) UpdateSessionSettings(ctx context.Context, s *session.Session) error {
+	if c.pmProvider != nil {
+		policy, err := c.pmProvider.PMConfiguration(s.ID)
+		if err != nil {
+			return err
+		}
+		if policy != nil {
+			return errors.New("pm_role_settings_locked")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	p := c.procs[s.ID]
+	if p == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	if p.currentReqID() != "" {
+		c.mu.Unlock()
+		return errors.New("runtime_busy")
+	}
+	delete(c.procs, s.ID)
+	c.mu.Unlock()
+	p.cancel()
+	if p.exited != nil {
+		select {
+		case <-p.exited:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+			return errors.New("runtime_retire_timeout")
+		}
+	}
 	return nil
 }
 
@@ -294,6 +349,30 @@ func (c *Claude) spawn(s *session.Session) (*proc, error) {
 		mcpURL = c.mcp.sessionURL(s.ID)
 	}
 	args := claudeSpawnArgs(snap, mcpURL)
+	var pm *backend.PMConfiguration
+	readOnlyWorker := false
+	if c.pmProvider != nil {
+		var err error
+		pm, err = c.pmProvider.PMConfiguration(s.ID)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		if pm != nil {
+			args = claudePMSpawnArgs(snap, *pm)
+		}
+		if workers, ok := c.pmProvider.(backend.CollaborationWorkerProvider); ok && pm == nil {
+			readOnly, err := workers.IsReadOnlyCollaborationWorker(s.ID)
+			if err != nil {
+				cancel()
+				return nil, err
+			}
+			if readOnly {
+				readOnlyWorker = true
+				args = claudeReadOnlyWorkerArgs(snap, mcpURL)
+			}
+		}
+	}
 
 	cmd := exec.CommandContext(ctx, c.claudeBin, args...)
 	if snap.Cwd != "" {
@@ -305,6 +384,13 @@ func (c *Claude) spawn(s *session.Session) (*proc, error) {
 		// The per-server timeout in --mcp-config is sometimes ignored; the env var
 		// is honored. 30 min lets a human take their time answering ask_user.
 		cmd.Env = append(os.Environ(), "MCP_TOOL_TIMEOUT=1800000")
+	}
+	if pm != nil {
+		cmd.Dir = pm.RuntimeDir
+		cmd.Env = append(os.Environ(), "MCP_TOOL_TIMEOUT=30000", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "ENABLE_CLAUDEAI_MCP_SERVERS=false", "BRIDGE_PM_SESSION_TOKEN="+pm.Token)
+	}
+	if readOnlyWorker {
+		cmd.Env = append(os.Environ(), "MCP_TOOL_TIMEOUT=1800000", "ENABLE_CLAUDEAI_MCP_SERVERS=false")
 	}
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -328,7 +414,9 @@ func (c *Claude) spawn(s *session.Session) (*proc, error) {
 
 	log.Printf("[%s] spawned claude pid=%d cwd=%s resume=%s", s.ID, cmd.Process.Pid, snap.Cwd, snap.ResumeID)
 	p := &proc{
-		cmd: cmd, stdin: newBufWriteCloser(stdinPipe), cancel: cancel,
+		pmSession:      pm != nil,
+		readOnlyWorker: readOnlyWorker,
+		cmd:            cmd, stdin: newBufWriteCloser(stdinPipe), cancel: cancel, exited: make(chan struct{}),
 		tools: newToolNormalizer(c.sink, c), model: snap.Model,
 	}
 	p.touch()
@@ -394,9 +482,11 @@ func claudeSpawnArgs(snap session.Snapshot, mcpURL string) []string {
 
 // ndLine is the union of stdout line shapes we care about.
 type ndLine struct {
-	Type    string `json:"type"`
-	Subtype string `json:"subtype"`
-	Message struct {
+	IsAPIErrorMessage bool   `json:"isApiErrorMessage"`
+	APIError          string `json:"error"`
+	Type              string `json:"type"`
+	Subtype           string `json:"subtype"`
+	Message           struct {
 		Content []json.RawMessage `json:"content"`
 	} `json:"message"`
 	ToolUseID string          `json:"tool_use_id"`
@@ -459,6 +549,12 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 			continue // Task-subagent internal event — keep it out of the main stream
 		}
 		reqID := p.currentReqID()
+		if evt.IsAPIErrorMessage {
+			p.finishTurn()
+			p.cancel()
+			c.sink.Emit(backend.NewError(s.ID, reqID, "pm_provider_"+evt.APIError, "PM model authentication or API request failed; check the provider login before continuing."))
+			return
+		}
 		switch evt.Type {
 		case "stream_event":
 			sawStreamEvent = true
@@ -549,6 +645,19 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 				c.startAutoCompact(s, p)
 			}
 		case "system":
+			if evt.Subtype == "init" && p.readOnlyWorker && !validReadOnlyWorkerTools(evt.Tools) {
+				p.cancel()
+				c.sink.Emit(backend.NewError(s.ID, p.currentReqID(), "pm_worker_tool_policy_mismatch", "Read-only worker exposed unexpected tools; execution stopped."))
+				return
+			}
+			if evt.Subtype == "init" && c.pmProvider != nil {
+				pm, err := c.pmProvider.PMConfiguration(s.ID)
+				if err != nil || (pm != nil && !validPMTools(evt.Tools)) {
+					p.cancel()
+					c.sink.Emit(backend.NewError(s.ID, p.currentReqID(), "pm_tool_policy_mismatch", "PM runtime exposed unexpected tools; execution was stopped."))
+					return
+				}
+			}
 			if evt.Model != "" {
 				p.mu.Lock()
 				p.model = evt.Model
@@ -605,6 +714,9 @@ func (c *Claude) waitForClaudeAskUser(s *session.Session, waits []<-chan struct{
 }
 
 func (c *Claude) watchProc(s *session.Session, p *proc) {
+	if p.exited != nil {
+		defer close(p.exited)
+	}
 	_ = p.cmd.Wait()
 	rc := 0
 	if p.cmd.ProcessState != nil {

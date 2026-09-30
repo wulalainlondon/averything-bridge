@@ -1,4 +1,7 @@
-# Go Bridge Production ADB Test Plan
+# Historical Go Bridge Production ADB Migration Test Plan
+
+> Archived evidence only. The Python Bridge referenced below is retired and
+> must not be started, deployed, or used as a recovery fallback.
 
 This document is the handoff checklist for validating the Go bridge with a real Android device through ADB before promoting it to production.
 

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 
 	"everything-go/internal/backend"
 	"everything-go/internal/session"
@@ -34,9 +35,18 @@ func (m *Mux) CatalogDefinitions(ctx context.Context, base []backend.Definition)
 // connection core supports multiple AI runtimes simultaneously, mirroring the
 // Python bridge's backend registry.
 type Mux struct {
+	admission backend.TurnAdmission
 	byBackend map[string]Executor
 	def       Executor
 	terminal  *TerminalSink
+}
+
+func (m *Mux) SetTurnAdmission(p backend.TurnAdmission) { m.admission = p }
+
+func (m *Mux) ObserveNativeLifecycle(s *session.Session, turnID, phase string) {
+	if observer, ok := m.pick(s).(backend.NativeTurnObserver); ok {
+		observer.ObserveNativeLifecycle(s, turnID, phase)
+	}
 }
 
 func NewMux(byBackend map[string]Executor, def Executor) *Mux {
@@ -55,6 +65,17 @@ func (m *Mux) pick(s *session.Session) Executor {
 }
 
 func (m *Mux) Send(ctx context.Context, s *session.Session, reqID, content string, images []backend.ImageAttachment, files []backend.FileAttachment) error {
+	if m.admission != nil {
+		updated, release, err := m.admission.AdmitTurn(s, reqID, content)
+		if err != nil {
+			if m.terminal != nil {
+				m.terminal.Emit(backend.NewError(s.ID, reqID, "pm_policy_rejected", err.Error()))
+			}
+			return err
+		}
+		defer release()
+		content = updated
+	}
 	e := m.pick(s)
 	if m.terminal == nil {
 		return e.Send(ctx, s, reqID, content, images, files)
@@ -129,6 +150,18 @@ func (m *Mux) ProviderFor(s *session.Session) (backend.HistoryProvider, bool) {
 	return hp, ok
 }
 
+// FinalAnswerForSession provides the exact terminal answer for Bridge-managed
+// delegation. It never substitutes streaming commentary for a final answer.
+func (m *Mux) FinalAnswerForSession(s *session.Session, requestID string) (string, bool, error) {
+	reader, ok := m.pick(s).(interface {
+		FinalAnswerForRequest(*session.Session, string) (string, bool, error)
+	})
+	if !ok {
+		return "", false, fmt.Errorf("final answer unavailable for backend %s", s.Backend())
+	}
+	return reader.FinalAnswerForRequest(s, requestID)
+}
+
 // AllProviders returns the distinct history providers across all backends,
 // for aggregating resumable sessions.
 func (m *Mux) AllProviders() []backend.HistoryProvider {
@@ -182,6 +215,47 @@ func (m *Mux) AllUsageProviders() []UsageProvider {
 		}
 	}
 	return out
+}
+
+// RuntimeDiagnostics aggregates distinct backend diagnostics without coupling
+// the core status endpoint to Codex or any other concrete runtime.
+func (m *Mux) RuntimeDiagnostics() map[string]any {
+	seen := map[Executor]bool{}
+	out := map[string]any{}
+	for _, e := range m.byBackend {
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		if provider, ok := e.(RuntimeDiagnosticsProvider); ok {
+			for key, value := range provider.RuntimeDiagnostics() {
+				out[key] = value
+			}
+		}
+	}
+	return out
+}
+
+func (m *Mux) MaintenanceRecords() []backend.Maintenance {
+	var records []backend.Maintenance
+	for _, e := range m.byBackend {
+		if p, ok := e.(backend.MaintenanceProvider); ok {
+			records = append(records, p.MaintenanceRecords()...)
+		}
+	}
+	return records
+}
+func (m *Mux) ReconcileMaintenance(ctx context.Context, id string, release bool) (backend.Maintenance, error) {
+	for _, e := range m.byBackend {
+		if p, ok := e.(backend.MaintenanceProvider); ok {
+			for _, r := range p.MaintenanceRecords() {
+				if r.SessionID == id {
+					return p.ReconcileMaintenance(ctx, id, release)
+				}
+			}
+		}
+	}
+	return backend.Maintenance{}, fmt.Errorf("no maintenance record")
 }
 
 // RespondUserInput tries each interaction-capable backend until one owns the id.

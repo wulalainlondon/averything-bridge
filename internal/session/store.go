@@ -13,10 +13,19 @@ import (
 // saved_sessions.json. Store writes known fields back into the original raw JSON
 // object so Python-only metadata survives Go updates.
 type savedEntry struct {
+	ConfigRevision      uint64   `json:"config_revision,omitempty"`
 	Name                string   `json:"name"`
+	MetadataRevision    uint64   `json:"metadata_revision,omitempty"`
+	NameUpdatedAt       int64    `json:"name_updated_at,omitempty"`
+	NameUpdatedBy       string   `json:"name_updated_by,omitempty"`
+	LastNameMutationID  string   `json:"last_name_mutation_id,omitempty"`
 	ResumeID            string   `json:"resume_id"`
 	ClaudeUUID          string   `json:"claude_uuid"`
 	LastUsed            int64    `json:"last_used"`
+	PreviewText         string   `json:"preview_text,omitempty"`
+	PreviewRole         string   `json:"preview_role,omitempty"`
+	PreviewUpdatedAt    int64    `json:"preview_updated_at,omitempty"`
+	PreviewRevision     uint64   `json:"preview_revision,omitempty"`
 	Cwd                 string   `json:"cwd"`
 	Backend             string   `json:"backend"`
 	Model               string   `json:"model"`
@@ -82,7 +91,7 @@ func (st *Store) Save(sessions []*Session) error {
 	raw := st.loadRawLocked()
 	currentIDs := make(map[string]bool, len(sessions))
 	for _, s := range sessions {
-		snap := s.Snapshot()
+		snap := s.SettingsSnapshot()
 		currentIDs[snap.ID] = true
 		// last_used must reflect the session's real last activity, NOT now.
 		// Stamping every session with now on each Save flattens the whole file to
@@ -95,7 +104,11 @@ func (st *Store) Save(sessions []*Session) error {
 		}
 		entry := savedEntry{
 			Name: snap.Name, ResumeID: snap.ResumeID, ClaudeUUID: snap.ResumeID,
+			ConfigRevision: snap.ConfigRevision, MetadataRevision: snap.MetadataRevision, NameUpdatedAt: snap.NameUpdatedAt,
+			NameUpdatedBy: snap.NameUpdatedBy, LastNameMutationID: snap.LastNameMutationID,
 			LastUsed: lastUsed, Cwd: snap.Cwd, Backend: snap.Backend, Model: snap.Model,
+			PreviewText: snap.PreviewText, PreviewRole: snap.PreviewRole,
+			PreviewUpdatedAt: snap.PreviewUpdatedAt, PreviewRevision: snap.PreviewRevision,
 			Sandbox: snap.Sandbox, CreatedAt: snap.CreatedAt,
 			Effort:      snap.Effort,
 			ServiceTier: snap.ServiceTier, CollaborationMode: snap.CollaborationMode, Personality: snap.Personality,
@@ -187,9 +200,25 @@ func putKnownFields(obj map[string]json.RawMessage, entry savedEntry) {
 		obj[key] = data
 	}
 	put("name", entry.Name)
+	put("metadata_revision", entry.MetadataRevision)
+	put("config_revision", entry.ConfigRevision)
+	put("name_updated_at", entry.NameUpdatedAt)
+	put("name_updated_by", entry.NameUpdatedBy)
+	put("last_name_mutation_id", entry.LastNameMutationID)
 	put("resume_id", entry.ResumeID)
 	put("claude_uuid", entry.ClaudeUUID)
 	put("last_used", entry.LastUsed)
+	if entry.PreviewText != "" && entry.PreviewUpdatedAt > 0 {
+		put("preview_text", entry.PreviewText)
+		put("preview_role", entry.PreviewRole)
+		put("preview_updated_at", entry.PreviewUpdatedAt)
+		put("preview_revision", entry.PreviewRevision)
+	} else {
+		delete(obj, "preview_text")
+		delete(obj, "preview_role")
+		delete(obj, "preview_updated_at")
+		delete(obj, "preview_revision")
+	}
 	put("cwd", entry.Cwd)
 	put("backend", entry.Backend)
 	put("model", entry.Model)
@@ -273,9 +302,18 @@ func entryFromRaw(obj map[string]json.RawMessage) savedEntry {
 	}
 	return savedEntry{
 		Name:                rawString(obj, "name"),
+		MetadataRevision:    uint64(rawInt64(obj, "metadata_revision")),
+		ConfigRevision:      uint64(rawInt64(obj, "config_revision")),
+		NameUpdatedAt:       rawInt64(obj, "name_updated_at"),
+		NameUpdatedBy:       rawString(obj, "name_updated_by"),
+		LastNameMutationID:  rawString(obj, "last_name_mutation_id"),
 		ResumeID:            resumeID,
 		ClaudeUUID:          claudeUUID,
 		LastUsed:            lastUsed,
+		PreviewText:         rawString(obj, "preview_text"),
+		PreviewRole:         rawString(obj, "preview_role"),
+		PreviewUpdatedAt:    rawInt64(obj, "preview_updated_at"),
+		PreviewRevision:     uint64(rawInt64(obj, "preview_revision")),
 		Cwd:                 rawString(obj, "cwd"),
 		Backend:             rawString(obj, "backend"),
 		Model:               rawString(obj, "model"),

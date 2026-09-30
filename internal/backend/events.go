@@ -30,6 +30,7 @@ type (
 	UserInputPayload      = protocol.UserInputRequestPayload
 	UserInputRequest      = protocol.UserInputRequestEvent
 	InteractionResolved   = protocol.InteractionResolved
+	TurnProgress          = protocol.TurnProgress
 	SessionInitInfo       = protocol.SessionInitInfo
 	MCPServerStatus       = protocol.MCPServerStatus
 )
@@ -38,13 +39,19 @@ type (
 // normalized 0..1 fraction unless the backend explicitly documents another
 // unit; ResetsAt is an optional ISO timestamp.
 type UsageWindow struct {
-	Utilization *float64
-	ResetsAt    *string
+	Utilization     *float64
+	ResetsAt        *string
+	Unit            string
+	Label           string
+	DurationMinutes int
 }
 
 // UsageReport is the backend-neutral usage payload. Client protocol adapters
 // choose the outbound event name and wire tags.
 type UsageReport struct {
+	BackendID      string
+	Source         string
+	CollectedAt    int64
 	FiveHour       *UsageWindow
 	SevenDay       *UsageWindow
 	SevenDaySonnet *UsageWindow
@@ -136,6 +143,10 @@ func NewSessionInitInfo(sessionID, model, permissionMode string, tools, slashCom
 	return protocol.NewSessionInitInfo(sessionID, model, permissionMode, tools, slashCommands, mcpServers)
 }
 
+func NewSessionRuntimeMetadata(sessionID string, model, effort *string) protocol.SessionMetaUpdated {
+	return protocol.NewSessionRuntimeMetadata(sessionID, model, effort)
+}
+
 func NewSessionWarning(sessionID, message string) SessionWarning {
 	return protocol.NewSessionWarning(sessionID, message)
 }
@@ -158,6 +169,10 @@ func NewUserInputRequest(payload UserInputPayload) UserInputRequest {
 
 func NewInteractionResolved(requestID, sessionID, status string) InteractionResolved {
 	return protocol.NewInteractionResolved(requestID, sessionID, status)
+}
+
+func NewTurnProgress(sessionID, requestID, stage, message string) TurnProgress {
+	return TurnProgress{SessionID: sessionID, RequestID: requestID, Stage: stage, Message: message}
 }
 
 func NewUsageReport(fiveHour, sevenDay, sevenDaySonnet *UsageWindow) UsageReport {

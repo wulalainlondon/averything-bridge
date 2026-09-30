@@ -132,7 +132,7 @@ func (h *Hub) replayOfflineLegacy(c *Client) {
 		if len(events) == 0 {
 			return
 		}
-		data, err := marshalEvent(events[0])
+		data, err := marshalEvent(events[0], c.wireAuthority())
 		if err != nil {
 			log.Printf("[replay] legacy marshal failed: %v", err)
 			h.offline.Commit(1)
