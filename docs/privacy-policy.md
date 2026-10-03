@@ -34,6 +34,8 @@ The iOS app includes Firebase Cloud Messaging and Firebase Installations to supp
 
 The app does not include Firebase Analytics or advertising SDKs. SDK privacy manifests may also disclose operational diagnostic or service data for analytics purposes. Google processes and retains Firebase service data under its privacy terms: https://firebase.google.com/support/privacy.
 
+Depending on your Bridge and notification settings, a push alert can include a session name, task-result preview, or filename. This optional alert content is processed by Google and Apple push services for delivery. Your desktop Bridge controls what it sends.
+
 ## Data Sharing
 
 The app developer does not sell your data and does not share your personal data with advertisers.
