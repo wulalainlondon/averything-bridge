@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Effective date: 2026-06-01
+Effective date: 2026-10-03
 
 Averything is a mobile companion app for controlling AI runtimes through a desktop bridge that you install and run on your own computer.
 
@@ -27,6 +27,12 @@ Averything uses local network access to discover and connect to your desktop bri
 ## Notifications
 
 If you enable push notifications, the app may register a push notification token and send it to your desktop bridge so the bridge can notify you when an AI task finishes. Notifications are optional.
+
+## Push Notification Services
+
+The iOS app includes Firebase Cloud Messaging and Firebase Installations to support push delivery. These SDKs may register an installation identifier and an Apple push token and send app/device service metadata and diagnostic information to Google as part of initialization and delivery. This can happen separately from whether you allow visible notification alerts. Notifications can be disabled in Averything and in iOS Settings. These identifiers are used for app functionality; Averything does not use them for advertising or tracking across other companies' apps or websites.
+
+The app does not include Firebase Analytics or advertising SDKs. SDK privacy manifests may also disclose operational diagnostic or service data for analytics purposes. Google processes and retains Firebase service data under its privacy terms: https://firebase.google.com/support/privacy.
 
 ## Data Sharing
 
