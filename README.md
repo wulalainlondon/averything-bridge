@@ -1,64 +1,21 @@
-# Averything Bridge
+# Averything Bridge — support and compatibility entry
 
-Averything Bridge connects the Averything mobile and desktop apps to AI coding tools running on your own computer. The backend is a single native Go service; no Python runtime or virtual environment is required.
+The canonical Go source and new macOS ARM64/Intel release is [everything-go](https://github.com/wulalainlondon/everything-go). Both the App setup link and this support entry use the same fixed reviewed payload; this repository is not a second writable backend.
 
-## Supported backends
-
-- Claude Code CLI
-- Codex CLI/app-server, including shared-daemon session handoff
-- Gemini CLI through ACP (`gemini --acp`)
-- Ollama
-- Remote WebSocket backends
-
-The bridge provides session streaming and history, attachments, durable per-device replay, file browsing, search, artifact discovery, YouTube tasks, browser approvals, local instance management, LAN discovery, mDNS, WebRTC and an optional Cloudflare tunnel.
-
-## Install
-
-Install and sign in to at least one supported AI CLI first.
-
-### macOS or Linux
+## Planned v0.2.86 installation
 
 ```bash
-curl -fsSL https://github.com/wulalainlondon/averything-bridge/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/wulalainlondon/everything-go/releases/download/v0.2.86/install.sh | bash
 ```
 
-macOS downloads a notarized app signed by `Developer ID Application: YuDi Huang (UPWLTJL6S2)`. The installer rejects a different signer, invalid Gatekeeper assessment, missing notarization ticket, or checksum mismatch. Linux verifies SHA-256 before replacing the binary.
+v0.2.86 remains planned until the controller publishes the independently accepted artifacts and verifies the official link/checksums. The root `install.sh` compatibility shim fetches only that canonical installer and verifies its fixed SHA256 before running it. Existing user paths/configuration are preserved by the canonical installer. No latest-tag guessing or different backend payload is used.
 
-### Windows 10/11
+The release adds the currently reviewed authenticated Task API/queue/task-mode projections and Codex realtime handler, preserving Claude policy/context-known-zero, upload2GiB/root scope/storm and device guards. Installed/logged-in compatible CLI/account/voice availability are still required; models/providers are not interchangeable. PM narrower targets, background/steer/active cancellation remain unsupported where scope cannot be enforced. Unknown historical dispatch origins require lawful human confirmation.
 
-```powershell
-irm https://github.com/wulalainlondon/averything-bridge/releases/latest/download/install.ps1 | iex
-```
+[Release/source/signing and rollback gates](https://github.com/wulalainlondon/everything-go/blob/release/public-v0.2.86/docs/RELEASE.md). macOS helpers for remote capture require14; the Go service minimum is12. New Linux/Windows packages are not part of this release preparation.
 
-The PowerShell installer verifies SHA-256 and creates an `Averything Bridge` scheduled task at logon.
+## Historical releases
 
-## Build from source
+[v0.2.1](https://github.com/wulalainlondon/averything-bridge/releases/tag/v0.2.1) and [v0.2.77](https://github.com/wulalainlondon/everything-go/releases/tag/v0.2.77) keep their original bytes. Existing Windows/Linux installers and the historical migration source remain available as history; they do not supply current Task API/realtime capabilities. No tag rewrite or force push is permitted.
 
-Go 1.26 or newer is required.
-
-```bash
-go test ./...
-go build ./cmd/everything-go
-```
-
-For development only, run the built binary on a separate port and data directory. Production macOS deployments must use the signed and notarized release app.
-
-```bash
-./everything-go --port 8767 --data-dir /tmp/averything-bridge-dev
-```
-
-Important flags include `--claude-bin`, `--codex-bin`, `--gemini-bin`, `--ollama-host`, `--root-dir`, `--discovery`, `--mdns`, and `--tunnel`.
-
-## Upgrade and rollback
-
-Re-running the installer upgrades in place. On macOS it keeps `Everything Go.previous.app` until the new signed service passes its health check. The final pre-Go implementation remains available at the `python-final-20260823` tag and `legacy/python-final` branch.
-
-## Security
-
-- Pairing credentials are device-specific.
-- Public tunnels do not start before a trusted device is paired.
-- High-risk runtime operations pass through the permission gate.
-- Child instance paths and ports are validated before persistence or launch.
-- macOS releases are Developer ID signed and notarized; downloadable assets have SHA-256 manifests.
-
-See [Security Policy](SECURITY.md), [Privacy Policy](docs/privacy-policy.md), and [Release Checklist](RELEASE_CHECKLIST.md).
+Privacy: [policy](docs/privacy.html). Paired runtime credentials/config/data remain on the operator host and never enter public binaries/source. Swift/Mac App Store and iOS packaging belong to their respective owners.
