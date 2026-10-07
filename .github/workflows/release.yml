@@ -1,106 +1,16 @@
-name: release
-
+name: canonical-entry-verification
 on:
   push:
     tags: ['v*']
-
+  workflow_dispatch:
 permissions:
-  contents: write
-
+  contents: read
 jobs:
-  build:
+  verify:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Import macOS signing certificate
-        env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-        run: |
-          if [ -z "${MACOS_CERTIFICATE_P12_BASE64:-}" ]; then
-            echo "macOS signing certificate not configured" >&2
-            exit 1
-          fi
-          keychain="$RUNNER_TEMP/everything-go-signing.keychain-db"
-          cert="$RUNNER_TEMP/everything-go-cert.p12"
-          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$cert" 2>/dev/null \
-            || printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 -D > "$cert"
-          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain"
-          security import "$cert" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain-db
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$keychain"
-
-      - name: Cross-compile binaries (CGO-free, modernc sqlite)
-        run: |
-          mkdir -p dist
-          for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64 windows/amd64 windows/arm64; do
-            os=${target%/*}; arch=${target#*/}
-            suffix=""
-            [ "$os" = windows ] && suffix=".exe"
-            echo "building everything-go-$os-$arch$suffix"
-            CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
-              go build -trimpath -ldflags="-s -w" \
-              -o "dist/everything-go-$os-$arch$suffix" ./cmd/everything-go
-          done
-
-      - name: Package macOS app bundles
-        env:
-          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
-        run: |
-          chmod +x scripts/package_macos_app.sh
-          version="${GITHUB_REF_NAME#v}"
-          sign_identity="${MACOS_CODESIGN_IDENTITY:?MACOS_CODESIGN_IDENTITY is required}"
-          test "$sign_identity" = "Developer ID Application: YuDi Huang (UPWLTJL6S2)"
-          EVERYTHING_GO_CODESIGN_IDENTITY="$sign_identity" EVERYTHING_GO_VERSION="$version" \
-            scripts/package_macos_app.sh dist/everything-go-darwin-arm64 arm64 dist/everything-go-darwin-arm64.app.zip
-          EVERYTHING_GO_CODESIGN_IDENTITY="$sign_identity" EVERYTHING_GO_VERSION="$version" \
-            scripts/package_macos_app.sh dist/everything-go-darwin-amd64 amd64 dist/everything-go-darwin-amd64.app.zip
-
-      - name: Notarize macOS app bundles
-        env:
-          APPSTORE_CONNECT_API_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
-          APPSTORE_CONNECT_API_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
-          APPSTORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APPSTORE_CONNECT_API_KEY_P8_BASE64 }}
-        run: |
-          test -n "${APPSTORE_CONNECT_API_KEY_ID:-}"
-          test -n "${APPSTORE_CONNECT_API_ISSUER_ID:-}"
-          test -n "${APPSTORE_CONNECT_API_KEY_P8_BASE64:-}"
-          chmod +x scripts/notarize_macos_app_zip.sh
-          scripts/notarize_macos_app_zip.sh dist/everything-go-darwin-arm64.app.zip
-          scripts/notarize_macos_app_zip.sh dist/everything-go-darwin-amd64.app.zip
-
-      - name: Verify signed notarized macOS assets
-        run: |
-          for arch in arm64 amd64; do
-            work="$RUNNER_TEMP/verify-$arch"
-            mkdir -p "$work"
-            ditto -x -k "dist/everything-go-darwin-$arch.app.zip" "$work"
-            app="$work/Everything Go.app"
-            codesign --verify --deep --strict --verbose=2 "$app"
-            codesign -d --verbose=4 "$app" 2>&1 | grep -F "Authority=Developer ID Application: YuDi Huang (UPWLTJL6S2)"
-            codesign -d --verbose=4 "$app" 2>&1 | grep -F "TeamIdentifier=UPWLTJL6S2"
-            spctl -a -t exec -vv "$app"
-            xcrun stapler validate "$app"
-          done
-
-      - name: Finish release assets
-        run: |
-          rm dist/everything-go-darwin-arm64 dist/everything-go-darwin-amd64
-          cp install.sh dist/install.sh
-          cp install.ps1 dist/install.ps1
-          (cd dist && shasum -a 256 * > SHA256SUMS)
-          ls -la dist
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+      - name: Check compatibility entry syntax
+        run: bash -n install.sh
+# Support tags never build a second backend, read signing credentials or publish.
+# The authorized controller publishes only identical canonical frozen artifacts.
