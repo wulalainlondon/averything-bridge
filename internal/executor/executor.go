@@ -1,6 +1,13 @@
-// Package executor provides reliability and backend multiplexing on top of the
-// neutral backend contract. The connection core does not depend on any one AI
-// runtime; each native Go adapter implements the same lifecycle interface.
+// Package executor implements backend-adapter helpers on top of the neutral
+// backend contract. This is the architectural pivot that unlocks the three test
+// configurations:
+//
+//	GoExecutor      → spawns the CLI + parses streams in Go      (config 2: pure Go)
+//	PythonExecutor  → forwards to a Python worker over a socket   (config 3: Go + Python, the "P3" hybrid)
+//
+// The connection core (hub/client/router) is written ONCE against this
+// interface; swapping the Executor swaps the entire backend implementation
+// without touching connection, routing, or session management.
 package executor
 
 import (
@@ -40,4 +47,11 @@ type ProcInspector interface {
 type InteractionResponder interface {
 	RespondUserInput(id string, answers map[string]any, cancelled bool) bool
 	PendingInteractions(sessionID string) []backend.UserInputPayload
+}
+
+// RuntimeDiagnosticsProvider exposes cached, non-blocking health details for
+// backend runtimes. Implementations must not spawn processes or perform network
+// I/O from this method; status_result is expected to remain cheap.
+type RuntimeDiagnosticsProvider interface {
+	RuntimeDiagnostics() map[string]any
 }

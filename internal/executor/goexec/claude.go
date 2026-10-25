@@ -10,11 +10,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,8 @@ import (
 	"everything-go/internal/protocol"
 	"everything-go/internal/runtime"
 	"everything-go/internal/session"
+	"everything-go/internal/sourcepolicy"
+	"everything-go/internal/taskapi"
 )
 
 const (
@@ -43,18 +46,30 @@ var todoTools = map[string]bool{
 }
 
 type proc struct {
-	cmd    *exec.Cmd
-	stdin  *bufWriteCloser
-	cancel context.CancelFunc
-	reqID  string // request_id of the in-flight turn, stamped onto events
-	model  string
+	inputUUID          string
+	acceptedUUID       string
+	finalMessageID     string
+	finalAssistantText string
+
+	taskLease      *claudeTaskLease
+	pmSession      bool
+	readOnlyWorker bool
+	cmd            *exec.Cmd
+	stdin          *bufWriteCloser
+	cancel         context.CancelFunc
+	exited         chan struct{}
+	stopErr        error
+	reqID          string // request_id of the in-flight turn, stamped onto events
+	model          string
 
 	// Tool/todo presentation state, touched only by this proc's readStdout goroutine.
 	tools *toolNormalizer
 
-	mu                sync.Mutex
-	lastActivity      time.Time
-	compactInProgress bool
+	mu                  sync.Mutex
+	lastActivity        time.Time
+	compactInProgress   bool
+	manualStop          bool
+	manualStopRequestID string
 }
 
 func (p *proc) beginTurn(reqID string, compact bool) {
@@ -78,12 +93,17 @@ func (p *proc) currentReqID() string {
 }
 
 func (p *proc) finishTurn() (reqID string, wasCompact bool) {
+	if p.taskLease != nil {
+		p.taskLease.endTurn()
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	reqID = p.reqID
 	wasCompact = p.compactInProgress
 	p.reqID = ""
 	p.compactInProgress = false
+	p.inputUUID, p.acceptedUUID, p.finalMessageID, p.finalAssistantText = "", "", "", ""
 	return reqID, wasCompact
 }
 
@@ -114,10 +134,14 @@ type claudeState struct {
 
 // Claude implements executor.Executor over the local `claude` CLI.
 type Claude struct {
-	sink        executor.Sink
-	tools       *toolEmitter
-	claudeBin   string
-	projectsDir string
+	taskProvider      backend.TaskAPIProvider
+	taskMCP           *claudeTaskMCP
+	pmProvider        backend.PMProvider
+	sink              executor.Sink
+	tools             *toolEmitter
+	claudeBin         string
+	projectsDir       string
+	configDirOverride string
 
 	mu     sync.Mutex
 	procs  map[string]*proc // sessionID -> running subprocess
@@ -132,16 +156,19 @@ type Claude struct {
 	treeScanCache map[string]cachedAgentScan // agent jsonl path -> mtime-keyed parse
 }
 
+func (c *Claude) SetPMProvider(provider backend.PMProvider) { c.pmProvider = provider }
+
 func NewClaude(sink executor.Sink, claudeBin string) *Claude {
 	if claudeBin == "" {
 		claudeBin = "claude"
 	}
-	projectsDir := ""
-	if home, err := os.UserHomeDir(); err == nil {
-		projectsDir = filepath.Join(home, ".claude", "projects")
+	projectsDir := sourcepolicy.ClaudeProjectsDir()
+	configOverride := ""
+	if strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")) != "" {
+		configOverride = sourcepolicy.ClaudeConfigDir()
 	}
 	c := &Claude{
-		sink: sink, claudeBin: claudeBin, projectsDir: projectsDir,
+		sink: sink, claudeBin: claudeBin, projectsDir: projectsDir, configDirOverride: configOverride,
 		tools:   newToolEmitter(sink),
 		procs:   make(map[string]*proc),
 		states:  make(map[string]*claudeState),
@@ -174,9 +201,37 @@ func (c *Claude) state(sessionID string) *claudeState {
 // Send writes a user message to the session's claude process (spawning it on
 // first use) and lets the stdout reader stream the response.
 func (c *Claude) Send(ctx context.Context, s *session.Session, reqID, content string, images []backend.ImageAttachment, files []backend.FileAttachment) error {
+	if c.taskProvider != nil && s.ResumeID() != "" {
+		scope, err := c.taskProvider.TaskWorkerScope(s)
+		if err != nil {
+			return err
+		}
+		if scope != nil {
+			if err := c.ValidateExistingTaskScope(s, *scope, s.Snapshot().Cwd); err != nil {
+				return err
+			}
+		}
+	}
+
 	c.mu.Lock()
 	p := c.procs[s.ID]
+	if p != nil && p.taskLease != nil {
+		if p.taskLease.hasTurn() {
+			c.mu.Unlock()
+			return fmt.Errorf("Claude task request already active; inspect its original receipt")
+		}
+		// A completed business turn may have an internal compact in progress.
+		// Never reuse its process credential for the next admitted request.
+		p.cancel()
+		delete(c.procs, s.ID)
+		p = nil
+	}
 	if p == nil {
+		if s.ResumeID() != "" {
+			c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "resuming_thread", "Loading the existing Claude conversation"))
+		} else {
+			c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "starting_thread", "Starting Claude"))
+		}
 		var err error
 		p, err = c.spawn(s)
 		if err != nil {
@@ -188,12 +243,33 @@ func (c *Claude) Send(ctx context.Context, s *session.Session, reqID, content st
 	}
 	isCompact := strings.TrimSpace(content) == "/compact"
 	p.beginTurn(reqID, isCompact)
+	if p.taskLease != nil {
+		p.taskLease.mu.Lock()
+		if p.taskLease.requestID == "" {
+			p.taskLease.requestID = reqID
+		}
+		p.taskLease.mu.Unlock()
+	}
 	c.mu.Unlock()
+	c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "submitting_turn", "Sending the turn to Claude"))
 	if isCompact {
 		c.sink.Emit(backend.NewSessionCommandStarted(s.ID, reqID, 0))
 	}
 
-	payload := userMessageJSON(content, images, files)
+	payload := userMessageJSON(backend.PresentationContent(ctx, content), images, files)
+	if p.taskLease != nil {
+		var frame map[string]any
+		json.Unmarshal(payload, &frame)
+		p.mu.Lock()
+		p.inputUUID = uuid.NewString()
+		p.acceptedUUID = ""
+		p.finalMessageID = ""
+		p.finalAssistantText = ""
+		frame["uuid"] = p.inputUUID
+		p.mu.Unlock()
+		payload, _ = json.Marshal(frame)
+		payload = append(payload, '\n')
+	}
 	if _, err := p.stdin.Write(payload); err != nil {
 		if isCompact {
 			c.sink.Emit(backend.NewSessionCommandFailed(s.ID, reqID, "stdin write failed: "+err.Error(), 0))
@@ -207,21 +283,100 @@ func (c *Claude) Send(ctx context.Context, s *session.Session, reqID, content st
 		}
 		return err
 	}
+	c.sink.Emit(backend.NewTurnProgress(s.ID, reqID, "waiting_model", "Claude accepted the turn"))
 	go c.agentTreePoller(s, p)
+	return nil
+}
+
+// The CLI's spawn arguments are immutable. An idle process is retired before
+// acknowledging new settings, and the next turn resumes the SAME conversation
+// with the persisted configuration. Never restart an active writer.
+func (c *Claude) UpdateSessionSettings(ctx context.Context, s *session.Session) error {
+	if c.pmProvider != nil {
+		policy, err := c.pmProvider.PMConfiguration(s.ID)
+		if err != nil {
+			return err
+		}
+		if policy != nil {
+			return errors.New("pm_role_settings_locked")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	p := c.procs[s.ID]
+	if p == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	if p.currentReqID() != "" {
+		c.mu.Unlock()
+		return errors.New("runtime_busy")
+	}
+	delete(c.procs, s.ID)
+	c.mu.Unlock()
+	p.cancel()
+	if p.exited != nil {
+		select {
+		case <-p.exited:
+			p.mu.Lock()
+			stopErr := p.stopErr
+			p.mu.Unlock()
+			if stopErr != nil {
+				return stopErr
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+			return errors.New("runtime_retire_timeout")
+		}
+	}
 	return nil
 }
 
 func (c *Claude) Stop(ctx context.Context, s *session.Session) error {
 	c.mu.Lock()
 	p := c.procs[s.ID]
-	delete(c.procs, s.ID)
 	c.mu.Unlock()
 
 	if p != nil {
-		p.cancel() // SIGKILL via context; the reader goroutine exits on EOF
+		p.mu.Lock()
+		p.manualStop = true
+		if p.manualStopRequestID == "" {
+			p.manualStopRequestID = p.reqID
+		}
+		p.mu.Unlock()
+		if p.taskLease != nil {
+			p.taskLease.revoke()
+		}
+		p.cancel() // Request process termination; do not claim it has exited yet.
+		if p.exited == nil {
+			return fmt.Errorf("Claude process exit is not yet observable")
+		}
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-p.exited:
+			p.mu.Lock()
+			stopErr := p.stopErr
+			p.mu.Unlock()
+			if stopErr != nil {
+				return stopErr
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("Claude stop requested but process exit is not confirmed")
+		}
 	}
 	c.cancelInteractionsFor(s.ID)
-	c.sink.Emit(backend.NewStopped(s.ID, ""))
+	if p == nil {
+		if s.IsStreaming() {
+			return fmt.Errorf("Claude stop is unconfirmed while the backend is preparing the process")
+		}
+		c.sink.Emit(backend.NewStopped(s.ID, ""))
+	}
 	return nil
 }
 
@@ -231,6 +386,9 @@ func (c *Claude) Clear(ctx context.Context, s *session.Session) error {
 	delete(c.procs, s.ID)
 	c.mu.Unlock()
 	if p != nil {
+		if p.taskLease != nil {
+			p.taskLease.revoke()
+		}
 		p.cancel()
 	}
 	c.cancelInteractionsFor(s.ID)
@@ -264,6 +422,9 @@ func (c *Claude) KillProc(s *session.Session) bool {
 	if p == nil {
 		return false
 	}
+	if p.taskLease != nil {
+		p.taskLease.revoke()
+	}
 	p.cancel()
 	c.cancelInteractionsFor(s.ID)
 	return true
@@ -275,6 +436,9 @@ func (c *Claude) Close(ctx context.Context, s *session.Session) error {
 	delete(c.procs, s.ID)
 	c.mu.Unlock()
 	if p != nil {
+		if p.taskLease != nil {
+			p.taskLease.revoke()
+		}
 		p.cancel()
 	}
 	c.cancelInteractionsFor(s.ID)
@@ -294,8 +458,61 @@ func (c *Claude) spawn(s *session.Session) (*proc, error) {
 		mcpURL = c.mcp.sessionURL(s.ID)
 	}
 	args := claudeSpawnArgs(snap, mcpURL)
+	var pm *backend.PMConfiguration
+	readOnlyWorker := false
+	if c.pmProvider != nil {
+		var err error
+		pm, err = c.pmProvider.PMConfiguration(s.ID)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		if pm != nil {
+			args = claudePMSpawnArgs(snap, *pm)
+		}
+		if workers, ok := c.pmProvider.(backend.CollaborationWorkerProvider); ok && pm == nil {
+			readOnly, err := workers.IsReadOnlyCollaborationWorker(s.ID)
+			if err != nil {
+				cancel()
+				return nil, err
+			}
+			if readOnly {
+				readOnlyWorker = true
+				args = claudeReadOnlyWorkerArgs(snap, mcpURL)
+			}
+		}
+	}
 
+	args, taskLease, taskErr := c.taskSpawn(s, args, pm)
+	if taskErr != nil {
+		cancel()
+		return nil, taskErr
+	}
 	cmd := exec.CommandContext(ctx, c.claudeBin, args...)
+	configureOwnedProcessGroup(cmd)
+	// Give a CLI wrapper its normal signal/cleanup path before escalating.
+	// CommandContext's default SIGKILL skips shell traps and can orphan tools.
+	exited := make(chan struct{})
+	cmd.Cancel = func() error {
+		err := signalOwnedProcessGroup(cmd)
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return cmd.Process.Kill()
+		}
+		// Escalate while the exact owned leader is still observable, before
+		// CommandContext's parent-only WaitDelay. Never guess a shared group.
+		go func() {
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-exited:
+				return
+			case <-timer.C:
+				forceOwnedProcessGroup(cmd)
+			}
+		}()
+		return err
+	}
+	cmd.WaitDelay = 3 * time.Second
 	if snap.Cwd != "" {
 		// Expand "~"/"~/..." like Python's os.path.expanduser before chdir;
 		// the app sends "~" as the default cwd and exec won't expand it.
@@ -305,6 +522,20 @@ func (c *Claude) spawn(s *session.Session) (*proc, error) {
 		// The per-server timeout in --mcp-config is sometimes ignored; the env var
 		// is honored. 30 min lets a human take their time answering ask_user.
 		cmd.Env = append(os.Environ(), "MCP_TOOL_TIMEOUT=1800000")
+	}
+	if pm != nil {
+		cmd.Dir = pm.RuntimeDir
+		cmd.Env = append(os.Environ(), "MCP_TOOL_TIMEOUT=30000", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "ENABLE_CLAUDEAI_MCP_SERVERS=false", "BRIDGE_PM_SESSION_TOKEN="+pm.Token)
+	}
+	if readOnlyWorker {
+		cmd.Env = append(os.Environ(), "MCP_TOOL_TIMEOUT=1800000", "ENABLE_CLAUDEAI_MCP_SERVERS=false")
+	}
+	cmd.Env = addTaskEnvironment(cmd.Env, taskLease)
+	if c.configDirOverride != "" {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, "CLAUDE_CONFIG_DIR="+c.configDirOverride)
 	}
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -328,8 +559,16 @@ func (c *Claude) spawn(s *session.Session) (*proc, error) {
 
 	log.Printf("[%s] spawned claude pid=%d cwd=%s resume=%s", s.ID, cmd.Process.Pid, snap.Cwd, snap.ResumeID)
 	p := &proc{
-		cmd: cmd, stdin: newBufWriteCloser(stdinPipe), cancel: cancel,
+		taskLease:      taskLease,
+		pmSession:      pm != nil,
+		readOnlyWorker: readOnlyWorker,
+		cmd:            cmd, stdin: newBufWriteCloser(stdinPipe), cancel: cancel, exited: exited,
 		tools: newToolNormalizer(c.sink, c), model: snap.Model,
+	}
+	if taskLease != nil {
+		taskLease.mu.Lock()
+		taskLease.p = p
+		taskLease.mu.Unlock()
 	}
 	p.touch()
 
@@ -353,22 +592,26 @@ func claudeSpawnArgs(snap session.Snapshot, mcpURL string) []string {
 	model := snap.Model
 	if model == "opusplan" {
 		args = append(args, "--model", "opus", "--permission-mode", "plan")
-	} else if model == "fable" {
-		args = append(args, "--model", "claude-fable-5")
 	} else {
+		if model == "fable" {
+			model = "claude-fable-5"
+		}
 		switch snap.Sandbox {
-		case "read-only":
-			args = append(args,
-				"--dangerously-skip-permissions",
-				"--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch",
-			)
-		case "workspace-write":
-			args = append(args,
-				"--dangerously-skip-permissions",
-				"--disallowedTools", "Bash",
-			)
-		default:
+		case "danger-full-access":
 			args = append(args, "--dangerously-skip-permissions")
+		case "workspace-write":
+			args = append(args, "--permission-mode", "acceptEdits", "--disallowedTools", "Bash")
+		default:
+			approvedTools := "Read,Glob,Grep,WebSearch,WebFetch"
+			if mcpURL != "" {
+				approvedTools += ",mcp__ask_user__ask_question"
+			}
+			args = append(args,
+				"--permission-mode", "dontAsk",
+				"--tools", "Read,Glob,Grep,WebSearch,WebFetch",
+				"--allowedTools", approvedTools,
+				"--strict-mcp-config",
+			)
 		}
 		if model != "" {
 			args = append(args, "--model", model)
@@ -386,6 +629,9 @@ func claudeSpawnArgs(snap session.Snapshot, mcpURL string) []string {
 	if snap.ResumeID != "" {
 		args = append(args, "--resume", snap.ResumeID)
 	}
+	if snap.Name != "" {
+		args = append(args, "--name", snap.Name)
+	}
 	if snap.Effort != "" && snap.Effort != "auto" {
 		args = append(args, "--effort", snap.Effort)
 	}
@@ -393,21 +639,32 @@ func claudeSpawnArgs(snap session.Snapshot, mcpURL string) []string {
 }
 
 // ndLine is the union of stdout line shapes we care about.
+type claudeInputUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
 type ndLine struct {
-	Type    string `json:"type"`
-	Subtype string `json:"subtype"`
-	Message struct {
+	UUID              string `json:"uuid"`
+	IsAPIErrorMessage bool   `json:"isApiErrorMessage"`
+	APIError          string `json:"error"`
+	IsError           bool   `json:"is_error"`
+	Type              string `json:"type"`
+	Subtype           string `json:"subtype"`
+	Message           struct {
 		Content []json.RawMessage `json:"content"`
+		Usage   *claudeInputUsage `json:"usage"`
 	} `json:"message"`
-	ToolUseID string          `json:"tool_use_id"`
-	Content   json.RawMessage `json:"content"`    // tool_result payload
-	SessionID string          `json:"session_id"` // result → new resume uuid
-	Model     string          `json:"model"`      // system/init
-	Result    json.RawMessage `json:"result"`     // result error payload
-	Usage     struct {
-		InputTokens              int `json:"input_tokens"`
-		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-	} `json:"usage"`
+	ToolUseID  string            `json:"tool_use_id"`
+	Content    json.RawMessage   `json:"content"`    // tool_result payload
+	SessionID  string            `json:"session_id"` // result → new resume uuid
+	Model      string            `json:"model"`      // system/init
+	Result     json.RawMessage   `json:"result"`     // result error payload
+	Usage      *claudeInputUsage `json:"usage"`
+	ModelUsage map[string]struct {
+		ContextWindow int `json:"contextWindow"`
+	} `json:"modelUsage"`
 	// Non-empty on events produced inside a Task subagent. Those are internal
 	// to the subagent and must not pollute the main-chain stream.
 	ParentToolUseID string `json:"parent_tool_use_id"`
@@ -445,6 +702,7 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 	// avoid double emission. Old CLIs without stream_event keep the aggregate
 	// path. readStdout is the proc's only reader, so a local is race-free.
 	sawStreamEvent := false
+	var lastInputUsage *claudeInputUsage
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -459,6 +717,16 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 			continue // Task-subagent internal event — keep it out of the main stream
 		}
 		reqID := p.currentReqID()
+		if evt.IsAPIErrorMessage || (evt.Type == "assistant" && evt.APIError != "") {
+			p.finishTurn()
+			p.cancel()
+			prefix, message := "claude_provider_", "Claude authentication or API request failed; check the provider login before continuing."
+			if p.pmSession {
+				prefix, message = "pm_provider_", "PM model authentication or API request failed; check the provider login before continuing."
+			}
+			c.sink.Emit(backend.NewError(s.ID, reqID, prefix+evt.APIError, message))
+			return
+		}
 		switch evt.Type {
 		case "stream_event":
 			sawStreamEvent = true
@@ -476,6 +744,22 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 				}
 			}
 		case "assistant":
+			if p.taskLease != nil && evt.UUID != "" {
+				parts := []string{}
+				for _, raw := range evt.Message.Content {
+					var block struct{ Type, Text string }
+					if json.Unmarshal(raw, &block) == nil && block.Type == "text" {
+						parts = append(parts, block.Text)
+					}
+				}
+				p.mu.Lock()
+				p.finalMessageID = evt.UUID
+				p.finalAssistantText = strings.Join(parts, "")
+				p.mu.Unlock()
+			}
+			if evt.Message.Usage != nil {
+				lastInputUsage = evt.Message.Usage
+			}
 			var askWaits []<-chan struct{}
 			for _, raw := range evt.Message.Content {
 				var b block
@@ -511,8 +795,35 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 				continue
 			}
 			c.tools.ResultEnd(s.ID, reqID, evt.ToolUseID, output)
+		case "user":
+			if p.taskLease != nil && evt.UUID != "" && evt.SessionID != "" {
+				p.mu.Lock()
+				matched := evt.UUID == p.inputUUID && reqID != ""
+				if matched {
+					p.acceptedUUID = evt.UUID
+				}
+				p.mu.Unlock()
+				if matched {
+					c.sink.Emit(backend.NativeProviderEvidence{SessionID: s.ID, RequestID: reqID, Backend: "claude", ConversationID: evt.SessionID, Token: evt.UUID, TokenKind: "message_uuid"})
+				}
+			}
+			// Public stream-json tool replies are user message content blocks.
+			// A replayed user prompt is an acknowledgement, not assistant output.
+			for _, raw := range evt.Message.Content {
+				var b claudeBlock
+				if json.Unmarshal(raw, &b) != nil || b.Type != "tool_result" || b.ToolUseID == "" {
+					continue
+				}
+				output := flattenToolOutput(b.Content)
+				if p.tools.HandleClaudeToolResult(s.ID, reqID, b.ToolUseID, output) {
+					continue
+				}
+				c.tools.ResultEnd(s.ID, reqID, b.ToolUseID, output)
+			}
 		case "result":
-			if evt.Subtype != "" && evt.Subtype != "success" {
+			inputUsage := lastInputUsage
+			lastInputUsage = nil
+			if evt.IsError || (evt.Subtype != "" && evt.Subtype != "success") {
 				msg := claudeRawToString(evt.Result)
 				if msg == "" {
 					msg = "Claude result failed"
@@ -528,18 +839,41 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 			st.mu.Lock()
 			st.restartCount = 0
 			st.mu.Unlock()
-			contextUsed := evt.Usage.InputTokens + evt.Usage.CacheCreationInputTokens
+			contextUsed := -1 // no usage report is unknown, not an inferred zero
+			if evt.Usage != nil {
+				contextUsed = evt.Usage.InputTokens + evt.Usage.CacheCreationInputTokens + evt.Usage.CacheReadInputTokens
+			}
+			// result.usage is accumulated across tool steps in a turn. The latest
+			// assistant request describes the current context window, not their sum.
+			if inputUsage != nil {
+				contextUsed = inputUsage.InputTokens + inputUsage.CacheCreationInputTokens + inputUsage.CacheReadInputTokens
+			}
 			contextLimit := claudeContextLimit(p.currentModel())
-			if contextLimit > 0 || contextUsed > 0 {
+			if usage, ok := evt.ModelUsage[p.currentModel()]; ok && usage.ContextWindow > 0 {
+				contextLimit = usage.ContextWindow
+			}
+			if contextLimit > 0 || contextUsed >= 0 {
 				s.SetContext(contextUsed, contextLimit)
 			}
 			if evt.SessionID != "" && evt.SessionID != s.ResumeID() {
 				s.SetResumeID(evt.SessionID)
 				c.sink.Emit(backend.NewSessionUUID(s.ID, evt.SessionID))
 			}
+			if p.taskLease != nil {
+				p.mu.Lock()
+				token, message, text := p.acceptedUUID, p.finalMessageID, p.finalAssistantText
+				p.mu.Unlock()
+				final := claudeRawToString(evt.Result)
+				if token != "" && message != "" && final == text {
+					c.sink.Emit(backend.NativeProviderEvidence{SessionID: s.ID, RequestID: reqID, Backend: "claude", ConversationID: s.ResumeID(), Token: token, TokenKind: "message_uuid", MessageID: message, Text: final, Status: "succeeded"})
+				}
+			}
 			doneReqID, wasCompact := p.finishTurn()
 			if doneReqID != "" {
 				reqID = doneReqID
+			}
+			if final := claudeRawToString(evt.Result); final != "" {
+				c.sink.Emit(backend.CompletedAnswer{SessionID: s.ID, RequestID: reqID, Text: final})
 			}
 			c.sink.Emit(backend.NewDone(s.ID, reqID))
 			if wasCompact {
@@ -549,6 +883,51 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 				c.startAutoCompact(s, p)
 			}
 		case "system":
+			if evt.Subtype == "init" && (len(evt.Tools) > 0 || len(evt.SlashCmds) > 0) {
+				var servers []backend.MCPServerStatus
+				for _, raw := range evt.MCPServers {
+					var srv backend.MCPServerStatus
+					if json.Unmarshal(raw, &srv) == nil && srv.Name != "" {
+						servers = append(servers, srv)
+					}
+				}
+				c.sink.Emit(backend.NewSessionInitInfo(s.ID, evt.Model, evt.PermissionMd, evt.Tools, evt.SlashCmds, servers))
+			}
+			if evt.Subtype == "init" && p.taskLease != nil {
+				if conversation, e := taskapi.ClaudeConversation(line); e == nil {
+					p.taskLease.mu.Lock()
+					prior := p.taskLease.threadID
+					if prior == "" {
+						p.taskLease.threadID = conversation.ResumeID
+					}
+					p.taskLease.mu.Unlock()
+					if prior != "" && prior != conversation.ResumeID {
+						p.cancel()
+						c.sink.Emit(protocol.NewError(s.ID, p.currentReqID(), "unsupported: native conversation changed"))
+						continue
+					}
+				}
+			}
+			if evt.Subtype == "init" && p.taskLease != nil && p.taskLease.worker && !validTaskWorkerTools(evt.Tools) {
+				p.taskLease.revoke()
+				p.cancel()
+				c.sink.Emit(backend.NewError(s.ID, p.currentReqID(), "unsupported_task_worker_toolset", "Bounded task worker did not expose the exact gateway toolset; stopped without replay."))
+				return
+			}
+
+			if evt.Subtype == "init" && p.readOnlyWorker && (p.taskLease == nil || !p.taskLease.worker) && !validReadOnlyWorkerTools(evt.Tools) {
+				p.cancel()
+				c.sink.Emit(backend.NewError(s.ID, p.currentReqID(), "pm_worker_tool_policy_mismatch", "Read-only worker exposed unexpected tools; execution stopped."))
+				return
+			}
+			if evt.Subtype == "init" && c.pmProvider != nil {
+				pm, err := c.pmProvider.PMConfiguration(s.ID)
+				if err != nil || (pm != nil && !validPMPolicyTools(pm,evt.Tools)) {
+					p.cancel()
+					c.sink.Emit(backend.NewError(s.ID, p.currentReqID(), "pm_tool_policy_mismatch", "PM runtime exposed unexpected tools; execution was stopped."))
+					return
+				}
+			}
 			if evt.Model != "" {
 				p.mu.Lock()
 				p.model = evt.Model
@@ -561,16 +940,17 @@ func (c *Claude) readStdout(s *session.Session, p *proc, stdout interface{ Read(
 					c.sink.Emit(backend.NewSessionUUID(s.ID, evt.SessionID))
 				}
 			}
-			if evt.Subtype == "init" && (len(evt.Tools) > 0 || len(evt.SlashCmds) > 0) {
-				var servers []backend.MCPServerStatus
-				for _, raw := range evt.MCPServers {
-					var srv backend.MCPServerStatus
-					if json.Unmarshal(raw, &srv) == nil && srv.Name != "" {
-						servers = append(servers, srv)
-					}
-				}
-				c.sink.Emit(backend.NewSessionInitInfo(s.ID, evt.Model, evt.PermissionMd, evt.Tools, evt.SlashCmds, servers))
-			}
+
+		}
+	}
+	if err := sc.Err(); err != nil {
+		reqID, wasCompact := p.finishTurn()
+		p.cancel()
+		if wasCompact {
+			c.sink.Emit(backend.NewSessionCommandFailed(s.ID, reqID, "Claude output stream could not be read", 0))
+		}
+		if reqID != "" {
+			c.sink.Emit(backend.NewError(s.ID, reqID, "claude_stream_read_failed", "Claude output stream exceeded the supported frame size or could not be read; the request was stopped without replay."))
 		}
 	}
 	// stdout closed → process gone
@@ -605,7 +985,22 @@ func (c *Claude) waitForClaudeAskUser(s *session.Session, waits []<-chan struct{
 }
 
 func (c *Claude) watchProc(s *session.Session, p *proc) {
+	if p.taskLease != nil {
+		defer p.taskLease.revoke()
+	}
+	if p.exited != nil {
+		defer close(p.exited)
+	}
 	_ = p.cmd.Wait()
+	p.mu.Lock()
+	manualStopRequested := p.manualStop
+	p.mu.Unlock()
+	if manualStopRequested && !waitOwnedProcessGroupExit(p.cmd, 4*time.Second) {
+		p.mu.Lock()
+		p.stopErr = fmt.Errorf("Claude parent exited but owned process group exit is unconfirmed")
+		p.mu.Unlock()
+		return // Retain binding; no stopped terminal or implicit replay.
+	}
 	rc := 0
 	if p.cmd.ProcessState != nil {
 		rc = p.cmd.ProcessState.ExitCode()
@@ -619,7 +1014,17 @@ func (c *Claude) watchProc(s *session.Session, p *proc) {
 	delete(c.procs, s.ID)
 	c.mu.Unlock()
 
-	reqID := p.reqID
+	p.mu.Lock()
+	reqID, manualStop := p.reqID, p.manualStop
+	if manualStop && p.manualStopRequestID != "" {
+		reqID = p.manualStopRequestID
+	}
+	p.mu.Unlock()
+	if manualStop {
+		c.cancelInteractionsFor(s.ID)
+		c.sink.Emit(backend.NewStopped(s.ID, reqID))
+		return // Manual stop must not auto-restart the killed process.
+	}
 	if reqID != "" {
 		c.sink.Emit(backend.NewError(
 			s.ID, reqID, backend.ErrProcessDied,
@@ -635,6 +1040,12 @@ func (c *Claude) watchProc(s *session.Session, p *proc) {
 		}
 	}
 
+	// A formal API invocation never restarts an uncertain native request.
+	// Its original receipt/evidence remains the recovery anchor.
+	if p.taskLease != nil {
+		p.taskLease.revoke()
+		return
+	}
 	st := c.state(s.ID)
 	st.mu.Lock()
 	badResume := st.badResume

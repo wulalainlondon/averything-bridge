@@ -12,6 +12,7 @@
 package session
 
 import (
+	"errors"
 	"log"
 	"sort"
 	"strings"
@@ -25,7 +26,10 @@ import (
 // All mutable fields are private; callers go through the methods below so the
 // mutex is always held and reads see a consistent view.
 type Session struct {
-	mu sync.Mutex
+	mu             sync.Mutex
+	configUpdating bool
+	configRevision uint64
+	futureConfig   *Configuration
 
 	// ID and CreatedAt are set once at construction and never change, so they
 	// are exported and safe to read concurrently without the lock.
@@ -33,6 +37,10 @@ type Session struct {
 	CreatedAt float64 // unix seconds (matches Python time.time())
 
 	name                string
+	metadataRevision    uint64
+	nameUpdatedAt       int64
+	nameUpdatedBy       string
+	lastNameMutationID  string
 	cwd                 string
 	backend             string
 	model               string
@@ -46,27 +54,39 @@ type Session struct {
 	pinned              bool
 	hidden              bool
 
-	lastActivity float64
-	contextUsed  int
-	contextMax   int
+	lastActivity     float64
+	previewText      string
+	previewRole      string
+	previewUpdatedAt int64
+	previewRevision  uint64
+	contextUsed      int
+	contextMax       int
+	contextUsedKnown bool
 
 	state State
 
-	// Turn queue (see turn.go). mailbox serializes turns; turnDone signals the
-	// in-flight turn's completion to the worker. mailbox is NEVER closed (that
-	// would race a concurrent Submit into a send-on-closed-channel panic); the
-	// worker is stopped by closing quit instead.
-	mailbox  chan func()
-	quit     chan struct{}
-	workerUp bool
-	turnDone chan struct{}
+	// Queue entries have stable IDs so a waiting message can be reserved for
+	// steering or removed atomically before the worker begins it.
+	mailbox        []*queuedTurn
+	queueChanged   chan struct{}
+	queueHolds     int
+	activeQueuedID string
+	quit           chan struct{}
+	workerUp       bool
+	workerDone     chan struct{}
+	turnDone       chan struct{}
 }
 
 // Snapshot is an immutable, lock-free copy of a session's fields for callers
 // that need several at once (summaries, task listings, spawn argument building).
 type Snapshot struct {
+	ConfigRevision      uint64
 	ID                  string
 	Name                string
+	MetadataRevision    uint64
+	NameUpdatedAt       int64
+	NameUpdatedBy       string
+	LastNameMutationID  string
 	Cwd                 string
 	Backend             string
 	Model               string
@@ -79,8 +99,13 @@ type Snapshot struct {
 	HistoricalResumeIDs []string
 	CreatedAt           float64
 	LastActivity        float64
+	PreviewText         string
+	PreviewRole         string
+	PreviewUpdatedAt    int64
+	PreviewRevision     uint64
 	ContextUsed         int
 	ContextMax          int
+	ContextUsedKnown    bool
 	Pinned              bool
 	Hidden              bool
 	Streaming           bool
@@ -98,13 +123,19 @@ func (s *Session) Snapshot() Snapshot {
 
 func (s *Session) snapshotLocked() Snapshot {
 	return Snapshot{
-		ID: s.ID, Name: s.name, Cwd: s.cwd, Backend: s.backend,
+		ConfigRevision: s.configRevision,
+		ID:             s.ID, Name: s.name, Cwd: s.cwd, Backend: s.backend,
+		MetadataRevision: s.metadataRevision, NameUpdatedAt: s.nameUpdatedAt,
+		NameUpdatedBy: s.nameUpdatedBy, LastNameMutationID: s.lastNameMutationID,
 		Model: s.model, Sandbox: s.sandbox, Effort: s.effort, ResumeID: s.resumeID,
 		HistoricalResumeIDs: append([]string(nil), s.historicalResumeIDs...),
 		ServiceTier:         s.serviceTier, CollaborationMode: s.collaborationMode, Personality: s.personality,
 		CreatedAt: s.CreatedAt, LastActivity: s.lastActivity,
+		PreviewText: s.previewText, PreviewRole: s.previewRole,
+		PreviewUpdatedAt: s.previewUpdatedAt, PreviewRevision: s.previewRevision,
 		ContextUsed: s.contextUsed, ContextMax: s.contextMax,
-		Pinned: s.pinned, Hidden: s.hidden,
+		ContextUsedKnown: s.contextUsedKnown,
+		Pinned:           s.pinned, Hidden: s.hidden,
 		Streaming: s.state == Streaming || s.state == Stopping,
 		State:     s.state,
 	}
@@ -140,6 +171,14 @@ func (s *Session) SetEffort(effort string) {
 	s.mu.Unlock()
 }
 
+// SetModel stores an exact model override. Empty means follow the runtime
+// default, so it cannot use ApplyConfig's omit-empty semantics.
+func (s *Session) SetModel(model string) {
+	s.mu.Lock()
+	s.model = model
+	s.mu.Unlock()
+}
+
 // ApplyCodexSettings stores app-server thread settings. Empty values are
 // meaningful for service tier/personality/mode (they clear an override), so
 // callers pass pointers to distinguish omission from clearing.
@@ -154,6 +193,21 @@ func (s *Session) ApplyCodexSettings(serviceTier, collaborationMode, personality
 	if personality != nil {
 		s.personality = *personality
 	}
+	s.mu.Unlock()
+}
+
+// RestoreConfig restores an exact previously captured configuration. Unlike
+// ApplyConfig, empty strings are meaningful here because they clear overrides.
+// It is used to roll back a switch that the active runtime rejected.
+func (s *Session) RestoreConfig(snap Snapshot) {
+	s.mu.Lock()
+	s.backend = snap.Backend
+	s.model = snap.Model
+	s.sandbox = snap.Sandbox
+	s.effort = snap.Effort
+	s.serviceTier = snap.ServiceTier
+	s.collaborationMode = snap.CollaborationMode
+	s.personality = snap.Personality
 	s.mu.Unlock()
 }
 
@@ -247,6 +301,7 @@ func (s *Session) SetContext(used, max int) {
 	s.mu.Lock()
 	if used >= 0 {
 		s.contextUsed = used
+		s.contextUsedKnown = true
 	}
 	if max >= 0 {
 		s.contextMax = max
@@ -269,9 +324,10 @@ func (s *Session) SetLastActivity(ts float64) {
 
 // Registry is the in-memory session store, owned by the Go connection core.
 type Registry struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	store    *Store
+	mu         sync.RWMutex
+	mutationMu sync.Mutex
+	sessions   map[string]*Session
+	store      *Store
 }
 
 func NewRegistry() *Registry {
@@ -293,18 +349,27 @@ func (r *Registry) AttachStore(store *Store) {
 		if created == 0 {
 			created = float64(e.LastUsed)
 		}
-		r.mu.Lock()
-		r.sessions[id] = &Session{
-			ID: id, CreatedAt: created,
+		s := &Session{
+			configRevision: e.ConfigRevision,
+			ID:             id, CreatedAt: created,
 			name: e.Name, cwd: e.Cwd, backend: e.Backend,
+			metadataRevision: e.MetadataRevision, nameUpdatedAt: e.NameUpdatedAt,
+			nameUpdatedBy: e.NameUpdatedBy, lastNameMutationID: e.LastNameMutationID,
 			model: e.Model, sandbox: e.Sandbox, resumeID: resume,
 			historicalResumeIDs: append([]string(nil), e.HistoricalResumeIDs...),
 			effort:              e.Effort,
 			serviceTier:         e.ServiceTier, collaborationMode: e.CollaborationMode, personality: e.Personality,
 			pinned: e.Pinned, hidden: e.Hidden,
 			lastActivity: float64(e.LastUsed),
-			state:        Idle,
+			previewText:  e.PreviewText, previewRole: e.PreviewRole,
+			previewUpdatedAt: e.PreviewUpdatedAt, previewRevision: e.PreviewRevision,
+			state: Idle,
 		}
+		if previewActivity := float64(e.PreviewUpdatedAt) / 1000; previewActivity > s.lastActivity {
+			s.lastActivity = previewActivity
+		}
+		r.mu.Lock()
+		r.sessions[id] = s
 		r.mu.Unlock()
 	}
 	if len(canonicalIDs) != len(loaded) {
@@ -387,12 +452,178 @@ func firstNonEmptyRegistry(values ...string) string {
 // Persist writes the current sessions to the attached store (no-op if none).
 // Safe to call from a goroutine; writes are serialized inside the Store.
 func (r *Registry) Persist() {
-	if r.store == nil {
-		return
-	}
-	if err := r.store.Save(r.List()); err != nil {
+	if err := r.PersistDurably(); err != nil {
 		log.Printf("session persist failed: %v", err)
 	}
+}
+
+// PersistDurably lets durable queues refuse ownership if their Session identity
+// could not be saved. It uses the same mutation boundary as preview/rename.
+func (r *Registry) PersistDurably() error {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	if r.store == nil {
+		return nil
+	}
+	return r.store.Save(r.List())
+}
+
+var (
+	ErrRenameConflict = errors.New("session metadata revision conflict")
+	ErrRenameEmpty    = errors.New("session name is empty")
+	ErrPreviewInvalid = errors.New("session preview is invalid")
+	ErrSessionMissing = errors.New("session not found")
+)
+
+// CommitPreviewAndPersist atomically advances the server-authoritative row
+// preview. The timestamp is part of the same projection as the text and role,
+// so clients never have to combine a fresh activity time with stale content.
+// Older observations are ignored; equal retries are idempotent.
+func (r *Registry) CommitPreviewAndPersist(id, text, role string, updatedAt int64) (Snapshot, bool, error) {
+	text = strings.TrimSpace(text)
+	role = strings.TrimSpace(role)
+	if text == "" || (role != "user" && role != "assistant") || updatedAt <= 0 {
+		return Snapshot{}, false, ErrPreviewInvalid
+	}
+
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	s, ok := r.Get(id)
+	if !ok {
+		return Snapshot{}, false, ErrSessionMissing
+	}
+	before := s.Snapshot()
+	if updatedAt < before.PreviewUpdatedAt ||
+		(updatedAt == before.PreviewUpdatedAt && before.PreviewText == text && before.PreviewRole == role) {
+		return before, false, nil
+	}
+
+	s.mu.Lock()
+	s.previewText = text
+	s.previewRole = role
+	s.previewUpdatedAt = updatedAt
+	s.previewRevision++
+	activity := float64(updatedAt) / 1000
+	if activity > s.lastActivity {
+		s.lastActivity = activity
+	}
+	after := s.snapshotLocked()
+	s.mu.Unlock()
+
+	if r.store != nil {
+		if err := r.store.Save(r.List()); err != nil {
+			s.mu.Lock()
+			if s.previewRevision == after.PreviewRevision {
+				s.previewText = before.PreviewText
+				s.previewRole = before.PreviewRole
+				s.previewUpdatedAt = before.PreviewUpdatedAt
+				s.previewRevision = before.PreviewRevision
+				if s.lastActivity == after.LastActivity {
+					s.lastActivity = before.LastActivity
+				}
+			}
+			s.mu.Unlock()
+			return before, false, err
+		}
+	}
+	return after, true, nil
+}
+
+// RepairPreviewAndPersist replaces a projection only when it still exactly
+// matches expectedInvalidText. This narrow compare-and-swap is used to migrate
+// previews that history can prove came from a tool-only card. It deliberately
+// permits an older human message timestamp while never reducing LastActivity.
+func (r *Registry) RepairPreviewAndPersist(id, expectedInvalidText, text, role string, updatedAt int64) (Snapshot, bool, error) {
+	text = strings.TrimSpace(text)
+	role = strings.TrimSpace(role)
+	if expectedInvalidText == "" || text == "" || (role != "user" && role != "assistant") || updatedAt <= 0 {
+		return Snapshot{}, false, ErrPreviewInvalid
+	}
+
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	s, ok := r.Get(id)
+	if !ok {
+		return Snapshot{}, false, ErrSessionMissing
+	}
+	before := s.Snapshot()
+	if before.PreviewText != expectedInvalidText || before.PreviewRole != "assistant" {
+		return before, false, nil
+	}
+
+	s.mu.Lock()
+	s.previewText = text
+	s.previewRole = role
+	s.previewUpdatedAt = updatedAt
+	s.previewRevision++
+	after := s.snapshotLocked()
+	s.mu.Unlock()
+
+	if r.store != nil {
+		if err := r.store.Save(r.List()); err != nil {
+			s.mu.Lock()
+			if s.previewRevision == after.PreviewRevision {
+				s.previewText = before.PreviewText
+				s.previewRole = before.PreviewRole
+				s.previewUpdatedAt = before.PreviewUpdatedAt
+				s.previewRevision = before.PreviewRevision
+			}
+			s.mu.Unlock()
+			return before, false, err
+		}
+	}
+	return after, true, nil
+}
+
+// RenameAndPersist is the authoritative Session-name commit. The mutation is
+// serialized with every Registry persist, written atomically to disk, and only
+// then returned to the caller for broadcast. A failed disk write rolls memory
+// back, so session_renamed always means the new name survived a restart.
+func (r *Registry) RenameAndPersist(id, name, updatedBy, mutationID string, expectedRevision *uint64) (Snapshot, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Snapshot{}, false, ErrRenameEmpty
+	}
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+
+	s, ok := r.Get(id)
+	if !ok {
+		return Snapshot{}, false, ErrSessionMissing
+	}
+	before := s.Snapshot()
+	if mutationID != "" && before.LastNameMutationID == mutationID {
+		return before, false, nil
+	}
+	if expectedRevision != nil && *expectedRevision != before.MetadataRevision {
+		return before, false, ErrRenameConflict
+	}
+	if before.Name == name {
+		return before, false, nil
+	}
+
+	now := time.Now().UnixMilli()
+	s.mu.Lock()
+	s.name = name
+	s.metadataRevision++
+	s.nameUpdatedAt = now
+	s.nameUpdatedBy = strings.TrimSpace(updatedBy)
+	s.lastNameMutationID = mutationID
+	s.mu.Unlock()
+	after := s.Snapshot()
+	if r.store != nil {
+		if err := r.store.Save(r.List()); err != nil {
+			s.mu.Lock()
+			s.name = before.Name
+			s.metadataRevision = before.MetadataRevision
+			s.nameUpdatedAt = before.NameUpdatedAt
+			s.nameUpdatedBy = before.NameUpdatedBy
+			s.lastNameMutationID = before.LastNameMutationID
+			s.mu.Unlock()
+			return before, false, err
+		}
+	}
+	return after, true, nil
 }
 
 // PruneCodexSessions removes persisted and in-memory Codex rows excluded by
@@ -415,6 +646,53 @@ func (r *Registry) PruneCodexSessions(ignore func(cwd, name string) bool) int {
 		r.Persist()
 	}
 	return removed
+}
+
+// PruneMissingNativeSessions retires idle imported or Bridge-created rows
+// bound to a confirmed missing native conversation. Execution/queue receipts remain intact.
+// The caller supplies authoritative deletion evidence and a durable-work guard.
+func (r *Registry) PruneMissingNativeSessions(missing func(Snapshot) bool) int {
+	if missing == nil {
+		return 0
+	}
+	r.mu.Lock()
+	var removed []*Session
+	for id, s := range r.sessions {
+		snap := s.Snapshot()
+		prefix := "jl_c_"
+		if snap.Backend == "codex" {
+			prefix = "jl_x_"
+		} else if snap.Backend != "claude" {
+			continue
+		}
+		if len(snap.ResumeID) < 12 || (id != prefix+snap.ResumeID[:12] && !strings.HasPrefix(id, "s_")) || !missing(snap) {
+			continue
+		}
+		s.mu.Lock()
+		if s.state == Idle && len(s.mailbox) == 0 && s.queueHolds == 0 && s.activeQueuedID == "" && !s.configUpdating && s.resumeID == snap.ResumeID {
+			// Close under the same lock that excludes Submit, before removing the row.
+			s.state = Closed
+			if s.turnDone != nil {
+				close(s.turnDone)
+				s.turnDone = nil
+			}
+			if s.quit != nil {
+				close(s.quit)
+				s.quit = nil
+			}
+			s.queueHolds = 0
+			s.signalQueueLocked()
+			s.workerUp = false
+			delete(r.sessions, id)
+			removed = append(removed, s)
+		}
+		s.mu.Unlock()
+	}
+	r.mu.Unlock()
+	if len(removed) > 0 {
+		r.Persist()
+	}
+	return len(removed)
 }
 
 // Create registers a session under the client-supplied id. If the id already
@@ -502,7 +780,10 @@ func (r *Registry) UpsertExternal(id, name, cwd, backend, resumeID string, lastU
 		}
 		before := s.Snapshot()
 		s.mu.Lock()
-		if s.name == "" || (s.ID == id && strings.HasPrefix(s.ID, "jl_")) {
+		// Once a user-authored metadata revision exists, the Bridge registry is
+		// the name authority. Native JSONL discovery may keep refreshing runtime
+		// location/activity, but must never restore its derived transcript title.
+		if s.metadataRevision == 0 && (s.name == "" || (s.ID == id && strings.HasPrefix(s.ID, "jl_"))) {
 			s.name = name
 		}
 		if s.cwd == "" || (s.ID == id && strings.HasPrefix(s.ID, "jl_")) {
@@ -534,7 +815,9 @@ func (r *Registry) UpsertExternal(id, name, cwd, backend, resumeID string, lastU
 		// observation roll the active mapping backwards; retain it as history.
 		if s.resumeID == "" {
 			s.resumeID = resumeID
-			s.name = name
+			if s.metadataRevision == 0 {
+				s.name = name
+			}
 			s.cwd = cwd
 			s.backend = backend
 		} else if s.resumeID != resumeID {
@@ -547,7 +830,9 @@ func (r *Registry) UpsertExternal(id, name, cwd, backend, resumeID string, lastU
 			s.mu.Unlock()
 			return s, historyChanged
 		} else {
-			s.name = name
+			if s.metadataRevision == 0 {
+				s.name = name
+			}
 			s.cwd = cwd
 			s.backend = backend
 		}

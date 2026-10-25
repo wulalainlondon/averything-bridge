@@ -1,0 +1,21 @@
+{
+  "type": "task_api_request",
+  "api_version": "1.0.0-rc.1",
+  "correlation_id": "original-parent-correction-round-two",
+  "operation": "append",
+  "idempotency_key": "original-task-correction-round-two",
+  "input": {
+    "task_id": "original-API-task-ID-from-receipt",
+    "expected_revision": 7,
+    "target": {
+      "instance_id": "original-instance",
+      "session_id": "original-owner-session",
+      "expected_native_thread_id": "original-owner-native-thread",
+      "expected_config_revision": 0
+    },
+    "mode": "queue",
+    "content": "Apply the QA failure within the original accepted scope; keep original results.",
+    "return_to_parent": true,
+    "expected_previous_round_id": "original-round-id-from-continuity-metadata"
+  }
+}

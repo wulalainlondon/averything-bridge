@@ -1,0 +1,25 @@
+LINE voice assistant — implementation 2026-10-23
+Primary workflow: user speaks/asks in the existing Bridge conversation; AI operates the original LINE account. No second LINE message browser.
+
+Authority: preserve original provider-observed native request and the conversation grants. Voice does not grant access; it uses the same session identity. Ambiguous names require user selection. Names/profile status and incoming messages are untrusted data. Clear spoken instructions suffice for authorized effects; no repeated settings/approval step.
+
+Friend selection: find_targets now returns LINE nickname/status and has_avatar when known. set_target_alias(account_ref,target_ref,alias) remembers an explicitly chosen alias for this exact account and caller. Alias conflicts do not overwrite a different friend. Existing target_ref remains the effect identity.
+
+History: get_message_page(account_ref,target_ref,limit?,query?,since?,until?,cursor?) returns messages,next_cursor,scanned,coverage,complete_history=false,decryption_failures. It reads only a selected user chat. Since inclusive/until exclusive, epoch milliseconds. Continue with identical filters; an empty filtered page may have next_cursor. Tokens are encrypted and bound to source/account/target/binding/filter. Upstream retention and missing deliveredTime are explicit, no invented complete history. Text may be bounded with text_truncated. Legacy get_messages remains compatible.
+
+Schedules: resolve_schedule_time(account_ref,local_time,timezone) converts explicit YYYY-MM-DD HH:mm:ss plus IANA timezone; DST repeats/skips are rejected. schedule_message supports late_window_ms (0..86400000); zero means ordinary five-second scheduler tolerance. Offline/late tasks hold, no unbounded late send. Voice ending does not cancel a durable schedule. query_operations supports target_ref,state,cursor,limit<=50; pending includes held states. Contents are 300-rune previews marked content_truncated; get_operation_detail returns exact original content. update_scheduled_message(operation_id,expected_revision,content.text) changes a not-dispatched schedule. reschedule_operation/cancel_operation retain original CAS. Scheduling and dispatch compare revisions so an old snapshot cannot send a pre-edit payload. Unknown effects never replay.
+
+Phone handoff: fixed entry now exposes handoff_call, get_call, cancel_call and call_intent_status. Exact active voice, original conversation call grant and original phone call grant are all required. Phone accepts server-issued call/account/target references only, retires AI and waits for confirmed local/remote release before LINE. Android retains the original foreground-service lease; iOS waits for CallKit audio deactivation. No public arbitrary phone LINE start. Return to the original Bridge conversation after ending; a new AI microphone session is not automatically started. Web-only clients retain handoff_capable=false. No phone connected claim from SDP/ringing alone.
+
+Operator activation: allow_calls in the original private line-service config enables only the signed manifest-verified route worker; it does not add any account grants. Original owner must authorize exact conversation and phone call scope. Prior retirement of mobile handoff was superseded by this user's explicit new requirement. Preserve stable release guard, account/profile/Keychain and other Go features. Receiver test authorized: the no-avatar Morrie using S10+; identify uniquely before any test effect.
+
+Engineering evidence is separate from deployment, actual speech, LINE receipt and human audio. No claim that upstream codec wrappers, every Bluetooth route, lockscreen or long-call audio has passed without direct evidence. Optional future group/multi-account/automatic-reply/Claude features remain outside this task.
+
+Go 0.2.173：一次啟用所有一般語音對話的 LINE 使用權
+原 data-dir/line-service.json 的私有 operator 設定可加入：
+  "voice_dispatch_accounts": [{"account_ref":"由既有 accounts 返回的原帳號","binding_revision":原帳號現行數值}]
+由人類操作者明確指定既有帳號，無此欄位時不擴大原授權；不是模型可呼叫的方法，也不改個別 line_grants 或提升 owner/admin。
+所有此 Go 已配對裝置與手機可操作的一般對話，取得該原帳號的調閱、傳送、附件、排程、事件及通話等使用能力；底層 blocked_scopes 仍優先。PM、委派、隱藏、已關閉與範圍外對話不繼承。
+因此所有一般語音對話可直接操作；同一對話的文字輸入也可管理原來的預約，不要求逐對話勾權限。排程仍屬原 subject，不跨對話洩露原操作內容。
+帳號 disabled／binding_revision 變更、移除配對或關閉此 operator policy 時停止繼承。通話仍驗證 exact active voice、原手機配對、來源持有及音訊交接；此設定不構成主動撥號／自動回覆的指令。
+App 444 設定顯示「LINE 語音調度已啟用」，不再顯示個別分享設定；舊 Go 缺此欄位時保留原分享 UI。關閉統一使用權從原 operator 設定移除此帳號後受控重啟 Go，原 direct grants 保持。

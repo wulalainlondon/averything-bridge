@@ -52,8 +52,12 @@ type Options struct {
 
 func DefaultOptions() Options {
 	home, _ := os.UserHomeDir()
+	claudeProjectsDir := strings.TrimSpace(os.Getenv("EVERYTHING_GO_CLAUDE_PROJECTS_DIR"))
+	if claudeProjectsDir == "" {
+		claudeProjectsDir = filepath.Join(home, ".claude", "projects")
+	}
 	return Options{
-		ClaudeProjectsDir:       filepath.Join(home, ".claude", "projects"),
+		ClaudeProjectsDir:       claudeProjectsDir,
 		CodexSessionsDir:        sourcepolicy.CodexSessionsDir(),
 		CodexIgnoreCWDGlobs:     sourcepolicy.CodexIgnoreCWDGlobs(),
 		CodexIgnoreNamePrefixes: sourcepolicy.CodexIgnoreNamePrefixes(),
@@ -67,6 +71,13 @@ func DefaultOptions() Options {
 // then uses fsnotify for low-latency updates. If fsnotify cannot start, it
 // falls back to polling.
 func Watch(ctx context.Context, opts Options, onSession func(NativeSession)) {
+	WatchChanges(ctx, opts, onSession, nil)
+}
+
+// WatchChanges is Watch with a notification that fires only for transcript
+// changes observed after the initial import. This lets downstream indexers
+// wake promptly without treating the startup catalog as thousands of edits.
+func WatchChanges(ctx context.Context, opts Options, onSession func(NativeSession), onTranscriptChange func(string)) {
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = 30 * time.Second
 	}
@@ -78,6 +89,12 @@ func Watch(ctx context.Context, opts Options, onSession func(NativeSession)) {
 	}
 
 	scanRecent(opts, onSession)
+	onChange := func(session NativeSession) {
+		onSession(session)
+		if onTranscriptChange != nil {
+			onTranscriptChange(session.Path)
+		}
+	}
 	if usePolling() {
 		// macOS fsnotify is backed by kqueue, which must hold an open file
 		// descriptor for every file in every watched directory. Watching the
@@ -86,12 +103,12 @@ func Watch(ctx context.Context, opts Options, onSession func(NativeSession)) {
 		// lifetime — the dominant cause of the bridge's FD/RSS bloat. Polling
 		// is stat-only and cheap; ~PollInterval latency is fine for surfacing
 		// externally-created native sessions in the dashboard.
-		poll(ctx, opts, onSession)
+		poll(ctx, opts, onChange)
 		return
 	}
-	if err := watchFS(ctx, opts, onSession); err != nil {
+	if err := watchFS(ctx, opts, onChange); err != nil {
 		log.Printf("[nativewatch] fsnotify unavailable (%v), falling back to polling", err)
-		poll(ctx, opts, onSession)
+		poll(ctx, opts, onChange)
 	}
 }
 
@@ -345,9 +362,12 @@ func parseCodex(path string) (NativeSession, bool) {
 	if title == "" {
 		title = shortID(uid)
 	}
-	last := codexTimestampFromFilename(filepath.Base(path))
+	// A rollout filename records thread creation, not its latest activity. A
+	// long-running Codex thread can be appended for months, so mtime is the only
+	// useful discovery cursor. Filename time is merely a fallback for odd files.
+	last := modUnix(path)
 	if last == 0 {
-		last = modUnix(path)
+		last = codexTimestampFromFilename(filepath.Base(path))
 	}
 	return NativeSession{
 		ID:       "jl_x_" + shortN(uid, 12),

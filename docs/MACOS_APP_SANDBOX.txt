@@ -1,0 +1,55 @@
+macOS App Sandbox backend construction
+
+NewCodexAppSandbox is an opt-in owner API for a dedicated, signed sandbox helper.
+Normal NewCodex construction, daemon mode and normal workspace-write/read-only
+policies remain unchanged. A session payload cannot enable this owner profile.
+
+Owner responsibilities:
+- Launch the helper from an appropriately signed App Sandbox host. The helper
+  must have app-sandbox + inherit, without get-task-allow. On other platforms or
+  CGO-disabled builds this construction returns an unsupported error.
+- Obtain a workspace using macOS user-selection APIs and transfer its scoped
+  access to the helper before construction. Workspace must be an absolute,
+  accessible directory. The instance pins its canonical workspace. Its CLI uses
+  project_root_markers=[] so non-Git directories do not search ungranted parents
+  for config/AGENTS files. The private server's initial cwd is also explicitly
+  pinned to that workspace, independent of the launcher cwd.
+- Supply a separate container runtime directory containing no auth.json.
+- Supply ChatGPT tokens from an application-owned private broker. The callback
+  must honor context deadlines and support token refresh. Tokens are sent only
+  to app-server's external-token RPC, not flags, child environment or files.
+  Refresh cannot change account within this backend instance.
+- Explicitly choose the session mode "app-sandbox". Read-only and other sandbox
+  overrides are rejected rather than silently losing their constraints.
+- Close the private server using CloseAppSandbox when the owner shuts down.
+  The method refuses ordinary/shared-daemon backends.
+
+This mode uses Codex's externalSandbox policy with networkAccess="enabled".
+macOS App Sandbox enforces file capabilities and the host's network-client
+capability. This is a distinct policy: it does not recreate Codex's additional
+workspace-write network restriction or a read-only job boundary. App-container
+data is also within the OS sandbox; do not place broker secrets in that container.
+Strict per-command network rules or isolation between multiple workspaces/tenants
+need an additional design and validation. The current prototype covers one
+selected workspace, file denial controls, ephemeral auth and cold resume.
+
+The signed-process entitlement guard is a necessary construction condition.
+Shipping acceptance must also examine the host's complete entitlements and
+exercise positive/negative capability controls. The prototype is not a Mac App
+Store review, a redistribution license, or a replacement for a production login UI.
+The test-only FIFO feeder is not part of this product API or a shipping login flow.
+
+History sources:
+- CODEX_HOME / EVERYTHING_GO_CODEX_SESSIONS_DIR retain their existing precedence.
+- CLAUDE_CONFIG_DIR now selects both Claude CLI configuration and its Go history
+  source. Explicit overrides are normalized consistently; the unset/default
+  credential path is preserved.
+- Inaccessible history is history_permission_denied, not an empty snapshot.
+  Client errors do not erase healthy providers or become cached failure results.
+
+Official API reference:
+https://learn.chatgpt.com/docs/app-server
+https://developer.apple.com/documentation/xcode/embedding-a-helper-tool-in-a-sandboxed-app
+
+Project-root API reference:
+https://learn.chatgpt.com/docs/config-file/config-advanced#project-root-detection

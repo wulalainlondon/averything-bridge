@@ -89,6 +89,9 @@ func (h *Hub) handleWebRTCOffer(ctx context.Context, c *Client, offer clientprot
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		log.Printf("[webrtc] datachannel offered: label=%s", dc.Label())
 		dcc := newDCConn(pc, dc)
+		// The promoted DataChannel still downloads over the signaling socket's
+		// reachable HTTP origin (often a public tunnel rather than a LAN IP).
+		dcc.httpOrigin = c.downloadOrigin
 		dc.OnOpen(func() {
 			log.Printf("[webrtc] datachannel open — promoting to bridge client")
 			peer.promoted.Store(true)
@@ -179,11 +182,12 @@ func (h *Hub) cleanupWebRTC(c *Client) {
 // Read drains. The consumer (serveConn) starts reading the instant the channel
 // opens, so the buffer only absorbs the brief window before that.
 type dcConn struct {
-	pc    *webrtc.PeerConnection
-	dc    *webrtc.DataChannel
-	inbox chan []byte
-	done  chan struct{}
-	once  sync.Once
+	httpOrigin string
+	pc         *webrtc.PeerConnection
+	dc         *webrtc.DataChannel
+	inbox      chan []byte
+	done       chan struct{}
+	once       sync.Once
 }
 
 func newDCConn(pc *webrtc.PeerConnection, dc *webrtc.DataChannel) *dcConn {
@@ -234,3 +238,5 @@ func (d *dcConn) Close(_ string) {
 }
 
 func (d *dcConn) Kind() string { return "webrtc" }
+
+func (d *dcConn) HTTPOrigin() string { return d.httpOrigin }

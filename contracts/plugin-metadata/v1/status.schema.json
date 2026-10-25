@@ -1,0 +1,168 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "schema",
+    "host",
+    "process_loaded",
+    "discovery",
+    "contracts",
+    "supported_mode"
+  ],
+  "properties": {
+    "type": {
+      "const": "plugin_metadata_status"
+    },
+    "schema": {
+      "const": "plugin-metadata-status.v1"
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "installed",
+        "enabled",
+        "loaded",
+        "discovery"
+      ],
+      "properties": {
+        "installed": {
+          "const": "unknown"
+        },
+        "enabled": {
+          "const": "unknown"
+        },
+        "loaded": {
+          "const": "unknown"
+        },
+        "discovery": {
+          "const": "unknown"
+        }
+      }
+    },
+    "process_loaded": {
+      "const": true
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "http",
+        "socket"
+      ],
+      "properties": {
+        "scope": {
+          "const": "authenticated_hub_metadata_only"
+        },
+        "http": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "socket": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_api",
+        "observation"
+      ],
+      "properties": {
+        "task_api": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "sha256"
+          ],
+          "properties": {
+            "version": {
+              "const": "1.0.0-rc.1"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        },
+        "observation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "sha256"
+          ],
+          "properties": {
+            "version": {
+              "const": "internal-agent-observation.v1"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "supported_mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_metadata",
+        "coverage",
+        "root_inventory_callback",
+        "canonical_qa",
+        "report_navigation",
+        "business_auth"
+      ],
+      "properties": {
+        "provider_metadata": {
+          "const": "existing_codex_daemon_only"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "partial_provider_child_cache",
+              "partial_selected_native_root"
+            ]
+          },
+          "uniqueItems": true,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "root_inventory_callback": {
+          "const": "unsupported"
+        },
+        "canonical_qa": {
+          "const": "unsupported_original_relation_required"
+        },
+        "report_navigation": {
+          "const": "unsupported_original_owner_required"
+        },
+        "business_auth": {
+          "const": "original_permissions_preserved"
+        }
+      }
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bridge:plugin-metadata-status:v1",
+  "description": "Original authenticated Hub process metadata only; host axes remain unknown without separate host receipts. Independent from TaskAPI and observation family."
+}

@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bridge:task-api:1.0.0-rc.5",
+  "description": "Original-task interaction extension; rc.1-rc.4 remain unchanged.",
+  "$defs": {
+    "Input": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "capabilities",
+            "ask_parent",
+            "list",
+            "get",
+            "wait",
+            "answer",
+            "escalate",
+            "ack",
+            "receipt"
+          ]
+        },
+        "interaction_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "task_clarification",
+            "human_decision"
+          ]
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "answer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000
+        },
+        "ack_token": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "wait_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30000
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "original_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 160
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "ask_parent"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "question",
+              "kind",
+              "blocking"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "enum": [
+                  "get",
+                  "answer",
+                  "escalate",
+                  "ack"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "interaction_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "answer"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "expected_revision",
+              "answer"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "ack"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "ack_token"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "receipt"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "interaction_id",
+              "original_key"
+            ]
+          }
+        }
+      ]
+    },
+    "Request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "task_api_request"
+        },
+        "api_version": {
+          "const": "1.0.0-rc.5"
+        },
+        "correlation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "operation": {
+          "const": "interactions"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "input": {
+          "$ref": "#/$defs/Input"
+        }
+      },
+      "required": [
+        "type",
+        "api_version",
+        "correlation_id",
+        "operation",
+        "input"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "input": {
+                "properties": {
+                  "action": {
+                    "enum": [
+                      "ask_parent",
+                      "answer",
+                      "escalate"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "idempotency_key"
+            ]
+          }
+        }
+      ]
+    },
+    "Response": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "task_api_response"
+        },
+        "api_version": {
+          "const": "1.0.0-rc.5"
+        },
+        "request_api_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "correlation_id": {
+          "type": "string"
+        },
+        "operation": {
+          "const": "interactions"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": "object"
+        },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code",
+            "message",
+            "acceptance",
+            "retryable",
+            "recommended_action"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "acceptance": {
+              "type": "string"
+            },
+            "recommended_action": {
+              "type": "string"
+            },
+            "receipt_id": {
+              "type": "string"
+            },
+            "capability": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "required": [
+        "type",
+        "api_version",
+        "correlation_id",
+        "operation",
+        "ok"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "result"
+            ],
+            "not": {
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "error"
+            ],
+            "not": {
+              "required": [
+                "result"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$ref": "#/$defs/Request"
+}

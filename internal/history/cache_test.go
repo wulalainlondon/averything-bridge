@@ -47,6 +47,26 @@ func TestHistoryCacheSQLitePersistsAcrossInstances(t *testing.T) {
 	}
 }
 
+func TestHistoryTailStatePersistsAcrossInstances(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.sqlite")
+	state := TailState{Path: "/tmp/rollout.jsonl", Size: 123, MtimeNS: 456, HeadSHA256: "head", LineCount: 12, EndedWithNewline: true}
+	c1, err := NewSQLiteCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1.SaveTailState(state)
+	_ = c1.Close()
+	c2, err := NewSQLiteCache(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	got, ok := c2.LoadTailState(state.Path)
+	if !ok || got != state {
+		t.Fatalf("tail state did not survive restart ok=%v got=%+v want=%+v", ok, got, state)
+	}
+}
+
 func TestHistoryCacheEvictsLRUOverByteBudget(t *testing.T) {
 	c := NewMemoryCache()
 	c.maxBytes = 4096 // tiny budget so a few entries force eviction

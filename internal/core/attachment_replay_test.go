@@ -188,14 +188,9 @@ func TestTextAttachmentDoneOrdering(t *testing.T) {
 	h.Emit(protocol.NewTextChunk("s1", "r1", "created "+path))
 	h.Emit(protocol.NewDone("s1", "r1"))
 
-	first := <-phone.send
-	second := <-phone.send
-	third := <-phone.send
-	var a, b, c map[string]any
-	_ = json.Unmarshal(first, &a)
-	_ = json.Unmarshal(second, &b)
-	_ = json.Unmarshal(third, &c)
-	if a["type"] != "text_chunk" || b["type"] != "offline_replay_batch" || c["type"] != "done" {
-		t.Fatalf("ordering=%v, %v, %v", a["type"], b["type"], c["type"])
-	}
+	// Authoritative runtime snapshots may be interleaved with content events;
+	// they must not change the content/attachment/terminal order itself.
+	_ = waitForType(t, phone, "text_chunk")
+	_ = waitForType(t, phone, "offline_replay_batch")
+	_ = waitForType(t, phone, "done")
 }

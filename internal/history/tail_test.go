@@ -1,6 +1,9 @@
 package history
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -63,4 +66,57 @@ func TestStreamTailLinesHandlesHugeSingleLine(t *testing.T) {
 		t.Fatalf("huge single line not retained intact: n=%d", len(lines))
 	}
 	_ = truncated
+}
+
+func TestReadTailFileLinesPreservesAbsoluteNumbersAcrossAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	var initial strings.Builder
+	for i := 1; i <= 100; i++ {
+		fmt.Fprintf(&initial, "line-%03d-payload\n", i)
+	}
+	if err := os.WriteFile(path, []byte(initial.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lines, truncated, state, err := ReadTailFileLines(path, 160, TailState{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || state.LineCount != 100 || len(lines) == 0 || lines[len(lines)-1].LineNo != 100 {
+		t.Fatalf("initial tail mismatch truncated=%v state=%+v lines=%+v", truncated, state, lines)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.WriteString("line-101-payload\nline-102-payload\nline-103-payload\n")
+	_ = f.Close()
+	lines, truncated, next, err := ReadTailFileLines(path, 160, state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || next.LineCount != 103 || len(lines) == 0 || lines[len(lines)-1].LineNo != 103 {
+		t.Fatalf("appended tail mismatch truncated=%v state=%+v lines=%+v", truncated, next, lines)
+	}
+}
+
+func TestReadTailFileLinesContinuesIncompleteLastLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte("one\ntwo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, state, err := ReadTailFileLines(path, 1024, TailState{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	_, _ = f.WriteString("-continued\nthree")
+	_ = f.Close()
+	lines, _, next, err := ReadTailFileLines(path, 1024, state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.LineCount != 3 || len(lines) != 3 || lines[1].LineNo != 2 || string(lines[1].Data) != "two-continued" || lines[2].LineNo != 3 {
+		t.Fatalf("incomplete append line accounting failed: state=%+v lines=%+v", next, lines)
+	}
 }

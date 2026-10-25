@@ -64,33 +64,13 @@ func TestAckDeletesWhenAllTargetsAck(t *testing.T) {
 	}
 }
 
-func TestPushOversizeUsesCurrentURLAndSurvivesReload(t *testing.T) {
+func TestPushOversizeRejected(t *testing.T) {
 	dir := t.TempDir()
-	src := filepath.Join(dir, "big.bin")
-	f, err := os.Create(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(inlineMaxBytes + 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
+	big := make([]byte, inlineMaxBytes+1)
+	src := writeTemp(t, dir, "big.bin", big)
 	s := New(dir)
-	s.SetURLBuilder(func(name string) string { return "https://old.example/media/" + filepath.Base(name) })
-	item, err := s.Push(src, "sender", []string{"phone"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if item.Data != "" || item.URL != "https://old.example/media/big.bin" {
-		t.Fatalf("item = %+v", item)
-	}
-	s2 := New(dir)
-	s2.SetURLBuilder(func(name string) string { return "https://new.example/media/" + filepath.Base(name) })
-	pending := s2.Pending("phone")
-	if len(pending) != 1 || pending[0].URL != "https://new.example/media/big.bin" {
-		t.Fatalf("pending = %+v", pending)
+	if _, err := s.Push(src, "sender", nil); err == nil {
+		t.Fatal("oversize file must be rejected (no Storage fallback in Go)")
 	}
 }
 

@@ -3,6 +3,7 @@ package governance
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +27,13 @@ type PermissionManager struct {
 
 	mu        sync.Mutex
 	waiters   map[string]chan bool
+	details   map[string]permissionDetails
 	requester map[string]string // request_id -> requester device_id (binds the answer)
+}
+
+type permissionDetails struct {
+	sessionID, action string
+	expires           time.Time
 }
 
 // NewPermissionManager builds a manager. emit broadcasts events to all clients.
@@ -38,7 +45,7 @@ func NewPermissionManager(emit func(any), mode string) *PermissionManager {
 	}
 	return &PermissionManager{
 		emit: emit, mode: mode, ttl: 60 * time.Second,
-		waiters: map[string]chan bool{}, requester: map[string]string{},
+		waiters: map[string]chan bool{}, requester: map[string]string{}, details: map[string]permissionDetails{},
 	}
 }
 
@@ -59,50 +66,62 @@ func (m *PermissionManager) Request(deviceID, action, title, justification, prev
 	}
 	rid := "perm_" + permRandHex(12)
 	ch := make(chan bool, 1)
-	expires := time.Now().Add(m.ttl).UnixMilli()
+	deadline := time.Now().Add(m.ttl)
+	expires := deadline.UnixMilli()
 
 	m.mu.Lock()
 	m.waiters[rid] = ch
 	m.requester[rid] = deviceID
+	m.details[rid] = permissionDetails{sessionID, action, deadline}
 	m.mu.Unlock()
 
 	m.emit(protocol.NewPermissionRequest(rid, sessionID, action, title, justification, preview, risk, expires))
 
-	var approved bool
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
-	case approved = <-ch:
-	case <-time.After(m.ttl):
-		approved = false
-		m.emit(protocol.NewPermissionResult(rid, sessionID, action, "expired", ""))
+	case approved := <-ch:
+		return approved
+	case <-timer.C:
+		// If Resolve won first, read its decision; otherwise timeout wins the same CAS.
+		m.finish(rid, "expired", "", true)
+		return <-ch
 	}
-
-	m.mu.Lock()
-	delete(m.waiters, rid)
-	delete(m.requester, rid)
-	m.mu.Unlock()
-	return approved
 }
 
-// Resolve applies the user's decision. The responder device must match the
-// requester (a different connected client cannot approve someone's high-risk op).
-func (m *PermissionManager) Resolve(requestID, decision, responderDeviceID string) {
+// Resolve returns command errors only to the responder. It never emits a false
+// terminal result for a gate that is still waiting for its authenticated owner.
+func (m *PermissionManager) Resolve(requestID, decision, responderDeviceID string) error {
+	if decision != "approve" && decision != "deny" {
+		return errors.New("invalid permission decision")
+	}
+	return m.finish(requestID, decision, responderDeviceID, false)
+}
+
+func (m *PermissionManager) finish(requestID, decision, responderDeviceID string, timeout bool) error {
 	m.mu.Lock()
 	ch := m.waiters[requestID]
-	requester := m.requester[requestID]
-	m.mu.Unlock()
 	if ch == nil {
-		return // unknown or already resolved/expired
+		m.mu.Unlock()
+		return errors.New("permission no longer pending")
 	}
-	if responderDeviceID != "" && requester != "" && responderDeviceID != requester {
-		m.emit(protocol.NewPermissionResult(requestID, "", "", "denied", "response device mismatch"))
-		return
+	if !timeout && m.requester[requestID] != "" && responderDeviceID != m.requester[requestID] {
+		m.mu.Unlock()
+		return errors.New("permission response device mismatch")
 	}
-	approved := decision == "approve"
-	select {
-	case ch <- approved:
-	default:
+	detail := m.details[requestID]
+	if !detail.expires.IsZero() && !time.Now().Before(detail.expires) {
+		decision = "expired"
 	}
-	m.emit(protocol.NewPermissionResult(requestID, "", "", decision, ""))
+	delete(m.waiters, requestID)
+	delete(m.requester, requestID)
+	delete(m.details, requestID)
+	m.mu.Unlock()
+	// Publish the actual single winner before allowing the protected operation to
+	// continue. A timeout losing the CAS waits on this same channel.
+	m.emit(protocol.NewPermissionResult(requestID, detail.sessionID, detail.action, decision, ""))
+	ch <- decision == "approve"
+	return nil
 }
 
 func permRandHex(n int) string {

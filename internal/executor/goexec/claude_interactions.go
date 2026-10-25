@@ -1,6 +1,7 @@
 package goexec
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -59,6 +60,7 @@ func (c *Claude) registerMCPInteraction(sessionID string, input json.RawMessage)
 	c.pending[payload.RequestID] = &pendingInteraction{payload: payload, sessionID: sessionID, resultCh: ch}
 	c.interMu.Unlock()
 	c.sink.Emit(backend.NewUserInputRequest(payload))
+	c.observeDelegatedQuestion(sessionID, nil, payload)
 	log.Printf("[%s] ask_user MCP → user_input_request %s (%d question(s))", sessionID, payload.RequestID, len(payload.Questions))
 	return payload, ch
 }
@@ -86,6 +88,7 @@ func (c *Claude) RegisterUserInputRequest(s *session.Session, toolUseID, agent s
 	c.interMu.Unlock()
 
 	c.sink.Emit(backend.NewUserInputRequest(payload))
+	c.observeDelegatedQuestion(s.ID, s, payload)
 	log.Printf("[%s] AskUserQuestion → user_input_request %s (%d question(s))", s.ID, payload.RequestID, len(questions))
 	return doneCh
 }
@@ -447,4 +450,29 @@ func randHex(n int) string {
 	b := make([]byte, (n+1)/2)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)[:n]
+}
+
+func (c *Claude) observeDelegatedQuestion(id string, s *session.Session, payload backend.UserInputPayload) {
+	observer, ok := c.taskProvider.(backend.TaskQuestionObserver)
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	p := c.procs[id]
+	c.mu.Unlock()
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	request := p.reqID
+	p.mu.Unlock()
+	if s == nil && p.taskLease != nil {
+		p.taskLease.mu.Lock()
+		s = p.taskLease.s
+		p.taskLease.mu.Unlock()
+	}
+	if s == nil || request == "" || s.ActiveQueuedID() != request {
+		return
+	}
+	observer.ObserveTaskQuestion(context.Background(), backend.TaskQuestionEvidence{Session: s, RequestID: request, ThreadID: s.ResumeID(), CallID: payload.ToolUseID, Payload: payload})
 }

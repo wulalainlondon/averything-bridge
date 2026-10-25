@@ -1,10 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"everything-go/internal/inbox"
 )
@@ -44,14 +48,104 @@ func TestPushFileBroadcastAndAck(t *testing.T) {
 	if fpA["file_id"] != fileID {
 		t.Fatal("phoneA file_push file_id mismatch")
 	}
-	if fpA["data"] == nil || fpA["data"].(string) == "" {
-		t.Fatal("file_push must carry inline base64 data")
+	if fpA["data"] != nil || !strings.Contains(fpA["url"].(string), inbox.DownloadPrefix) {
+		t.Fatal("file_push must carry a download URL without inline file content")
 	}
 
 	// phoneA is the only target (sender excluded) → its ack drains the entry.
 	h.handleFilePushAck(fileID, "phoneA")
 	if p := h.inbox.Pending("phoneA"); len(p) != 0 {
 		t.Fatalf("entry should be gone after the sole target acked, got %d", len(p))
+	}
+}
+
+// Regression: four 9 MB APKs used to become one 46 MiB inbox_list, exceeding
+// Swift's 16 MiB receive limit even though each individual push fit that limit.
+func TestGetInboxLargeLegacyFilesStayMetadataOnly(t *testing.T) {
+	h, _ := newTestHub(t)
+	dir := t.TempDir()
+	h.SetInbox(inbox.New(dir))
+	src := filepath.Join(dir, "build.apk")
+	if err := os.WriteFile(src, bytes.Repeat([]byte{0x42}, 9*1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := h.inbox.Push(src, "sender", []string{"phoneA"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	phone := newDeviceClient(h, "phoneA", 1024)
+	h.addClient(phone)
+	h.registerLatest(phone)
+	phone.downloadOrigin = "https://bridge.example.test"
+	h.sendPendingPushes(phone)
+	for i := 0; i < 4; i++ {
+		raw := <-phone.send
+		if len(raw) > 2048 || bytes.Contains(raw, []byte(`"data":`)) {
+			t.Fatal("hello replay still includes file body")
+		}
+	}
+	route(h, phone, `{"type":"get_inbox"}`)
+	raw := <-phone.send
+	if len(raw) > 8192 {
+		t.Fatalf("inbox metadata too large: %d", len(raw))
+	}
+	var response struct {
+		Items []struct {
+			URL    string
+			Data   string
+			FileID string
+		}
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 4 {
+		t.Fatalf("lost legacy files: %d", len(response.Items))
+	}
+	for _, item := range response.Items {
+		if item.Data != "" || !strings.HasPrefix(item.URL, "https://bridge.example.test"+inbox.DownloadPrefix) {
+			t.Fatal("invalid wire item")
+		}
+	}
+	if len(h.inbox.Pending("phoneA")) != 4 {
+		t.Fatal("sync changed receipt state")
+	}
+	if len(h.inbox.Pending("other-device")) != 0 {
+		t.Fatal("sync changed targeting")
+	}
+}
+
+func TestGetInboxMetadataBatchesRemainBounded(t *testing.T) {
+	h, _ := newTestHub(t)
+	dir := t.TempDir()
+	entries := map[string]inbox.Entry{}
+	for i := 0; i < 2000; i++ {
+		id := fmt.Sprint(i)
+		entries[id] = inbox.Entry{FileID: id, Filename: strings.Repeat("f", 200), URL: "https://storage.example.test/download", PushedAt: float64(time.Now().Unix())}
+	}
+	data, _ := json.Marshal(entries)
+	if err := os.WriteFile(filepath.Join(dir, "inbox.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.SetInbox(inbox.New(dir))
+	phone := newDeviceClient(h, "phoneA", 1024)
+	h.sendInbox(phone)
+	count := 0
+	batches := len(phone.send)
+	for len(phone.send) > 0 {
+		raw := <-phone.send
+		if len(raw) > inboxListMaxBytes {
+			t.Fatalf("oversized metadata batch: %d", len(raw))
+		}
+		var response struct{ Items []json.RawMessage }
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		count += len(response.Items)
+	}
+	if count != 2000 || batches < 2 {
+		t.Fatalf("files=%d batches=%d", count, batches)
 	}
 }
 

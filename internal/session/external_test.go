@@ -1,6 +1,9 @@
 package session
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestRegistryUpsertExternalCreatesAndUpdates(t *testing.T) {
 	r := NewRegistry()
@@ -46,5 +49,32 @@ func TestRegistryUpsertExternalDedupesBridgeSessionByResumeID(t *testing.T) {
 	snap := bridge.Snapshot()
 	if snap.Name != "Live" || snap.Cwd != "/work" || int64(snap.LastActivity) != last {
 		t.Fatalf("bridge-owned fields should be preserved while activity updates: %+v", snap)
+	}
+}
+
+func TestNativeWatcherCannotOverwriteRevisionedSessionName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	r := NewRegistry()
+	r.AttachStore(NewStore(path))
+	s, _ := r.UpsertExternal("jl_x_thread", "Transcript title", "/work", "codex", "thread-1", 100)
+	expected := uint64(0)
+	if _, changed, err := r.RenameAndPersist(s.ID, "User title", "device-a", "m1", &expected); err != nil || !changed {
+		t.Fatalf("authoritative rename failed changed=%v err=%v", changed, err)
+	}
+
+	_, changed := r.UpsertExternal("jl_x_thread", "Transcript title", "/work", "codex", "thread-1", 200)
+	if changed {
+		t.Fatal("native watcher reported a structural change after only seeing a stale title")
+	}
+	if got := s.Snapshot(); got.Name != "User title" || got.MetadataRevision != 1 {
+		t.Fatalf("native watcher overwrote authoritative metadata: %+v", got)
+	}
+
+	r.Persist()
+	restarted := NewRegistry()
+	restarted.AttachStore(NewStore(path))
+	got, _ := restarted.Get("jl_x_thread")
+	if snap := got.Snapshot(); snap.Name != "User title" || snap.MetadataRevision != 1 {
+		t.Fatalf("authoritative watcher protection did not survive restart: %+v", snap)
 	}
 }

@@ -1,0 +1,28 @@
+{
+  "schema_version": 3,
+  "timestamps": [
+    { "name": "epoch", "wire_unix_ms": 0, "iso": "1970-01-01T00:00:00.000Z" },
+    { "name": "taipei_boundary", "wire_unix_ms": 1788280200123, "iso": "2026-09-01T16:30:00.123Z" },
+    { "name": "pre_epoch", "wire_unix_ms": -1, "iso": "1969-12-31T23:59:59.999Z" }
+  ],
+  "endpoints": [
+    { "input": "ws://100.64.1.2:8766/", "canonical": "ws://100.64.1.2:8766" },
+    { "input": "WSS://Example.COM:443/socket/", "canonical": "wss://example.com/socket" },
+    { "input": "https://Example.COM/media/", "canonical": "https://example.com/media" },
+    { "input": "unix:///tmp/averything app.sock", "canonical": "unix:///tmp/averything%20app.sock" }
+  ],
+  "paths": [
+    { "input": "/Users/wulala/Desktop/職人 日誌.png", "canonical": "/Users/wulala/Desktop/職人 日誌.png", "allowed": true },
+    { "input": "/tmp/link/../real/file.png", "canonical": "/tmp/real/file.png", "allowed": true },
+    { "input": "../../etc/passwd", "canonical": "", "allowed": false },
+    { "input": "C:\\Users\\Wulala\\Bridge Drop\\圖.png", "canonical": "C:/Users/Wulala/Bridge Drop/圖.png", "allowed": true },
+    { "input": "/missing/圖片.png", "canonical": "/missing/圖片.png", "allowed": true, "missing_state": "missing_media" }
+  ],
+  "previews": [
+    { "phase": "running", "user": "修正登入", "assistant": "舊答案", "terminal_assistant": "", "expected_role": "user", "expected": "修正登入" },
+    { "phase": "completed", "user": "修正登入", "assistant": "完成並通過測試", "terminal_assistant": "完成並通過測試", "expected_role": "assistant", "expected": "完成並通過測試" },
+    { "phase": "failed", "user": "部署", "assistant": "", "terminal_assistant": "", "expected_role": "user", "expected": "部署" },
+    { "phase": "waiting", "user": "建立專案", "assistant": "請選擇目錄", "terminal_assistant": "", "expected_role": "assistant", "expected": "請選擇目錄" },
+    { "phase": "interrupted", "user": "長任務", "assistant": "已完成第一步", "terminal_assistant": "", "expected_role": "assistant", "expected": "已完成第一步" }
+  ]
+}

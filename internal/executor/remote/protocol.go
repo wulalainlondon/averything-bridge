@@ -168,6 +168,7 @@ func usageReportFromWire(rep *protocol.UsageReport) *backend.UsageReport {
 		usageWindowFromWire(rep.SevenDay),
 		usageWindowFromWire(rep.SevenDaySonnet),
 	)
+	out.BackendID, out.Source, out.CollectedAt = rep.BackendID, rep.Source, rep.CollectedAt
 	return &out
 }
 
@@ -175,5 +176,5 @@ func usageWindowFromWire(w *protocol.UsageWindow) *backend.UsageWindow {
 	if w == nil {
 		return nil
 	}
-	return &backend.UsageWindow{Utilization: w.Utilization, ResetsAt: w.ResetsAt}
+	return &backend.UsageWindow{Utilization: w.Utilization, ResetsAt: w.ResetsAt, Unit: w.Unit, Label: w.Label, DurationMinutes: w.DurationMinutes}
 }

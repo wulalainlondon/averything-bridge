@@ -1,0 +1,326 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Internal agent observation v1",
+  "description": "Read-only visibility event. Sole wire/projection owner: visibility backend. Schema validation is not authentication, current binding, QA proof or a canonical Task SDK. Timestamps may be empty only for explicitly unavailable/unobserved evidence; freshness/ancestry/current owner checks are semantic port requirements.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "schema",
+    "authority",
+    "source_epoch",
+    "session_id",
+    "root_actor_id",
+    "observed_at",
+    "availability",
+    "children"
+  ],
+  "properties": {
+    "type": {
+      "const": "internal_agent_observation"
+    },
+    "schema": {
+      "const": "internal-agent-observation.v1"
+    },
+    "authority": {
+      "type": "string"
+    },
+    "source_epoch": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "root_actor_id": {
+      "type": "string"
+    },
+    "observed_at": {
+      "type": "string"
+    },
+    "availability": {
+      "enum": [
+        "live",
+        "unsupported",
+        "unknownstale"
+      ]
+    },
+    "children": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/child"
+      }
+    },
+    "root_state": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "coverage": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "probe_error": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "attempted_at": {
+      "type": "string",
+      "maxLength": 160
+    }
+  },
+  "$defs": {
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parent_task_id",
+        "child_task_id",
+        "task_group_id",
+        "result_version_id",
+        "source_hash",
+        "review_scope",
+        "definition_revision"
+      ],
+      "properties": {
+        "parent_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "child_task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "task_group_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result_version_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "review_scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "definition_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "command_receipt_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "task_id",
+        "result_version_id",
+        "source_hash",
+        "report_id",
+        "window_id",
+        "reading_anchor"
+      ],
+      "properties": {
+        "availability": {
+          "enum": [
+            "available",
+            "unavailable",
+            "unverified"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "result_version_id": {
+          "type": "string"
+        },
+        "source_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "report_id": {
+          "type": "string"
+        },
+        "window_id": {
+          "type": "string"
+        },
+        "reading_anchor": {
+          "type": "string"
+        }
+      }
+    },
+    "axes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution",
+        "native_final",
+        "review",
+        "delivery",
+        "cancellation",
+        "deployment"
+      ],
+      "properties": {
+        "execution": {
+          "enum": [
+            "active",
+            "idle",
+            "queued",
+            "unknown"
+          ]
+        },
+        "native_final": {
+          "enum": [
+            "sealed",
+            "unverified",
+            "unknown"
+          ]
+        },
+        "review": {
+          "enum": [
+            "pass",
+            "needsfix",
+            "inprogress",
+            "unverified",
+            "unknown"
+          ]
+        },
+        "delivery": {
+          "enum": [
+            "verified",
+            "unverified",
+            "unknown"
+          ]
+        },
+        "cancellation": {
+          "enum": [
+            "requested",
+            "confirmed",
+            "unknown"
+          ]
+        },
+        "deployment": {
+          "enum": [
+            "verified",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "child": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actor_id",
+        "parent_actor_id",
+        "actor_kind",
+        "role",
+        "title",
+        "stage",
+        "state",
+        "reported_state",
+        "source",
+        "last_observed",
+        "association",
+        "axes"
+      ],
+      "properties": {
+        "actor_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_actor_id": {
+          "type": "string"
+        },
+        "actor_kind": {
+          "enum": [
+            "internal_qa",
+            "internal_implementation"
+          ]
+        },
+        "role": {
+          "enum": [
+            "implementation",
+            "review"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "active",
+            "done",
+            "needsfix",
+            "queued",
+            "waiting",
+            "unverified",
+            "unknownstale"
+          ]
+        },
+        "reported_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "enum": [
+            "native_probe",
+            "root_tool_observation",
+            "none"
+          ]
+        },
+        "last_observed": {
+          "type": "string"
+        },
+        "association": {
+          "enum": [
+            "bound",
+            "unmatched"
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "report": {
+          "$ref": "#/$defs/report"
+        },
+        "axes": {
+          "$ref": "#/$defs/axes"
+        },
+        "native_id_status": {
+          "enum": [
+            "known",
+            "unavailable"
+          ]
+        },
+        "relation_proof": {
+          "enum": [
+            "native_ancestry",
+            "observed_child"
+          ]
+        },
+        "probe_error": {
+          "enum": [
+            "timeout",
+            "cancelled",
+            "unsupported",
+            "probe_failed",
+            "offline"
+          ]
+        }
+      }
+    }
+  }
+}

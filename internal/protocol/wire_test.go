@@ -3,6 +3,8 @@ package protocol
 import (
 	"encoding/json"
 	"testing"
+
+	"everything-go/internal/workitems"
 )
 
 func TestParseInboundBasicEnvelope(t *testing.T) {
@@ -140,6 +142,15 @@ func TestSessionsListNeverNull(t *testing.T) {
 	_, raw := marshalKeys(t, NewSessionsList(nil))
 	if !contains(raw, `"sessions":[]`) {
 		t.Fatalf("empty sessions should be []; got %s", raw)
+	}
+}
+
+func TestWorkSnapshotNeverUsesNullCollections(t *testing.T) {
+	_, raw := marshalKeys(t, NewWorkSnapshot(workitems.DeviceSnapshot{}))
+	for _, want := range []string{`"projects":[]`, `"items":[]`, `"session_links":[]`, `"dependencies":[]`, `"comments":[]`} {
+		if !contains(raw, want) {
+			t.Fatalf("work snapshot missing %s: %s", want, raw)
+		}
 	}
 }
 

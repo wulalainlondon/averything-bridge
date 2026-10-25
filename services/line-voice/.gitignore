@@ -1,0 +1,6 @@
+node_modules/
+keychain-helper
+*.env
+private/
+*.enc
+run.lock

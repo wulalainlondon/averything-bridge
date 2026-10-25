@@ -1,6 +1,10 @@
 #!/bin/bash
 set -uo pipefail
 
+# Deployment invariant: Morrie is an Intel Mac (x86_64 / GOARCH=amd64).
+# A correctly signed arm64 app still fails here with "Bad CPU type"; always
+# verify the packaged executable architecture before replacing this runtime.
+
 RUNTIME_DIR="/Users/morrie/.everything-go-runtime-9453"
 BIN="$RUNTIME_DIR/Everything Go.app/Contents/MacOS/everything-go"
 PORT="${EVERYTHING_GO_PORT:-9453}"
@@ -13,6 +17,8 @@ export PATH="/Users/morrie/.bun/bin:/usr/local/bin:/opt/homebrew/bin:/Users/morr
 export EVERYTHING_GO_CODEX_SESSIONS_DIR="/Users/morrie/.codex/sessions"
 export EVERYTHING_GO_CODEX_IGNORE_CWD_GLOBS="/private/tmp/**,/tmp/**"
 export EVERYTHING_GO_CODEX_IGNORE_NAME_PREFIXES="<recommended_plugins>,[bridge-eval]"
+export EVERYTHING_GO_CODEX_APP_SERVER_MODE="daemon"
+export EVERYTHING_GO_CODEX_APP_SERVER_SOCKET="/Users/morrie/.codex/app-server-control/app-server-control.sock"
 
 log() { echo "[everything-go-9453-launch] $*"; }
 

@@ -14,15 +14,17 @@ import (
 var ErrUnsupportedGoal = errors.New("goal mode is only supported for Codex sessions")
 var (
 	ErrUnsupportedSteer   = errors.New("same-turn steering is not supported by this backend")
+	ErrSteerRejected      = errors.New("steering was rejected before applying input")
 	ErrNoActiveTurn       = errors.New("there is no active turn to steer")
 	ErrThreadActiveWriter = errors.New("codex thread is controlled by another client")
+	// Returned only before any native input RPC has been attempted.
+	ErrNativeSubmissionBusy = errors.New("native_submission_busy")
 )
 
 const (
 	Claude   = "claude"
 	Codex    = "codex"
 	Ollama   = "ollama"
-	Gemini   = "gemini"
 	RemoteWS = "remote-ws"
 )
 
@@ -97,11 +99,12 @@ type ImageAttachment struct {
 // FileAttachment is a file attached to a user message. Content is the
 // adapter-normalized payload used by the backend implementation.
 type FileAttachment struct {
-	Name       string
-	Content    string
-	MediaType  string
-	RemotePath string
-	SizeBytes  int64
+	AttachmentID string
+	Name         string
+	Content      string
+	MediaType    string
+	RemotePath   string
+	SizeBytes    int64
 }
 
 // HistoryProvider is the optional backend capability for loading persisted
@@ -125,10 +128,32 @@ type Executor interface {
 	Close(ctx context.Context, s *session.Session) error
 }
 
+// QueuedSubmissionReader reads native readiness without submitting model input.
+// A non-nil result keeps an ordinary queued input waiting and cancellable.
+type QueuedSubmissionReader interface {
+	QueuedSubmissionReady(context.Context, *session.Session, string) error
+}
+
+type sandboxOverrideContextKey struct{}
+
+// WithSandboxOverride applies a server-authoritative sandbox to one submitted
+// turn. Backends that support per-turn policy overrides must honor it instead
+// of trusting the Session's ordinary interactive sandbox.
+func WithSandboxOverride(ctx context.Context, sandbox string) context.Context {
+	return context.WithValue(ctx, sandboxOverrideContextKey{}, sandbox)
+}
+
+// SandboxOverride returns the sandbox explicitly attached to this turn.
+func SandboxOverride(ctx context.Context) (string, bool) {
+	value, ok := ctx.Value(sandboxOverrideContextKey{}).(string)
+	return value, ok && value != ""
+}
+
 // SteerResult identifies the active turn that accepted a same-turn user
 // message. RequestID is the original request that owns the turn; clients use it
 // to keep subsequent streaming events attached to the same lifecycle.
 type SteerResult struct {
+	StrictACK bool // server adapter only; not client supplied or a primary-owner rebind
 	TurnID    string
 	RequestID string
 }

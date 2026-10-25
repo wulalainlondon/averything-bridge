@@ -1,9 +1,12 @@
 package search
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 func TestBuildFTSMatch(t *testing.T) {
@@ -42,6 +45,37 @@ func TestCollectWarnings(t *testing.T) {
 	}
 	if len(collectWarnings("everything works")) != 0 {
 		t.Fatal("3+ char ASCII should not warn")
+	}
+}
+
+func TestRecentMessagesTracksNewestAssistantTimestampSeparately(t *testing.T) {
+	idx := newTestIndex(t)
+	sid := "claude:uid-1"
+	_, err := idx.db.Exec(`INSERT INTO sessions(session_id,source,source_path,project_dir,display_name,last_ts,msg_count,backend)
+		VALUES(?,?,?,?,?,?,?,?)`, sid, "claude", "/p/session", "/p", "Session", "2026-01-01T00:00:03Z", 3, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, row := range []struct{ role, ts, content string }{
+		{"assistant", "2026-01-01T00:00:01Z", "older"},
+		{"assistant", "2026-01-01T00:00:02Z", "newer assistant"},
+		{"user", "2026-01-01T00:00:03Z", "newest row"},
+	} {
+		if _, err := idx.db.Exec(`INSERT INTO messages(session_id,msg_uuid,role,ts,content) VALUES(?,?,?,?,?)`, sid, index, row.role, row.ts, row.content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preview := idx.RecentMessagesByUID([]SessionUID{{HubID: "hub", Backend: "claude", UID: "uid-1"}}, 12)["hub"]
+	if preview == nil || preview.LastTS != parseISOUnix("2026-01-01T00:00:03Z") || preview.LastAssistantTS != parseISOUnix("2026-01-01T00:00:02Z") || preview.LastUserTS != parseISOUnix("2026-01-01T00:00:03Z") {
+		t.Fatalf("preview=%+v", preview)
+	}
+}
+
+func TestTruncateRunesKeepsUTF8Valid(t *testing.T) {
+	input := strings.Repeat("最新回覆", 80)
+	got := truncateRunes(input, 200)
+	if !strings.HasPrefix(input, got) || len([]rune(got)) != 200 || !utf8.ValidString(got) {
+		t.Fatalf("invalid rune truncation: runes=%d", len([]rune(got)))
 	}
 }
 
@@ -216,5 +250,46 @@ func TestSetIndexingStatus(t *testing.T) {
 	idx.SetIndexing(false)
 	if got := idx.Health().IngestProgress["status"]; got != "ready" {
 		t.Fatalf("status after child indexer exits = %v, want ready", got)
+	}
+}
+
+func TestHealthReportsLastChildMetrics(t *testing.T) {
+	idx := newTestIndex(t)
+	idx.RecordIngestMetrics(IngestMetrics{Mode: "incremental", FilesSeen: 1, FilesChanged: 1, FilesQueued: 1, DurationMS: 42})
+	progress := idx.Health().IngestProgress
+	if progress["mode"] != "incremental" || progress["files_seen"] != 1 || progress["duration_ms"] != int64(42) {
+		t.Fatalf("ingest progress=%+v", progress)
+	}
+}
+
+func TestHealthReportsProjectionFreshnessAgainstTranscriptFiles(t *testing.T) {
+	idx := newTestIndex(t)
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(path, []byte("one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.db.Exec(`INSERT INTO ingest_state(source_path,file_size,last_mtime,last_offset,head_sha256,last_ingest_at,msg_extracted,errors)
+		VALUES(?,?,?,?,?,?,?,?)`, path, 4, 1.0, 4, "head", 1.0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("two\n"); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	health := idx.Health()
+	if health.StaleFiles != 1 || health.PendingBytes != 4 || health.ProjectionLagSecs < 1 {
+		t.Fatalf("freshness=%+v", health)
 	}
 }

@@ -1,0 +1,2275 @@
+[
+  {
+    "name": "request-capabilities",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "capabilities",
+      "input": {}
+    }
+  },
+  {
+    "name": "reject-input-spoof-capabilities",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "capabilities",
+      "input": {
+        "caller": "forged"
+      }
+    }
+  },
+  {
+    "name": "reject-extra-capabilities",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "capabilities",
+      "input": {},
+      "extra": true
+    }
+  },
+  {
+    "name": "request-create_dispatch",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "input": {
+        "goal": "Read fixture",
+        "instruction": "Read isolated input artifact.",
+        "scope": {
+          "workspace_roots": [
+            "/fixture"
+          ],
+          "allowed_operations": [
+            "read"
+          ],
+          "sandbox": "read-only",
+          "network": "deny",
+          "max_children": 0
+        },
+        "acceptance": [
+          {
+            "id": "c1",
+            "description": "Anchored summary",
+            "mandatory": true,
+            "evidence_kind": "native_result"
+          }
+        ],
+        "dependencies": [],
+        "workspace": {
+          "cwd": "/fixture",
+          "input_artifact_ids": []
+        },
+        "new_worker": {
+          "name": "Worker"
+        }
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-input-spoof-create_dispatch",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "input": {
+        "goal": "Read fixture",
+        "instruction": "Read isolated input artifact.",
+        "scope": {
+          "workspace_roots": [
+            "/fixture"
+          ],
+          "allowed_operations": [
+            "read"
+          ],
+          "sandbox": "read-only",
+          "network": "deny",
+          "max_children": 0
+        },
+        "acceptance": [
+          {
+            "id": "c1",
+            "description": "Anchored summary",
+            "mandatory": true,
+            "evidence_kind": "native_result"
+          }
+        ],
+        "dependencies": [],
+        "workspace": {
+          "cwd": "/fixture",
+          "input_artifact_ids": []
+        },
+        "new_worker": {
+          "name": "Worker"
+        },
+        "caller": "forged"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-extra-create_dispatch",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "input": {
+        "goal": "Read fixture",
+        "instruction": "Read isolated input artifact.",
+        "scope": {
+          "workspace_roots": [
+            "/fixture"
+          ],
+          "allowed_operations": [
+            "read"
+          ],
+          "sandbox": "read-only",
+          "network": "deny",
+          "max_children": 0
+        },
+        "acceptance": [
+          {
+            "id": "c1",
+            "description": "Anchored summary",
+            "mandatory": true,
+            "evidence_kind": "native_result"
+          }
+        ],
+        "dependencies": [],
+        "workspace": {
+          "cwd": "/fixture",
+          "input_artifact_ids": []
+        },
+        "new_worker": {
+          "name": "Worker"
+        }
+      },
+      "idempotency_key": "key-fixture-12345678",
+      "extra": true
+    }
+  },
+  {
+    "name": "request-list",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "list",
+      "input": {
+        "limit": 100
+      }
+    }
+  },
+  {
+    "name": "reject-input-spoof-list",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "list",
+      "input": {
+        "limit": 100,
+        "caller": "forged"
+      }
+    }
+  },
+  {
+    "name": "reject-extra-list",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "list",
+      "input": {
+        "limit": 100
+      },
+      "extra": true
+    }
+  },
+  {
+    "name": "request-get",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "input": {
+        "original_receipt": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "append",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-input-spoof-get",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "input": {
+        "original_receipt": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "append",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        },
+        "caller": "forged"
+      }
+    }
+  },
+  {
+    "name": "reject-extra-get",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "input": {
+        "original_receipt": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "append",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      },
+      "extra": true
+    }
+  },
+  {
+    "name": "request-read_result",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "read_result",
+      "input": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "offset": 0,
+        "limit": 16000
+      }
+    }
+  },
+  {
+    "name": "reject-input-spoof-read_result",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "read_result",
+      "input": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "offset": 0,
+        "limit": 16000,
+        "caller": "forged"
+      }
+    }
+  },
+  {
+    "name": "reject-extra-read_result",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "read_result",
+      "input": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "offset": 0,
+        "limit": 16000
+      },
+      "extra": true
+    }
+  },
+  {
+    "name": "request-append",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "append",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "content": "Read second input",
+        "mode": "queue"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-input-spoof-append",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "append",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "content": "Read second input",
+        "mode": "queue",
+        "caller": "forged"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-extra-append",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "append",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "content": "Read second input",
+        "mode": "queue"
+      },
+      "idempotency_key": "key-fixture-12345678",
+      "extra": true
+    }
+  },
+  {
+    "name": "request-cancel",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "command_receipt_id": "receipt-fixture",
+        "mode": "queued"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-input-spoof-cancel",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "command_receipt_id": "receipt-fixture",
+        "mode": "queued",
+        "caller": "forged"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-extra-cancel",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "command_receipt_id": "receipt-fixture",
+        "mode": "queued"
+      },
+      "idempotency_key": "key-fixture-12345678",
+      "extra": true
+    }
+  },
+  {
+    "name": "request-snapshot",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "snapshot",
+      "input": {
+        "session_id": "s_fixture12345678",
+        "views": [
+          "inbox",
+          "self",
+          "results",
+          "source_children",
+          "manager_arranging"
+        ],
+        "limit": 100
+      }
+    }
+  },
+  {
+    "name": "reject-input-spoof-snapshot",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "snapshot",
+      "input": {
+        "session_id": "s_fixture12345678",
+        "views": [
+          "inbox",
+          "self",
+          "results",
+          "source_children",
+          "manager_arranging"
+        ],
+        "limit": 100,
+        "caller": "forged"
+      }
+    }
+  },
+  {
+    "name": "reject-extra-snapshot",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "snapshot",
+      "input": {
+        "session_id": "s_fixture12345678",
+        "views": [
+          "inbox",
+          "self",
+          "results",
+          "source_children",
+          "manager_arranging"
+        ],
+        "limit": 100
+      },
+      "extra": true
+    }
+  },
+  {
+    "name": "request-events",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "events",
+      "input": {
+        "session_id": "s_fixture12345678",
+        "limit": 1000,
+        "subscribe": false
+      }
+    }
+  },
+  {
+    "name": "reject-input-spoof-events",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "events",
+      "input": {
+        "session_id": "s_fixture12345678",
+        "limit": 1000,
+        "subscribe": false,
+        "caller": "forged"
+      }
+    }
+  },
+  {
+    "name": "reject-extra-events",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "events",
+      "input": {
+        "session_id": "s_fixture12345678",
+        "limit": 1000,
+        "subscribe": false
+      },
+      "extra": true
+    }
+  },
+  {
+    "name": "request-deliver_result",
+    "valid": true,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "deliver_result",
+      "input": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "expected_source": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "native_thread_id": "resume-fixture",
+          "config_revision": 0,
+          "request_id": "r_fixture12345678"
+        }
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-input-spoof-deliver_result",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "deliver_result",
+      "input": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "expected_source": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "native_thread_id": "resume-fixture",
+          "config_revision": 0,
+          "request_id": "r_fixture12345678"
+        },
+        "caller": "forged"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-extra-deliver_result",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "deliver_result",
+      "input": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "expected_source": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "native_thread_id": "resume-fixture",
+          "config_revision": 0,
+          "request_id": "r_fixture12345678"
+        }
+      },
+      "idempotency_key": "key-fixture-12345678",
+      "extra": true
+    }
+  },
+  {
+    "name": "reject-key-missing-create_dispatch",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "input": {
+        "goal": "Read fixture",
+        "instruction": "Read isolated input artifact.",
+        "scope": {
+          "workspace_roots": [
+            "/fixture"
+          ],
+          "allowed_operations": [
+            "read"
+          ],
+          "sandbox": "read-only",
+          "network": "deny",
+          "max_children": 0
+        },
+        "acceptance": [
+          {
+            "id": "c1",
+            "description": "Anchored summary",
+            "mandatory": true,
+            "evidence_kind": "native_result"
+          }
+        ],
+        "dependencies": [],
+        "workspace": {
+          "cwd": "/fixture",
+          "input_artifact_ids": []
+        },
+        "new_worker": {
+          "name": "Worker"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-key-missing-deliver_result",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "deliver_result",
+      "input": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "expected_source": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "native_thread_id": "resume-fixture",
+          "config_revision": 0,
+          "request_id": "r_fixture12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-key-missing-append",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "append",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "content": "Read second input",
+        "mode": "queue"
+      }
+    }
+  },
+  {
+    "name": "reject-key-missing-cancel",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "command_receipt_id": "receipt-fixture",
+        "mode": "queued"
+      }
+    }
+  },
+  {
+    "name": "reject-lookup-missing-store",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "input": {
+        "original_receipt": {
+          "authority_instance_id": "instance-fixture",
+          "operation": "append",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-lookup-missing-task",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "input": {
+        "original_receipt": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "append",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-lookup-missing-authority",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "input": {
+        "original_receipt": {
+          "path": "delegation",
+          "operation": "append",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-two-targets",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "input": {
+        "goal": "Read fixture",
+        "instruction": "Read isolated input artifact.",
+        "scope": {
+          "workspace_roots": [
+            "/fixture"
+          ],
+          "allowed_operations": [
+            "read"
+          ],
+          "sandbox": "read-only",
+          "network": "deny",
+          "max_children": 0
+        },
+        "acceptance": [
+          {
+            "id": "c1",
+            "description": "Anchored summary",
+            "mandatory": true,
+            "evidence_kind": "native_result"
+          }
+        ],
+        "dependencies": [],
+        "workspace": {
+          "cwd": "/fixture",
+          "input_artifact_ids": []
+        },
+        "new_worker": {
+          "name": "Worker"
+        },
+        "existing_target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        }
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-broad-sandbox",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "input": {
+        "goal": "Read fixture",
+        "instruction": "Read isolated input artifact.",
+        "scope": {
+          "workspace_roots": [
+            "/fixture"
+          ],
+          "allowed_operations": [
+            "read"
+          ],
+          "sandbox": "danger-full-access",
+          "network": "deny",
+          "max_children": 0
+        },
+        "acceptance": [
+          {
+            "id": "c1",
+            "description": "Anchored summary",
+            "mandatory": true,
+            "evidence_kind": "native_result"
+          }
+        ],
+        "dependencies": [],
+        "workspace": {
+          "cwd": "/fixture",
+          "input_artifact_ids": []
+        },
+        "new_worker": {
+          "name": "Worker"
+        }
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-unpinned-steer",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "append",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "content": "Read second input",
+        "mode": "steer"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-unpinned-cancel",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 1,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "command_receipt_id": "receipt-fixture",
+        "mode": "active"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "reject-unknown-op-request",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "unknown-op",
+      "input": {}
+    }
+  },
+  {
+    "name": "reject-unknown-version-request",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "88.0",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "input": {
+        "task_id": "task-fixture"
+      }
+    }
+  },
+  {
+    "name": "duplicate-top-operation",
+    "valid": false,
+    "raw": "{\"type\":\"task_api_request\",\"api_version\":\"1.0.0-rc.1\",\"correlation_id\":\"fixture\",\"operation\":\"get\",\"operation\":\"cancel\",\"input\":{}}"
+  },
+  {
+    "name": "duplicate-nested-escaped-key",
+    "valid": false,
+    "raw": "{\"type\":\"task_api_request\",\"api_version\":\"1.0.0-rc.1\",\"correlation_id\":\"fixture\",\"operation\":\"get\",\"input\":{\"task_id\":\"a\",\"task_\\u0069d\":\"b\"}}"
+  },
+  {
+    "name": "trailing-json",
+    "valid": false,
+    "raw": "{\"type\": \"task_api_request\", \"api_version\": \"1.0.0-rc.1\", \"correlation_id\": \"fixture-correlation\", \"operation\": \"capabilities\", \"input\": {}} {}"
+  },
+  {
+    "name": "integer-safe-range",
+    "valid": false,
+    "value": {
+      "type": "task_api_request",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "input": {
+        "task_id": "task-fixture",
+        "expected_revision": 9007199254740992,
+        "target": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "expected_native_thread_id": "resume-fixture",
+          "expected_config_revision": 0
+        },
+        "command_receipt_id": "receipt-fixture",
+        "mode": "queued"
+      },
+      "idempotency_key": "key-fixture-12345678"
+    }
+  },
+  {
+    "name": "positive-response-capabilities",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "capabilities",
+      "ok": true,
+      "result": {
+        "api_versions": [
+          "1.0.0-rc.1"
+        ],
+        "schema_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "allowed_operations": [
+          "get",
+          "create_dispatch",
+          "append",
+          "cancel"
+        ],
+        "paths": [
+          "delegation"
+        ],
+        "providers": [],
+        "limits": {
+          "max_instruction_chars": 32000,
+          "max_pending_children": 3,
+          "event_retention_days": 30,
+          "max_events_per_scope": 100000,
+          "receipt_retention_days": 90
+        },
+        "default_worker_profile": {
+          "backend": "codex",
+          "model": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        "mutation_authority_instance_id": "instance-fixture",
+        "create_routes": {
+          "new_worker": "delegation",
+          "existing_target": "controller",
+          "approved_pm_task": "pm_v2"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-capabilities",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "capabilities",
+      "ok": true,
+      "result": {
+        "api_versions": [
+          "1.0.0-rc.1"
+        ],
+        "schema_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "allowed_operations": [
+          "get"
+        ],
+        "paths": [
+          "delegation"
+        ],
+        "providers": [],
+        "limits": {
+          "max_instruction_chars": 32000,
+          "max_pending_children": 3,
+          "event_retention_days": 30,
+          "max_events_per_scope": 100000,
+          "receipt_retention_days": 90
+        },
+        "default_worker_profile": {
+          "backend": "codex",
+          "model": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-create_dispatch",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "create_dispatch",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "create_dispatch",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-create_dispatch",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "create_dispatch",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "create_dispatch",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "create_dispatch",
+          "idempotency_key": "key-fixture-12345678"
+        },
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-list",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "list",
+      "ok": true,
+      "result": {
+        "items": [
+          {
+            "task_id": "task-fixture",
+            "task_ref": {
+              "authority_instance_id": "instance-fixture",
+              "path": "delegation",
+              "native_record_id": "dg-fixture"
+            },
+            "revision": 1,
+            "definition_revision": 0,
+            "source": {
+              "identity": {},
+              "binding_kind": "legacy_unknown",
+              "provenance": "unknown"
+            },
+            "target": {},
+            "axes": {
+              "admission": "queued",
+              "execution": "handoff",
+              "final": "unavailable",
+              "artifact": "none",
+              "qa": "not_requested",
+              "delivery": "not_requested",
+              "cancellation": "none"
+            },
+            "artifact_refs": [],
+            "qa": {
+              "status": "not_requested",
+              "evidence_refs": []
+            },
+            "evidence_refs": [],
+            "receipt_ids": [
+              "receipt-fixture"
+            ],
+            "child_task_ids": [],
+            "provenance": "legacy",
+            "views": [
+              "self"
+            ],
+            "capabilities": []
+          }
+        ],
+        "has_more": false,
+        "partial": false,
+        "history_status": "unknown"
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-list",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "list",
+      "ok": true,
+      "result": {
+        "items": [
+          {
+            "task_id": "task-fixture",
+            "task_ref": {
+              "authority_instance_id": "instance-fixture",
+              "path": "delegation",
+              "native_record_id": "dg-fixture"
+            },
+            "revision": 1,
+            "definition_revision": 0,
+            "source": {
+              "identity": {},
+              "binding_kind": "legacy_unknown",
+              "provenance": "unknown"
+            },
+            "target": {},
+            "axes": {
+              "admission": "queued",
+              "execution": "handoff",
+              "final": "unavailable",
+              "artifact": "none",
+              "qa": "not_requested",
+              "delivery": "not_requested",
+              "cancellation": "none"
+            },
+            "artifact_refs": [],
+            "qa": {
+              "status": "not_requested",
+              "evidence_refs": []
+            },
+            "evidence_refs": [],
+            "receipt_ids": [
+              "receipt-fixture"
+            ],
+            "child_task_ids": [],
+            "provenance": "legacy",
+            "views": [
+              "self"
+            ],
+            "capabilities": []
+          }
+        ],
+        "has_more": false,
+        "partial": false,
+        "history_status": "unknown",
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-get",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "ok": true,
+      "result": {
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "revision": 1,
+        "definition_revision": 0,
+        "source": {
+          "identity": {},
+          "binding_kind": "legacy_unknown",
+          "provenance": "unknown"
+        },
+        "target": {},
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "artifact_refs": [],
+        "qa": {
+          "status": "not_requested",
+          "evidence_refs": []
+        },
+        "evidence_refs": [],
+        "receipt_ids": [
+          "receipt-fixture"
+        ],
+        "child_task_ids": [],
+        "provenance": "legacy",
+        "views": [
+          "self"
+        ],
+        "capabilities": []
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-get",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "get",
+      "ok": true,
+      "result": {
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "revision": 1,
+        "definition_revision": 0,
+        "source": {
+          "identity": {},
+          "binding_kind": "legacy_unknown",
+          "provenance": "unknown"
+        },
+        "target": {},
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "artifact_refs": [],
+        "qa": {
+          "status": "not_requested",
+          "evidence_refs": []
+        },
+        "evidence_refs": [],
+        "receipt_ids": [
+          "receipt-fixture"
+        ],
+        "child_task_ids": [],
+        "provenance": "legacy",
+        "views": [
+          "self"
+        ],
+        "capabilities": [],
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-read_result",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "read_result",
+      "ok": true,
+      "result": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "final_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "anchor": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "request_id": "dgtask_fixture",
+          "source_message_id": "message-canonical",
+          "execution": {
+            "backend": "claude",
+            "provider_session_id": "resume-fixture",
+            "token_kind": "message_uuid",
+            "provider_token": "message-fixture"
+          }
+        },
+        "terminal_status": "succeeded",
+        "text": "繁體中文🙂",
+        "offset": 0,
+        "next_offset": 5,
+        "has_more": false,
+        "artifacts": [],
+        "qa": {
+          "status": "not_requested",
+          "evidence_refs": []
+        },
+        "limitations": []
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-read_result",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "read_result",
+      "ok": true,
+      "result": {
+        "task_id": "task-fixture",
+        "seal_id": "seal-fixture",
+        "final_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "anchor": {
+          "instance_id": "instance-fixture",
+          "session_id": "s_fixture12345678",
+          "request_id": "dgtask_fixture",
+          "source_message_id": "message-canonical",
+          "execution": {
+            "backend": "claude",
+            "provider_session_id": "resume-fixture",
+            "token_kind": "message_uuid",
+            "provider_token": "message-fixture"
+          }
+        },
+        "terminal_status": "succeeded",
+        "text": "繁體中文🙂",
+        "offset": 0,
+        "next_offset": 5,
+        "has_more": false,
+        "artifacts": [],
+        "qa": {
+          "status": "not_requested",
+          "evidence_refs": []
+        },
+        "limitations": [],
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-append",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "append",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "append",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "append",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-append",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "append",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "append",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "append",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        },
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-cancel",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "cancel",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "cancel",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-cancel",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "cancel",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "cancel",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        },
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-snapshot",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "snapshot",
+      "ok": true,
+      "result": {
+        "items": [
+          {
+            "task_id": "task-fixture",
+            "task_ref": {
+              "authority_instance_id": "instance-fixture",
+              "path": "delegation",
+              "native_record_id": "dg-fixture"
+            },
+            "revision": 1,
+            "definition_revision": 0,
+            "source": {
+              "identity": {},
+              "binding_kind": "legacy_unknown",
+              "provenance": "unknown"
+            },
+            "target": {},
+            "axes": {
+              "admission": "queued",
+              "execution": "handoff",
+              "final": "unavailable",
+              "artifact": "none",
+              "qa": "not_requested",
+              "delivery": "not_requested",
+              "cancellation": "none"
+            },
+            "artifact_refs": [],
+            "qa": {
+              "status": "not_requested",
+              "evidence_refs": []
+            },
+            "evidence_refs": [],
+            "receipt_ids": [
+              "receipt-fixture"
+            ],
+            "child_task_ids": [],
+            "provenance": "legacy",
+            "views": [
+              "self"
+            ],
+            "capabilities": []
+          }
+        ],
+        "views": [
+          "self"
+        ],
+        "watermarks": [
+          {
+            "store": "delegation",
+            "sequence": 1
+          }
+        ],
+        "events_cursor": "cursor-fixture",
+        "has_more": false,
+        "partial": false,
+        "consistency": "per_store_snapshot_vector",
+        "freeze_id": "freeze-fixture",
+        "expires_at_ms": 100,
+        "page_order": "task_id"
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-snapshot",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "snapshot",
+      "ok": true,
+      "result": {
+        "items": [
+          {
+            "task_id": "task-fixture",
+            "task_ref": {
+              "authority_instance_id": "instance-fixture",
+              "path": "delegation",
+              "native_record_id": "dg-fixture"
+            },
+            "revision": 1,
+            "definition_revision": 0,
+            "source": {
+              "identity": {},
+              "binding_kind": "legacy_unknown",
+              "provenance": "unknown"
+            },
+            "target": {},
+            "axes": {
+              "admission": "queued",
+              "execution": "handoff",
+              "final": "unavailable",
+              "artifact": "none",
+              "qa": "not_requested",
+              "delivery": "not_requested",
+              "cancellation": "none"
+            },
+            "artifact_refs": [],
+            "qa": {
+              "status": "not_requested",
+              "evidence_refs": []
+            },
+            "evidence_refs": [],
+            "receipt_ids": [
+              "receipt-fixture"
+            ],
+            "child_task_ids": [],
+            "provenance": "legacy",
+            "views": [
+              "self"
+            ],
+            "capabilities": []
+          }
+        ],
+        "views": [
+          "self"
+        ],
+        "watermarks": [
+          {
+            "store": "delegation",
+            "sequence": 1
+          }
+        ],
+        "events_cursor": "cursor-fixture",
+        "has_more": false,
+        "partial": false,
+        "consistency": "per_store_snapshot_vector",
+        "freeze_id": "freeze-fixture",
+        "expires_at_ms": 100,
+        "page_order": "task_id",
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-events",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "events",
+      "ok": true,
+      "result": {
+        "events": [],
+        "next_cursor": "cursor-fixture",
+        "retention_floor": [
+          {
+            "store": "delegation",
+            "sequence": 1
+          }
+        ],
+        "has_more": false,
+        "partial": false
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-events",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "events",
+      "ok": true,
+      "result": {
+        "events": [],
+        "next_cursor": "cursor-fixture",
+        "retention_floor": [
+          {
+            "store": "delegation",
+            "sequence": 1
+          }
+        ],
+        "has_more": false,
+        "partial": false,
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "positive-response-deliver_result",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "deliver_result",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "deliver_result",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "deliver_result",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        }
+      }
+    }
+  },
+  {
+    "name": "reject-response-extra-deliver_result",
+    "valid": false,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "deliver_result",
+      "ok": true,
+      "result": {
+        "receipt_id": "receipt-fixture",
+        "task_id": "task-fixture",
+        "task_ref": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "native_record_id": "dg-fixture"
+        },
+        "idempotency_key": "key-fixture-12345678",
+        "operation": "deliver_result",
+        "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "axes": {
+          "admission": "queued",
+          "execution": "handoff",
+          "final": "unavailable",
+          "artifact": "none",
+          "qa": "not_requested",
+          "delivery": "not_requested",
+          "cancellation": "none"
+        },
+        "task_revision": 1,
+        "effect_request_ids": [
+          "dgtask_fixture"
+        ],
+        "transport": "authenticated_mcp",
+        "created_at_ms": 0,
+        "reused": false,
+        "locator": {
+          "authority_instance_id": "instance-fixture",
+          "path": "delegation",
+          "operation": "deliver_result",
+          "task_id": "task-fixture",
+          "idempotency_key": "key-fixture-12345678"
+        },
+        "forged": true
+      }
+    }
+  },
+  {
+    "name": "typed-error-unknown-op",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "request_api_version": "88.0",
+      "correlation_id": "fixture-correlation",
+      "operation": "unknown-op",
+      "ok": false,
+      "error": {
+        "code": "unsupported",
+        "message": "Unsupported request.",
+        "retryable": false,
+        "acceptance": "known_none",
+        "recommended_action": "read_capabilities"
+      }
+    }
+  },
+  {
+    "name": "typed-error-cancel",
+    "valid": true,
+    "value": {
+      "type": "task_api_response",
+      "api_version": "1.0.0-rc.1",
+      "request_api_version": "1.0.0-rc.1",
+      "correlation_id": "fixture-correlation",
+      "operation": "cancel",
+      "ok": false,
+      "error": {
+        "code": "unsupported",
+        "message": "Unsupported request.",
+        "retryable": false,
+        "acceptance": "known_none",
+        "recommended_action": "read_capabilities"
+      }
+    }
+  },
+  {
+    "name": "legacy-identity-omitted",
+    "valid": true,
+    "definition": "Identity",
+    "value": {}
+  },
+  {
+    "name": "claude-anchor",
+    "valid": true,
+    "definition": "Anchor",
+    "value": {
+      "instance_id": "instance-fixture",
+      "session_id": "s_fixture12345678",
+      "request_id": "dgtask_fixture",
+      "source_message_id": "message-canonical",
+      "execution": {
+        "backend": "claude",
+        "provider_session_id": "resume-fixture",
+        "token_kind": "message_uuid",
+        "provider_token": "message-fixture"
+      }
+    }
+  },
+  {
+    "name": "codex-anchor",
+    "valid": true,
+    "definition": "Anchor",
+    "value": {
+      "instance_id": "instance-fixture",
+      "session_id": "s_fixture12345678",
+      "request_id": "dgtask_fixture",
+      "source_message_id": "message-canonical",
+      "execution": {
+        "backend": "codex",
+        "native_thread_id": "thread-fixture",
+        "native_turn_id": "turn-fixture"
+      }
+    }
+  },
+  {
+    "name": "reject-claude-turn",
+    "valid": false,
+    "definition": "Anchor",
+    "value": {
+      "instance_id": "instance-fixture",
+      "session_id": "s_fixture12345678",
+      "request_id": "dgtask_fixture",
+      "source_message_id": "message-canonical",
+      "execution": {
+        "backend": "claude",
+        "provider_session_id": "resume-fixture",
+        "token_kind": "message_uuid",
+        "provider_token": "message-fixture",
+        "native_turn_id": "fake"
+      }
+    }
+  },
+  {
+    "name": "reject-sealed-without-anchor",
+    "valid": false,
+    "definition": "Task",
+    "value": {
+      "task_id": "task-fixture",
+      "task_ref": {
+        "authority_instance_id": "instance-fixture",
+        "path": "delegation",
+        "native_record_id": "dg-fixture"
+      },
+      "revision": 1,
+      "definition_revision": 0,
+      "source": {
+        "identity": {},
+        "binding_kind": "legacy_unknown",
+        "provenance": "unknown"
+      },
+      "target": {},
+      "axes": {
+        "admission": "queued",
+        "execution": "handoff",
+        "final": "sealed",
+        "artifact": "none",
+        "qa": "not_requested",
+        "delivery": "not_requested",
+        "cancellation": "none"
+      },
+      "artifact_refs": [],
+      "qa": {
+        "status": "not_requested",
+        "evidence_refs": []
+      },
+      "evidence_refs": [],
+      "receipt_ids": [
+        "receipt-fixture"
+      ],
+      "child_task_ids": [],
+      "provenance": "legacy",
+      "views": [
+        "self"
+      ],
+      "capabilities": []
+    }
+  },
+  {
+    "name": "reject-delivered-without-anchor",
+    "valid": false,
+    "definition": "Task",
+    "value": {
+      "task_id": "task-fixture",
+      "task_ref": {
+        "authority_instance_id": "instance-fixture",
+        "path": "delegation",
+        "native_record_id": "dg-fixture"
+      },
+      "revision": 1,
+      "definition_revision": 0,
+      "source": {
+        "identity": {},
+        "binding_kind": "legacy_unknown",
+        "provenance": "unknown"
+      },
+      "target": {},
+      "axes": {
+        "admission": "queued",
+        "execution": "handoff",
+        "final": "unavailable",
+        "artifact": "none",
+        "qa": "not_requested",
+        "delivery": "delivered",
+        "cancellation": "none"
+      },
+      "artifact_refs": [],
+      "qa": {
+        "status": "not_requested",
+        "evidence_refs": []
+      },
+      "evidence_refs": [],
+      "receipt_ids": [
+        "receipt-fixture"
+      ],
+      "child_task_ids": [],
+      "provenance": "legacy",
+      "views": [
+        "self"
+      ],
+      "capabilities": []
+    }
+  },
+  {
+    "name": "reject-qa-self-passed",
+    "valid": false,
+    "definition": "QA",
+    "value": {
+      "status": "passed",
+      "evidence_refs": []
+    }
+  },
+  {
+    "name": "dependency-definition",
+    "valid": true,
+    "definition": "Dependency",
+    "value": {
+      "task_id": "dep",
+      "expected_definition_revision": 1,
+      "required_axes": [
+        "qa_passed"
+      ]
+    }
+  },
+  {
+    "name": "reject-unpaired-surrogate",
+    "valid": false,
+    "raw": "{\"x\":\"\\ud800\"}"
+  },
+  {
+    "name": "reject-low-surrogate",
+    "valid": false,
+    "raw": "{\"x\":\"\\udc00\"}"
+  },
+  {
+    "name": "reject-numeric-underflow",
+    "valid": false,
+    "raw": "{\"type\":\"task_api_request\",\"api_version\":\"1.0.0-rc.1\",\"correlation_id\":\"fixture-correlation\",\"operation\":\"cancel\",\"input\":{\"task_id\":\"task-fixture\",\"expected_revision\":1e-400,\"target\":{\"instance_id\":\"instance-fixture\",\"session_id\":\"s_fixture12345678\",\"expected_native_thread_id\":\"resume-fixture\",\"expected_config_revision\":0},\"command_receipt_id\":\"receipt-fixture\",\"mode\":\"queued\"},\"idempotency_key\":\"key-fixture-12345678\"}"
+  },
+  {
+    "name": "reject-numeric-near-safe-fraction",
+    "valid": false,
+    "raw": "{\"type\":\"task_api_request\",\"api_version\":\"1.0.0-rc.1\",\"correlation_id\":\"fixture-correlation\",\"operation\":\"cancel\",\"input\":{\"task_id\":\"task-fixture\",\"expected_revision\":9007199254740990.9,\"target\":{\"instance_id\":\"instance-fixture\",\"session_id\":\"s_fixture12345678\",\"expected_native_thread_id\":\"resume-fixture\",\"expected_config_revision\":0},\"command_receipt_id\":\"receipt-fixture\",\"mode\":\"queued\"},\"idempotency_key\":\"key-fixture-12345678\"}"
+  },
+  {
+    "name": "reject-numeric-float-lexeme",
+    "valid": false,
+    "raw": "{\"type\":\"task_api_request\",\"api_version\":\"1.0.0-rc.1\",\"correlation_id\":\"fixture-correlation\",\"operation\":\"cancel\",\"input\":{\"task_id\":\"task-fixture\",\"expected_revision\":1.0,\"target\":{\"instance_id\":\"instance-fixture\",\"session_id\":\"s_fixture12345678\",\"expected_native_thread_id\":\"resume-fixture\",\"expected_config_revision\":0},\"command_receipt_id\":\"receipt-fixture\",\"mode\":\"queued\"},\"idempotency_key\":\"key-fixture-12345678\"}"
+  },
+  {
+    "name": "reject-numeric-exponent-lexeme",
+    "valid": false,
+    "raw": "{\"type\":\"task_api_request\",\"api_version\":\"1.0.0-rc.1\",\"correlation_id\":\"fixture-correlation\",\"operation\":\"cancel\",\"input\":{\"task_id\":\"task-fixture\",\"expected_revision\":1e3,\"target\":{\"instance_id\":\"instance-fixture\",\"session_id\":\"s_fixture12345678\",\"expected_native_thread_id\":\"resume-fixture\",\"expected_config_revision\":0},\"command_receipt_id\":\"receipt-fixture\",\"mode\":\"queued\"},\"idempotency_key\":\"key-fixture-12345678\"}"
+  },
+  {
+    "name": "human-source-conservative-positive",
+    "valid": true,
+    "definition": "SourceBinding",
+    "value": {
+      "identity": {
+        "instance_id": "instance-fixture",
+        "session_id": "parent"
+      },
+      "binding_kind": "legacy_unknown",
+      "provenance": "legacy",
+      "human_assertion": {
+        "kind": "human_linked",
+        "record_id": "hl_fixture",
+        "actor_scope_id": "device:human",
+        "original_receipt_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_origin_status": "unknown"
+      }
+    }
+  },
+  {
+    "name": "human-source-negative-binding_kind",
+    "valid": false,
+    "definition": "SourceBinding",
+    "value": {
+      "identity": {
+        "instance_id": "instance-fixture",
+        "session_id": "parent"
+      },
+      "binding_kind": "native_tool",
+      "provenance": "legacy",
+      "human_assertion": {
+        "kind": "human_linked",
+        "record_id": "hl_fixture",
+        "actor_scope_id": "device:human",
+        "original_receipt_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_origin_status": "unknown"
+      }
+    }
+  },
+  {
+    "name": "human-source-negative-provenance",
+    "valid": false,
+    "definition": "SourceBinding",
+    "value": {
+      "identity": {
+        "instance_id": "instance-fixture",
+        "session_id": "parent"
+      },
+      "binding_kind": "legacy_unknown",
+      "provenance": "verified",
+      "human_assertion": {
+        "kind": "human_linked",
+        "record_id": "hl_fixture",
+        "actor_scope_id": "device:human",
+        "original_receipt_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_origin_status": "unknown"
+      }
+    }
+  },
+  {
+    "name": "human-source-negative-invocation_id",
+    "valid": false,
+    "definition": "SourceBinding",
+    "value": {
+      "identity": {
+        "instance_id": "instance-fixture",
+        "session_id": "parent"
+      },
+      "binding_kind": "legacy_unknown",
+      "provenance": "legacy",
+      "human_assertion": {
+        "kind": "human_linked",
+        "record_id": "hl_fixture",
+        "actor_scope_id": "device:human",
+        "original_receipt_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_origin_status": "unknown"
+      },
+      "invocation_id": "fake-call"
+    }
+  },
+  {
+    "name": "human-source-negative-authorization_ref",
+    "valid": false,
+    "definition": "SourceBinding",
+    "value": {
+      "identity": {
+        "instance_id": "instance-fixture",
+        "session_id": "parent"
+      },
+      "binding_kind": "legacy_unknown",
+      "provenance": "legacy",
+      "human_assertion": {
+        "kind": "human_linked",
+        "record_id": "hl_fixture",
+        "actor_scope_id": "device:human",
+        "original_receipt_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_origin_status": "unknown"
+      },
+      "authorization_ref": "fake-grant"
+    }
+  }
+]
