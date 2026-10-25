@@ -8,14 +8,26 @@ permissions:
 jobs:
   verify:
     runs-on: macos-latest
+    env:
+      OWNED_VERIFIER_SCRIPT: ${{ github.workspace }}/testdata/reviewed-verifier/artifact-owner-verifier.mjs
+      GOMAXPROCS: "2"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.7.0'
+      - name: Prepare pinned fixture and isolated LINE dependencies
+        run: |
+          shasum -a 256 -c testdata/reviewed-verifier/SHA256SUMS
+          npm ci --ignore-scripts --prefix services/line-account
+          npm run build --prefix services/line-account
+          npm ci --ignore-scripts --prefix services/line-voice
       - name: Verify source contracts and release scanner
         run: |
-          go test ./...
+          go test -p 2 ./...
           node --test scripts/check_release_secrets.test.mjs
       - name: Compile without publishing or accessing signing credentials
         run: |
