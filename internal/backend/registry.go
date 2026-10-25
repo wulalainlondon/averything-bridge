@@ -11,6 +11,7 @@ func DefaultRegistry(includeRemoteWS bool) []Definition {
 			DefaultModel: "opus",
 			Models: []Model{
 				{ID: "sonnet", Label: "sonnet"},
+				{ID: "haiku", Label: "haiku"},
 				{ID: "opus", Label: "opus"},
 				{ID: "opusplan", Label: "opus · plan"},
 				{ID: "fable", Label: "fable"},
@@ -24,6 +25,19 @@ func DefaultRegistry(includeRemoteWS bool) []Definition {
 			Label:        "Codex",
 			DefaultModel: "gpt-5.6-sol",
 			Models: []Model{
+				{
+					ID: "gpt-6-astra", Label: "GPT-6-Astra",
+					Description:               "Our most capable model for complex, demanding work.",
+					SupportedReasoningEfforts: []string{"low", "medium", "high", "xhigh", "max"},
+					DefaultReasoningEffort:    "medium", InputModalities: []string{"text", "image"},
+				},
+				{
+					ID: "gpt-6-sol", Label: "GPT-6-Sol",
+					Description: "Built to power complex coding and agentic workflows.",
+					// Codex 0.156.1 authenticated model/list capabilities.
+					SupportedReasoningEfforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"},
+					DefaultReasoningEffort:    "medium", InputModalities: []string{"text", "image"},
+				},
 				{ID: "gpt-5.6-sol", Label: "gpt-5.6-sol"},
 				{ID: "gpt-5.6-terra", Label: "gpt-5.6-terra"},
 				{ID: "gpt-5.6-luna", Label: "gpt-5.6-luna"},
@@ -35,12 +49,6 @@ func DefaultRegistry(includeRemoteWS bool) []Definition {
 			Capabilities: Capabilities{
 				History: true, Usage: true, Interactions: true, Sandbox: true, Images: true, Files: true, Steering: true,
 			},
-		},
-		{
-			ID:           Gemini,
-			Label:        "Gemini",
-			Models:       []Model{},
-			Capabilities: Capabilities{History: true, Sandbox: true, Images: true, Files: true},
 		},
 		{
 			ID:           Ollama,

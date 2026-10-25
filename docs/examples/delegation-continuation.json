@@ -1,0 +1,9 @@
+{
+  "delegation_id": "dg_original_owner",
+  "expected_previous_round_id": "dg_original_owner",
+  "instance_id": "original-instance",
+  "expected_thread_id": "original-owner-native-thread",
+  "expected_config_revision": 0,
+  "content": "Apply the independent QA failure to the original authorized task and preserve the original evidence.",
+  "mode": "queue"
+}

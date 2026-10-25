@@ -1,0 +1,60 @@
+LINEJS 3.4.2 — reply correlation and SRTP receiver rollover repair
+
+Scope: CONN_RSP (including duplicate CONN requests), INFO_RSP and MC DATA/JOIN/
+CHANGE responses copy their own incoming request's transaction ID, transaction
+sequence and established session. They retain local nonce direction and response
+message IDs, and do not consume a fresh outgoing transaction sequence.
+New SETUP, INFO, keepalive, BEPI open/check and locally initiated release messages
+retain the original SDK request behavior. Media key derivation, codecs, RTP
+framing and packet timing are unchanged. A second exact-source patch maintains
+receiver ROC/highest sequence state across wrap, with authenticated updates,
+64-packet replay protection, limited reordering, per-SSRC isolation and bounded
+serial decryption. The unchanged upstream sender is used in interoperability
+tests. This does not claim universal SRTP re-keying/group-call compatibility.
+
+SRTP receiver reference: RFC3711 sections3.3.1/3.3.2 and AppendixA.
+https://www.rfc-editor.org/rfc/rfc3711.html#section-3.3.1
+Pinned srtp.js SHA256:
+42b2221705474566fdade2f1b2470ae51b48cf23c3dc4d1351d98f1b7ae6b47e
+
+Reference and upstream implementation:
+https://github.com/evex-dev/linejs/issues/198#issuecomment-5963526825
+packages/linejs/client/features/call/planet/transport.ts, planetReplyHdr/replyTo.
+This is a narrow local port, not a claim that all upstream fixes are included.
+
+linejs-transport.mjs verifies the exact original transport SHA256 before applying
+the patch. It refuses a changed/unknown dependency; it never falls back to the
+unpatched class. npm ci --ignore-scripts may be used normally. The worker loads
+the repaired class explicitly, without modifying node_modules or package locks.
+The generated module is private temporary source, removed after import; it holds
+no authentication data. The runtime diagnostic identifies both source hashes.
+The SRTP module has its own source hash guard and patch hash diagnostic. Unknown
+source is refused, rather than loading an unpatched receiver.
+
+This integration retains the current session/pacing code and route-worker packet
+counts. The older candidate media-freshness telemetry is not included here;
+packet counts and signaling do not establish audible two-way conversation.
+
+The upstream-derived code is licensed as follows:
+
+MIT License
+
+Copyright (c) 2024-2026 Evex Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

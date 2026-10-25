@@ -1,6 +1,7 @@
 package nativewatch
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,6 +25,54 @@ func TestUsePollingMode(t *testing.T) {
 	}
 }
 
+func TestDefaultOptionsHonorClaudeProjectsOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("EVERYTHING_GO_CLAUDE_PROJECTS_DIR", dir)
+	if got := DefaultOptions().ClaudeProjectsDir; got != dir {
+		t.Fatalf("ClaudeProjectsDir=%q want %q", got, dir)
+	}
+}
+
+func TestWatchChangesDoesNotSignalInitialImport(t *testing.T) {
+	t.Setenv("EVERYTHING_GO_NATIVEWATCH_MODE", "poll")
+	root := t.TempDir()
+	path := filepath.Join(root, "123e4567-e89b-12d3-a456-426614174000.jsonl")
+	line := `{"type":"user","cwd":"/tmp/repo","message":{"content":[{"type":"text","text":"Initial"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{ClaudeProjectsDir: root, PollInterval: 20 * time.Millisecond, Debounce: time.Millisecond, InitialLookback: time.Hour}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	imports := make(chan NativeSession, 2)
+	changes := make(chan string, 2)
+	go WatchChanges(ctx, opts, func(ns NativeSession) { imports <- ns }, func(path string) { changes <- path })
+	select {
+	case <-imports:
+	case <-time.After(time.Second):
+		t.Fatal("initial session was not imported")
+	}
+	select {
+	case <-changes:
+		t.Fatal("initial import was reported as a transcript change")
+	case <-time.After(60 * time.Millisecond):
+	}
+	if f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0); err != nil {
+		t.Fatal(err)
+	} else {
+		_, _ = f.WriteString(line)
+		_ = f.Close()
+	}
+	select {
+	case changedPath := <-changes:
+		if changedPath != path {
+			t.Fatalf("change path=%q want %q", changedPath, path)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("appended transcript did not signal a change")
+	}
+}
+
 func TestParseClaudePath(t *testing.T) {
 	root := t.TempDir()
 	proj := filepath.Join(root, "-tmp-repo")
@@ -37,7 +86,6 @@ func TestParseClaudePath(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
 	ns, ok := ParsePath(path, Options{ClaudeProjectsDir: root})
 	if !ok {
 		t.Fatal("ParsePath returned false")
@@ -63,6 +111,10 @@ func TestParseCodexPath(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	appendTime := time.Date(2026, 9, 3, 9, 44, 59, 0, time.Local)
+	if err := os.Chtimes(path, appendTime, appendTime); err != nil {
+		t.Fatal(err)
+	}
 
 	ns, ok := ParsePath(path, Options{CodexSessionsDir: root})
 	if !ok {
@@ -71,7 +123,7 @@ func TestParseCodexPath(t *testing.T) {
 	if ns.ID != "jl_x_019e9ccf-aff" || ns.ResumeID != id || ns.Backend != BackendCodex {
 		t.Fatalf("bad identity: %+v", ns)
 	}
-	wantTS := time.Date(2026, 6, 7, 10, 11, 12, 0, time.UTC).Unix()
+	wantTS := appendTime.Unix()
 	if ns.Cwd != "/repo/codex" || ns.Name != "Continue mobile handoff" || ns.LastUsed != wantTS {
 		t.Fatalf("bad metadata: %+v", ns)
 	}

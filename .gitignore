@@ -5,9 +5,12 @@
 # Local recovery snapshots created during executor experiments.
 *.backup-record2-*
 
-# FCM service account keys are runtime-only private files. Never commit or
-# embed them in public release binaries.
+# Private FCM credentials are provisioned at runtime, never compiled or shipped.
 cmd/everything-go/keys/*.json
+fcm_service_account.json
+serviceAccountKey.json
+internal/core/notification_reply_secret
+/release-artifacts/
 *.log
 .DS_Store
 
@@ -21,3 +24,27 @@ pairing.json
 fcm_token.txt
 /feed/
 /inbox/
+
+# Private state from a local --data-dir=. run must not become source history.
+/*.db
+/*.db-*
+/*.sqlite
+/*.sqlite-*
+/*_secret
+/instance_id
+/fcm_tokens.json
+push_relay_client.json
+.push-relay-client-*
+/push-relay-data/
+/session_runtime.json
+/goal_snapshots.json
+/codex_maintenance.json
+/codex-turn-requests/
+/session-recaps/
+/monitoring_env.sh
+.env
+.env.*
+
+# Managed LINE account and media runtimes
+/services/*/node_modules/
+/services/line-account/dist/

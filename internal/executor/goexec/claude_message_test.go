@@ -77,11 +77,15 @@ func TestClaudeSpawnArgsSandboxAndPlanParity(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch",
+		"--tools Read,Glob,Grep,WebSearch,WebFetch", "--permission-mode dontAsk", "--strict-mcp-config",
 		"--model claude-sonnet-4", "--resume uuid", "--effort high",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("read-only args missing %q: %v", want, args)
 		}
+	}
+	if strings.Contains(joined, "--dangerously-skip-permissions") {
+		t.Fatalf("read-only must not bypass tool permissions: %v", args)
 	}
 
 	ws := session.Snapshot{Model: "claude-sonnet-4", Sandbox: "workspace-write"}
@@ -89,6 +93,9 @@ func TestClaudeSpawnArgsSandboxAndPlanParity(t *testing.T) {
 	joined = strings.Join(args, " ")
 	if !strings.Contains(joined, "--disallowedTools Bash") {
 		t.Fatalf("workspace-write should disallow Bash: %v", args)
+	}
+	if strings.Contains(joined, "--dangerously-skip-permissions") || !strings.Contains(joined, "--permission-mode acceptEdits") {
+		t.Fatalf("workspace-write must use explicit edit mode, not bypass: %v", args)
 	}
 
 	plan := session.Snapshot{Model: "opusplan", Sandbox: "danger-full-access"}

@@ -2,6 +2,9 @@ package executor
 
 import (
 	"context"
+	"everything-go/internal/taskapi"
+	"fmt"
+	"sort"
 
 	"everything-go/internal/backend"
 	"everything-go/internal/session"
@@ -34,9 +37,18 @@ func (m *Mux) CatalogDefinitions(ctx context.Context, base []backend.Definition)
 // connection core supports multiple AI runtimes simultaneously, mirroring the
 // Python bridge's backend registry.
 type Mux struct {
+	admission backend.TurnAdmission
 	byBackend map[string]Executor
 	def       Executor
 	terminal  *TerminalSink
+}
+
+func (m *Mux) SetTurnAdmission(p backend.TurnAdmission) { m.admission = p }
+
+func (m *Mux) ObserveNativeLifecycle(s *session.Session, turnID, phase string) {
+	if observer, ok := m.pick(s).(backend.NativeTurnObserver); ok {
+		observer.ObserveNativeLifecycle(s, turnID, phase)
+	}
 }
 
 func NewMux(byBackend map[string]Executor, def Executor) *Mux {
@@ -55,13 +67,52 @@ func (m *Mux) pick(s *session.Session) Executor {
 }
 
 func (m *Mux) Send(ctx context.Context, s *session.Session, reqID, content string, images []backend.ImageAttachment, files []backend.FileAttachment) error {
+	if m.admission != nil {
+		updated, release, err := m.admission.AdmitTurn(s, reqID, content)
+		if err != nil {
+			if m.terminal != nil {
+				m.terminal.Emit(backend.NewError(s.ID, reqID, "pm_policy_rejected", err.Error()))
+			}
+			return err
+		}
+		defer release()
+		content = updated
+	}
 	e := m.pick(s)
 	if m.terminal == nil {
 		return e.Send(ctx, s, reqID, content, images, files)
 	}
 	return sendReliable(ctx, e, m.terminal, s, reqID, content, images, files)
 }
-func (m *Mux) Stop(ctx context.Context, s *session.Session) error  { return m.pick(s).Stop(ctx, s) }
+func (m *Mux) Stop(ctx context.Context, s *session.Session) error { return m.pick(s).Stop(ctx, s) }
+
+func (m *Mux) QueuedSubmissionReady(ctx context.Context, s *session.Session, requestID string) error {
+	if reader, ok := m.pick(s).(backend.QueuedSubmissionReader); ok {
+		return reader.QueuedSubmissionReady(ctx, s, requestID)
+	}
+	return nil
+}
+func (m *Mux) StartRealtimeVoice(ctx context.Context, s *session.Session, input backend.RealtimeVoiceStart) (backend.RealtimeVoiceAnswer, error) {
+	voice, ok := m.pick(s).(backend.RealtimeVoiceExecutor)
+	if !ok {
+		return backend.RealtimeVoiceAnswer{}, fmt.Errorf("此後端不支援雙向語音")
+	}
+	return voice.StartRealtimeVoice(ctx, s, input)
+}
+func (m *Mux) StopRealtimeVoice(ctx context.Context, s *session.Session, id string) error {
+	voice, ok := m.pick(s).(backend.RealtimeVoiceExecutor)
+	if !ok {
+		return fmt.Errorf("此後端不支援雙向語音")
+	}
+	return voice.StopRealtimeVoice(ctx, s, id)
+}
+func (m *Mux) AppendRealtimeVoiceText(ctx context.Context, s *session.Session, id, text string) error {
+	voice, ok := m.pick(s).(backend.RealtimeVoiceExecutor)
+	if !ok {
+		return fmt.Errorf("此後端不支援雙向語音")
+	}
+	return voice.AppendRealtimeVoiceText(ctx, s, id, text)
+}
 func (m *Mux) Clear(ctx context.Context, s *session.Session) error { return m.pick(s).Clear(ctx, s) }
 func (m *Mux) Close(ctx context.Context, s *session.Session) error { return m.pick(s).Close(ctx, s) }
 
@@ -129,6 +180,18 @@ func (m *Mux) ProviderFor(s *session.Session) (backend.HistoryProvider, bool) {
 	return hp, ok
 }
 
+// FinalAnswerForSession provides the exact terminal answer for Bridge-managed
+// delegation. It never substitutes streaming commentary for a final answer.
+func (m *Mux) FinalAnswerForSession(s *session.Session, requestID string) (string, bool, error) {
+	reader, ok := m.pick(s).(interface {
+		FinalAnswerForRequest(*session.Session, string) (string, bool, error)
+	})
+	if !ok {
+		return "", false, fmt.Errorf("final answer unavailable for backend %s", s.Backend())
+	}
+	return reader.FinalAnswerForRequest(s, requestID)
+}
+
 // AllProviders returns the distinct history providers across all backends,
 // for aggregating resumable sessions.
 func (m *Mux) AllProviders() []backend.HistoryProvider {
@@ -184,6 +247,65 @@ func (m *Mux) AllUsageProviders() []UsageProvider {
 	return out
 }
 
+// RuntimeDiagnostics aggregates distinct backend diagnostics without coupling
+// the core status endpoint to Codex or any other concrete runtime.
+func (m *Mux) RuntimeDiagnostics() map[string]any {
+	seen := map[Executor]bool{}
+	out := map[string]any{}
+	for _, e := range m.byBackend {
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		if provider, ok := e.(RuntimeDiagnosticsProvider); ok {
+			for key, value := range provider.RuntimeDiagnostics() {
+				out[key] = value
+			}
+		}
+	}
+	return out
+}
+
+func (m *Mux) MaintenanceRecords() []backend.Maintenance {
+	var records []backend.Maintenance
+	for _, e := range m.byBackend {
+		if p, ok := e.(backend.MaintenanceProvider); ok {
+			records = append(records, p.MaintenanceRecords()...)
+		}
+	}
+	return records
+}
+func (m *Mux) ReconcileMaintenance(ctx context.Context, id string, release bool) (backend.Maintenance, error) {
+	for _, e := range m.byBackend {
+		if p, ok := e.(backend.MaintenanceProvider); ok {
+			for _, r := range p.MaintenanceRecords() {
+				if r.SessionID == id {
+					return p.ReconcileMaintenance(ctx, id, release)
+				}
+			}
+		}
+	}
+	return backend.Maintenance{}, fmt.Errorf("no maintenance record")
+}
+
+// PrepareAsyncReply never submits input outside the Hub's durable admission.
+func (m *Mux) PrepareAsyncReply(id string, answers map[string]any, cancelled bool) (string, string, bool, error) {
+	for _, e := range m.byBackend {
+		if native, ok := e.(backend.NativeAsyncInteractions); ok {
+			if sid, content, handled, err := native.PrepareAsyncReply(id, answers, cancelled); handled {
+				return sid, content, true, err
+			}
+		}
+	}
+	return "", "", false, nil
+}
+
+func (m *Mux) ReconcileAsyncQuestions(s *session.Session) {
+	if native, ok := m.pick(s).(backend.NativeAsyncInteractions); ok {
+		native.ReconcileAsyncQuestions(s)
+	}
+}
+
 // RespondUserInput tries each interaction-capable backend until one owns the id.
 // The answer carries no session, so the backend matches by request_id/tool_use_id.
 func (m *Mux) RespondUserInput(id string, answers map[string]any, cancelled bool) bool {
@@ -216,4 +338,51 @@ func (m *Mux) PendingInteractions(sessionID string) []backend.UserInputPayload {
 		}
 	}
 	return out
+}
+
+func (m *Mux) TaskAPICapabilities() []taskapi.ProviderCapability {
+	out := []taskapi.ProviderCapability{}
+	names := []string{}
+	for name := range m.byBackend {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if source, ok := m.byBackend[name].(backend.TaskCapabilitySource); ok {
+			out = append(out, source.TaskAPICapabilities()...)
+		} else {
+			out = append(out, taskapi.UnloadedCapability(name, "unknown", "No authenticated Task API provider invocation adapter is registered."))
+		}
+	}
+	return out
+}
+
+func (m *Mux) AppendRealtimeVoiceSpeech(ctx context.Context, s *session.Session, voice, text string) error {
+	p, ok := m.pick(s).(backend.RealtimeSpeechExecutor)
+	if !ok {
+		return fmt.Errorf("原語音來源尚未支援直接匯報")
+	}
+	return p.AppendRealtimeVoiceSpeech(ctx, s, voice, text)
+}
+func (m *Mux) ReadRealtimeVoiceSpeech(ctx context.Context, s *session.Session, voice string, since int64) (backend.RealtimeSpeechEvidence, error) {
+	p, ok := m.pick(s).(backend.RealtimeSpeechReader)
+	if !ok {
+		return backend.RealtimeSpeechEvidence{}, fmt.Errorf("原來源未提供逐通話播報回讀")
+	}
+	return p.ReadRealtimeVoiceSpeech(ctx, s, voice, since)
+}
+
+// Only a retained bounded task may use this enforcer; it grants no arbitrary
+// existing-target creation route and changes no provider/global settings.
+func (m *Mux) ExistingTaskScopeMode() string { return "retained_bounded_only" }
+func (m *Mux) ValidateExistingTaskScope(s *session.Session, scope taskapi.ChildScope, cwd string) error {
+	e, ok := m.byBackend[s.Backend()]
+	if !ok {
+		return taskapi.Failure("unsupported", "known_none", "read_capabilities")
+	}
+	guard, ok := e.(backend.ExistingTaskScopeEnforcer)
+	if !ok {
+		return taskapi.Failure("unsupported", "known_none", "read_capabilities")
+	}
+	return guard.ValidateExistingTaskScope(s, scope, cwd)
 }

@@ -1,0 +1,26 @@
+{
+  "name": "bridge-line-service",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test test/*.test.mjs",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@evex/linejs": "npm:@jsr/evex__linejs@3.4.2",
+    "qrcode": "1.5.4",
+    "undici": "7.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.3",
+    "typescript": "6.0.2"
+  },
+  "overrides": {
+    "thrift": "0.23.0",
+    "@jsr/evex__linejs-types": "3.5.0"
+  }
+}

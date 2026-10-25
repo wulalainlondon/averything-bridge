@@ -2,7 +2,11 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +16,7 @@ import (
 
 	"everything-go/internal/clientproto"
 	"everything-go/internal/executor"
+	"everything-go/internal/inbox"
 	"everything-go/internal/protocol"
 	rt "everything-go/internal/runtime"
 	"everything-go/internal/search"
@@ -105,8 +110,22 @@ func (h *Hub) sendDirListing(c *Client, cmd clientproto.Command) {
 	if !c.live() {
 		return
 	}
-	path := rt.ExpandPath(cmd.Path)
+	path, err := h.scopedPath(cmd.Path)
+	if err != nil {
+		// Parent/home navigation stays at the jail root, so older clients
+		// cannot navigate above it even if they show a parent button.
+		path = realpath(rt.ExpandPath(h.cfg.RootDir))
+	}
 	entries := rt.ListEntries(path)
+	if h.cfg.RootDir != "" {
+		visible := entries[:0]
+		for _, entry := range entries {
+			if h.cwdInScope(filepath.Join(path, entry.Name)) {
+				visible = append(visible, entry)
+			}
+		}
+		entries = visible
+	}
 	hash := rt.DirHash(entries)
 	unchanged := cmd.ClientHash != "" && cmd.ClientHash == hash
 
@@ -159,7 +178,11 @@ var previewURLTypes = map[string]string{
 }
 
 func (h *Hub) sendFileOpened(c *Client, cmd clientproto.Command) {
-	path := rt.ExpandPath(cmd.Path)
+	path, scopeErr := h.scopedPath(cmd.Path)
+	if scopeErr != nil {
+		c.enqueueEvent(protocol.NewFileOpened(cmd.Path, filepath.Base(cmd.Path), "", "", 0, "text/plain", scopeErr.Error()))
+		return
+	}
 	name := filepath.Base(path)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -204,14 +227,22 @@ func (h *Hub) sendMarkdownFilesListing(c *Client, cmd clientproto.Command) {
 		if strings.TrimSpace(raw) == "" || len(files) >= limit {
 			continue
 		}
-		root := rt.ExpandPath(raw)
+		root, scopeErr := h.scopedPath(raw)
+		if scopeErr != nil {
+			errors = append(errors, protocol.MarkdownScanError{Path: raw, Error: scopeErr.Error()})
+			continue
+		}
 		roots = append(roots, root)
 		found, err := rt.ScanMarkdownFiles(root, limit-len(files))
 		if err != nil {
 			errors = append(errors, protocol.MarkdownScanError{Path: raw, Error: err.Error()})
 			continue
 		}
-		files = append(files, found...)
+		for _, file := range found {
+			if h.cwdInScope(file.Path) {
+				files = append(files, file)
+			}
+		}
 	}
 	sort.SliceStable(files, func(i, j int) bool {
 		if files[i].Modified != files[j].Modified {
@@ -223,7 +254,11 @@ func (h *Hub) sendMarkdownFilesListing(c *Client, cmd clientproto.Command) {
 }
 
 func (h *Hub) saveFile(c *Client, cmd clientproto.Command) {
-	path := rt.ExpandPath(cmd.Path)
+	path, scopeErr := h.scopedPath(cmd.Path)
+	if scopeErr != nil {
+		c.enqueueEvent(protocol.NewFileSaved(cmd.Path, filepath.Base(cmd.Path), "", 0, 0, "text/plain", scopeErr.Error()))
+		return
+	}
 	name := filepath.Base(path)
 	saveErr := func(content string, size, modified int64, msg string) {
 		c.enqueueEvent(protocol.NewFileSaved(path, name, content, size, modified, "text/plain; charset=utf-8", msg))
@@ -306,12 +341,9 @@ func (h *Hub) resumableForPath(path string) []protocol.DirSession {
 
 // --- file push inbox (push_file / file_push_ack / get_inbox) ----------------
 
-// handlePushFile inlines a local file and broadcasts it to every connected
-// device but the sender, persisting it to the inbox so an offline device can
-// recover it on its next hello. Mirrors push_registry.handle_push_file (inline
-// path). Path is expanded like the other Go file handlers (no jail, matching
-// browse_dir/open_file). The push_ack goes only to the sender; the file_push
-// broadcast (with the base64 body) goes to everyone via the hub.
+// handlePushFile stores a local file and broadcasts its download metadata to every connected
+// device, persisting it for recovery on hello. The sender receives push_ack;
+// file_push carries a file-specific download URL, never the base64 body.
 func (h *Hub) handlePushFile(c *Client, reqPath string) {
 	if h.inbox == nil {
 		return
@@ -324,7 +356,21 @@ func (h *Hub) handlePushFile(c *Client, reqPath string) {
 	}
 	log.Printf("[push] file=%s id=%s size=%d → %d device(s)", item.Filename, item.FileID, item.Size, len(h.connectedDeviceIDs(c.deviceID)))
 	c.enqueueEvent(protocol.NewPushAck(item.FileID, item.Filename, item.Size))
-	h.Emit(protocol.NewFilePush(item.FileID, item.Filename, item.URL, item.Data, item.Size, item.MimeType))
+	prepared, err := h.inbox.DownloadItem(item)
+	if err != nil {
+		c.enqueueEvent(protocol.NewError("", "", "File download unavailable: "+err.Error()))
+		return
+	}
+	h.mu.RLock()
+	clients := make([]*Client, 0, len(h.clients))
+	for client := range h.clients {
+		clients = append(clients, client)
+	}
+	h.mu.RUnlock()
+	for _, client := range clients {
+		wire := h.inboxWireItem(client, prepared)
+		client.enqueueEvent(protocol.NewFilePush(wire.FileID, wire.Filename, wire.URL, "", wire.Size, wire.MimeType))
+	}
 	if h.fcm != nil {
 		go h.fcm.NotifyFilePush(item.FileID, item.Filename)
 	}
@@ -352,25 +398,85 @@ func (h *Hub) sendPendingPushes(c *Client) {
 		if !c.live() {
 			return
 		}
-		c.enqueueEvent(protocol.NewFilePush(it.FileID, it.Filename, it.URL, it.Data, it.Size, it.MimeType))
+		prepared, err := h.inbox.DownloadItem(it)
+		if err != nil {
+			c.enqueueEvent(protocol.NewError("", "", "File download unavailable: "+err.Error()))
+			continue
+		}
+		wire := h.inboxWireItem(c, prepared)
+		c.enqueueEvent(protocol.NewFilePush(wire.FileID, wire.Filename, wire.URL, "", wire.Size, wire.MimeType))
 	}
 }
 
 // inboxItems builds the inbox_list reply (get_inbox), which—unlike the hello
 // replay—includes pushed_at on each item.
-func (h *Hub) inboxItems(deviceID string) []protocol.InboxItem {
+func (h *Hub) inboxItems(c *Client) []protocol.InboxItem {
 	if h.inbox == nil {
 		return nil
 	}
-	pending := h.inbox.Pending(deviceID)
+	pending := h.inbox.Pending(c.deviceID)
 	out := make([]protocol.InboxItem, 0, len(pending))
 	for _, it := range pending {
-		out = append(out, protocol.InboxItem{
-			FileID: it.FileID, Filename: it.Filename, URL: it.URL,
-			Data: it.Data, Size: it.Size, MimeType: it.MimeType, PushedAt: it.PushedAt,
-		})
+		prepared, err := h.inbox.DownloadItem(it)
+		if err != nil {
+			c.enqueueEvent(protocol.NewError("", "", "File download unavailable: "+err.Error()))
+			continue
+		}
+		out = append(out, h.inboxWireItem(c, prepared))
 	}
 	return out
+}
+
+func (h *Hub) inboxWireItem(c *Client, item inbox.Item) protocol.InboxItem {
+	remote := item.URL
+	if strings.HasPrefix(remote, inbox.DownloadPrefix) {
+		origin := c.downloadOrigin
+		if origin == "" {
+			host := h.cfg.LanIP
+			if host == "" {
+				host = "127.0.0.1"
+			}
+			origin = "http://" + net.JoinHostPort(host, fmt.Sprint(h.cfg.Port))
+		}
+		remote = strings.TrimRight(origin, "/") + remote
+	}
+	return protocol.InboxItem{FileID: item.FileID, Filename: item.Filename, URL: remote,
+		Size: item.Size, MimeType: item.MimeType, PushedAt: item.PushedAt}
+}
+
+// Metadata can still accumulate for a long-lived desktop inbox. Keep every
+// list message bounded; existing clients merge inbox_list items by file ID.
+const inboxListMaxBytes = 48 * 1024 // also fits the WebRTC DataChannel message limit
+
+func (h *Hub) sendInbox(c *Client) {
+	items := h.inboxItems(c)
+	batch := []protocol.InboxItem{}
+	size := 64 // envelope, brackets and separators
+	for _, item := range items {
+		raw, err := json.Marshal(item)
+		if err != nil || len(raw)+64 > inboxListMaxBytes {
+			c.enqueueEvent(protocol.NewError("", "", "File metadata exceeds inbox message limit"))
+			continue
+		}
+		if size+len(raw)+1 > inboxListMaxBytes {
+			c.enqueueEvent(h.client.InboxListItems(batch))
+			batch = []protocol.InboxItem{}
+			size = 64
+		}
+		batch = append(batch, item)
+		size += len(raw) + 1
+	}
+	if len(batch) > 0 || len(items) == 0 {
+		c.enqueueEvent(h.client.InboxListItems(batch))
+	}
+}
+
+func (h *Hub) ServeInboxDownload(w http.ResponseWriter, r *http.Request) {
+	if h.inbox == nil {
+		http.NotFound(w, r)
+		return
+	}
+	h.inbox.DownloadHandler().ServeHTTP(w, r)
 }
 
 // realpath resolves symlinks like os.path.realpath; falls back to the absolute
@@ -443,17 +549,23 @@ func (h *Hub) statusResult(sessionID string) protocol.StatusResult {
 		}
 		queued += s.QueueLen()
 	}
+	status := map[string]any{
+		"server_time_ms":     time.Now().UnixMilli(),
+		"platform":           runtime.GOOS + "/" + runtime.GOARCH,
+		"go_version":         runtime.Version(),
+		"sessions_total":     len(sessions),
+		"sessions_streaming": streaming,
+		"queued_commands":    queued,
+		"permission_mode":    "enforce",
+	}
+	if provider, ok := h.exec.(interface{ RuntimeDiagnostics() map[string]any }); ok {
+		if diagnostics := provider.RuntimeDiagnostics(); len(diagnostics) > 0 {
+			status["backend_runtimes"] = diagnostics
+		}
+	}
 	return protocol.StatusResult{
 		Type:      "status_result",
 		SessionID: sessionID,
-		Status: map[string]any{
-			"server_time_ms":     time.Now().UnixMilli(),
-			"platform":           runtime.GOOS + "/" + runtime.GOARCH,
-			"go_version":         runtime.Version(),
-			"sessions_total":     len(sessions),
-			"sessions_streaming": streaming,
-			"queued_commands":    queued,
-			"permission_mode":    "enforce",
-		},
+		Status:    status,
 	}
 }

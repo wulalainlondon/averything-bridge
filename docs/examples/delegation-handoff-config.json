@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "parents": {
+    "REPLACE_WITH_AUTHORIZED_PARENT_SESSION_ID": {
+      "workspace": "/Users/wulala/Downloads/Helper/bridge-handoff-return-20261010",
+      "path": "coordinator-handoff.example.json",
+      "max_age_seconds": 86400
+    }
+  }
+}

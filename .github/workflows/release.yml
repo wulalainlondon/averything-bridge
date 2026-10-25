@@ -1,4 +1,4 @@
-name: canonical-entry-verification
+name: release-source-verification
 on:
   push:
     tags: ['v*']
@@ -10,7 +10,19 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check compatibility entry syntax
-        run: bash -n install.sh
-# Support tags never build a second backend, read signing credentials or publish.
-# The authorized controller publishes only identical canonical frozen artifacts.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify source contracts and release scanner
+        run: |
+          go test ./...
+          node --test scripts/check_release_secrets.test.mjs
+      - name: Compile without publishing or accessing signing credentials
+        run: |
+          mkdir -p "$RUNNER_TEMP/go-release-check"
+          for arch in arm64 amd64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -o "$RUNNER_TEMP/go-release-check/$arch" ./cmd/everything-go
+          done
+          node scripts/check_release_secrets.mjs "$RUNNER_TEMP/go-release-check/arm64" "$RUNNER_TEMP/go-release-check/amd64"
+# Exact frozen, Developer-ID signed, Accepted/stapled artifacts are published
+# separately after independent source/artifact QA; tagging cannot replace them.

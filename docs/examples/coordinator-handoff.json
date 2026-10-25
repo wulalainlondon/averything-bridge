@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "updated_at": "2026-10-10T00:00:00Z",
+  "goal": "Implement the authorized bounded Bridge handoff return mechanism",
+  "progress": "EXAMPLE ONLY: independent source QA and deployment are unverified",
+  "next_step": "Coordinator verifies evidence and arranges independent QA; deployment needs its existing authorization"
+}

@@ -26,17 +26,22 @@ type Opts struct {
 	// IncludeThinking keeps assistant thinking blocks in the reply. Off by
 	// default: legacy clients validate history blocks with a strict
 	// text/tool_call union and would reject the whole event otherwise.
-	IncludeThinking bool
+	IncludeThinking            bool
+	Scoped                     bool   // opt-in authenticated continuity pages
+	DeferredAssistantRequestID string // exact running request; native tool outputs can still append
 }
 
 // Result is the output of Slice — either a snapshot or a delta page.
 type Result struct {
-	Kind           string // "snapshot" | "delta"
-	Messages       []map[string]any
-	SourceCount    int
-	KnownIDFound   bool
-	SnapshotReason string
-	HasMoreBefore  bool
+	Kind              string // "snapshot" | "delta"
+	Messages          []map[string]any
+	SourceCount       int
+	KnownIDFound      bool
+	SnapshotReason    string
+	HasMoreBefore     bool
+	HasMoreAfter      bool
+	SourceGeneration  string
+	SourceGenerations map[string]string
 }
 
 // ResumableSession is one entry in the resumable_sessions list.
@@ -136,6 +141,23 @@ func Slice(messages []map[string]any, opts Opts) *Result {
 	limit := ClampLimit(opts.Limit)
 	count := len(messages)
 
+	if opts.Mode == "continuation" && opts.KnownLast != "" {
+		if idx := indexOf(messages, opts.KnownLast); idx >= 0 {
+			end := idx + limit
+			if end > count {
+				end = count
+			}
+			return &Result{Kind: "snapshot", Messages: messages[idx:end], SourceCount: count, KnownIDFound: true, SnapshotReason: "continuation_page", HasMoreBefore: idx > 0, HasMoreAfter: end < count}
+		}
+		return &Result{Kind: "snapshot", Messages: nil, SourceCount: count, KnownIDFound: false, SnapshotReason: "continuation_page"}
+	}
+	if opts.Mode == "beginning" {
+		end := limit
+		if end > count {
+			end = count
+		}
+		return &Result{Kind: "snapshot", Messages: messages[:end], SourceCount: count, KnownIDFound: true, SnapshotReason: "beginning_page", HasMoreAfter: end < count}
+	}
 	if opts.Before != "" {
 		idx := indexOf(messages, opts.Before)
 		if idx >= 0 {

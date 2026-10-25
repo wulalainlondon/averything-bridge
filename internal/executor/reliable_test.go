@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"everything-go/internal/backend"
 	"everything-go/internal/history"
@@ -13,6 +14,29 @@ import (
 
 type capSink struct{ events []any }
 
+func TestReliableMuxPreservesUncertainAndPreSubmissionBusy(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		sink := &capSink{}
+		terminal := NewTerminalSink(sink)
+		inner := &reliableFake{sink: terminal, err: errors.New("native_acceptance_unknown"),
+			emit: backend.NativeSubmissionUncertain{SessionID: "s1", RequestID: "r1", Reason: "native_acceptance_unknown"}}
+		if busy {
+			inner.err, inner.emit = backend.ErrNativeSubmissionBusy, nil
+		}
+		mux := NewReliableMux(map[string]Executor{"codex": inner}, inner, terminal)
+		s := session.NewRegistry().Create("s1", "n", "/tmp", "codex", "", "", "")
+		_ = mux.Send(context.Background(), s, "r1", "hi", nil, nil)
+		for _, event := range sink.events {
+			if _, ok := event.(protocol.Error); ok {
+				t.Fatal("manufactured failure", event)
+			}
+		}
+		if !terminal.Done(turnKey{sessionID: "s1", reqID: "r1"}) {
+			t.Fatal("adapter invocation leaked")
+		}
+	}
+}
+
 func (s *capSink) Emit(e any) { s.events = append(s.events, e) }
 
 type reliableFake struct {
@@ -21,6 +45,24 @@ type reliableFake struct {
 	panic  bool
 	emit   any
 	called bool
+}
+
+func TestTerminalSinkIgnoresLegacyWallClockTimeoutUntilRealTerminal(t *testing.T) {
+	sink := &capSink{}
+	terminal := NewTerminalSinkWithTimeout(sink, time.Millisecond)
+	key := terminal.Begin("long-running", "owned-request")
+	time.Sleep(25 * time.Millisecond)
+	if terminal.Done(key) || len(sink.events) != 0 {
+		t.Fatal("elapsed time manufactured a terminal")
+	}
+	terminal.Emit(protocol.NewDone("long-running", "other-request"))
+	if terminal.Done(key) {
+		t.Fatal("unrelated terminal released long turn")
+	}
+	terminal.Emit(protocol.NewStopped("long-running", "owned-request"))
+	if !terminal.Done(key) {
+		t.Fatal("confirmed stop did not settle long turn")
+	}
 }
 
 func (f *reliableFake) Send(ctx context.Context, s *session.Session, reqID, content string, images []backend.ImageAttachment, files []backend.FileAttachment) error {
@@ -109,5 +151,21 @@ func TestReliableMuxDoesNotHideHistoryCapability(t *testing.T) {
 
 	if _, ok := mux.ProviderFor(s); !ok {
 		t.Fatal("history capability should still be visible through mux")
+	}
+}
+
+type diagnosticFake struct{ reliableFake }
+
+func (d *diagnosticFake) RuntimeDiagnostics() map[string]any {
+	return map[string]any{"codex": map[string]any{"status": "ready", "running_version": "0.153.0"}}
+}
+
+func TestMuxAggregatesRuntimeDiagnostics(t *testing.T) {
+	inner := &diagnosticFake{}
+	mux := NewMux(map[string]Executor{"codex": inner, "alias": inner}, inner)
+	got := mux.RuntimeDiagnostics()
+	codex, ok := got["codex"].(map[string]any)
+	if !ok || codex["status"] != "ready" || codex["running_version"] != "0.153.0" {
+		t.Fatalf("unexpected diagnostics: %+v", got)
 	}
 }

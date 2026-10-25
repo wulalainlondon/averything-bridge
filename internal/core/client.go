@@ -2,9 +2,12 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -54,6 +57,12 @@ type pinger interface {
 
 // addressable is the optional contract a transport implements when it can report
 // a remote peer address, surfaced in connection logs for observability.
+// Control writes on coder/websocket are independently serialized by the library.
+// Waiting for a pong must not hold the application-data write mutex.
+type concurrentControlPinger interface{ ConcurrentControlPing() }
+
+func (w wsConn) ConcurrentControlPing() {}
+
 type addressable interface {
 	RemoteAddr() string
 }
@@ -65,14 +74,28 @@ type enrollmentEligible interface {
 // wsConn adapts coder/websocket to wireConn. Frames are always text (the wire
 // protocol is JSON); the read/write message type is fixed.
 type wsConn struct {
-	c         *websocket.Conn
-	addr      string // r.RemoteAddr captured at accept time, for logging
-	canEnroll bool
+	c          *websocket.Conn
+	addr       string // r.RemoteAddr captured at accept time, for logging
+	canEnroll  bool
+	progress   *atomic.Int64 // bytes read within a data message, not merely its header
+	httpOrigin string        // actual client-facing WS origin, including reverse proxy TLS
 }
 
+func (w wsConn) HTTPOrigin() string { return w.httpOrigin }
+
 func (w wsConn) Read(ctx context.Context) ([]byte, error) {
-	_, data, err := w.c.Read(ctx)
-	return data, err
+	_, reader, err := w.c.Reader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(inboundProgressReader{Reader: reader, progress: w.progress})
+}
+
+func (w wsConn) LastInboundProgress() time.Time {
+	if w.progress == nil || w.progress.Load() == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, w.progress.Load())
 }
 
 func (w wsConn) Write(ctx context.Context, data []byte) error {
@@ -94,9 +117,14 @@ func (w wsConn) EnrollmentEligible() bool { return w.canEnroll }
 // Client is one logical connection (WS or WebRTC DataChannel). A single write
 // pump goroutine drains the send channel so conn writes are never concurrent.
 type Client struct {
-	hub  *Hub
-	conn wireConn
-	send chan []byte
+	interactionControl bool // server-owned question delivery; never parsed from client input
+	callbackCapable    atomic.Bool
+	callbackNative     atomic.Bool
+	hub                *Hub
+	conn               wireConn
+	send               chan []byte
+	urgent             chan []byte // small heartbeat replies must not queue behind snapshots
+	writeMu            sync.Mutex  // a bounded data write must not race a shorter ping deadline
 	// quit is closed exactly once when the client is torn down. The send channel
 	// is deliberately NEVER closed: background goroutines (sendHistory, sendUsage,
 	// …) outlive the read loop and may call enqueue after disconnect, so closing
@@ -111,8 +139,15 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	clientID string
-	deviceID string
+	clientID           string
+	downloadOrigin     string
+	deviceID           string
+	clientSurface      string
+	protocolVersion    int
+	inventoryBinding   atomic.Pointer[clientInventoryBinding]
+	inventoryName      string
+	inventoryProbe     bool
+	offlineDeviceGuard bool
 	// enrollmentOnly is true when the handshake was admitted solely through a
 	// short-lived LAN pairing window. Such a client may only complete claim_bridge
 	// (or ping) until its credential is persisted.
@@ -121,7 +156,10 @@ type Client struct {
 	// supportsReplayAck is negotiated by hello{replay_ack:true}. New clients
 	// receive bounded offline_replay_batch frames; legacy clients use a throttled
 	// per-event fallback so they remain compatible without overflowing send.
-	supportsReplayAck bool
+	supportsReplayAck       bool
+	supportsSessionReadSync atomic.Bool
+	readIdentity            atomic.Pointer[pairedReadIdentity]
+	supportsCollaborationV2 atomic.Bool
 
 	// rtc holds the answering peer connection negotiated over this client's
 	// signaling channel, if any. Set on webrtc_offer; consulted by webrtc_ice
@@ -133,7 +171,16 @@ type Client struct {
 	// is queued on the same TCP stream. A pong can otherwise sit behind several
 	// megabytes of binary frames and look like a dead client on slower mobile
 	// links even though upload bytes are still arriving.
-	uploadActive atomic.Bool
+	uploadActive    atomic.Bool
+	dispatchActive  atomic.Bool
+	dispatchStarted atomic.Int64
+}
+
+func (c *Client) wireAuthority() string {
+	if c.protocolVersion >= 3 {
+		return c.hub.cfg.InstanceID
+	}
+	return ""
 }
 
 func (c *Client) enqueue(data []byte) {
@@ -211,21 +258,46 @@ func (c *Client) pingLoopEvery(ctx context.Context, interval, timeout time.Durat
 			if c.uploadActive.Load() {
 				continue
 			}
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			err := p.Ping(pctx)
-			cancel()
+			if !c.writeMu.TryLock() {
+				// The write pump has its own finite deadline. Starting a 10s
+				// control ping behind a slow data write falsely kills live peers.
+				continue
+			}
+			_, independentControl := p.(concurrentControlPinger)
+			if independentControl {
+				c.writeMu.Unlock()
+			}
+			err := pingWithInboundProgress(ctx, p, timeout, 2*time.Minute)
+			if !independentControl {
+				c.writeMu.Unlock()
+			}
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				} // normal owner shutdown is not a zombie
+
 				select {
 				case <-c.quit: // already being torn down; not a zombie
 					return
 				default:
 				}
-				log.Printf("[conn] ping timeout client=%s device=%s kind=%s addr=%s → dropping zombie",
-					c.clientID, c.deviceID, c.conn.Kind(), c.remoteAddr())
+				inboundAge := int64(-1)
+				if progress, ok := p.(inboundProgress); ok {
+					if last := progress.LastInboundProgress(); !last.IsZero() {
+						inboundAge = time.Since(last).Milliseconds()
+					}
+				}
+				dispatchAge := int64(-1)
+				if c.dispatchActive.Load() {
+					dispatchAge = time.Since(time.Unix(0, c.dispatchStarted.Load())).Milliseconds()
+				}
+				log.Printf("[conn] ping failure client=%s device=%s kind=%s class=%s inbound_age_ms=%d dispatch_active=%t dispatch_age_ms=%d → closing control connection",
+					c.clientID, c.deviceID, c.conn.Kind(), pingFailureClass(err), inboundAge, c.dispatchActive.Load(), dispatchAge)
 				c.conn.Close("ping timeout")
 				c.shutdown()
 				return
 			}
+			c.hub.touchDeviceInventory(c)
 		}
 	}
 }
@@ -234,7 +306,9 @@ func (c *Client) pingLoopEvery(ctx context.Context, interval, timeout time.Durat
 // connection closes.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // app connects from arbitrary LAN origins
+		InsecureSkipVerify:   true, // app connects from arbitrary LAN origins
+		CompressionMode:      webSocketCompressionMode(r.UserAgent()),
+		CompressionThreshold: 1024,
 	})
 	if err != nil {
 		log.Printf("ws accept error: %v", err)
@@ -242,8 +316,35 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(32 * 1024 * 1024)
 	h.serveConn(context.Background(), wsConn{
-		c: conn, addr: r.RemoteAddr, canEnroll: directPrivateRequest(r),
+		c: conn, addr: r.RemoteAddr, canEnroll: directPrivateRequest(r), progress: &atomic.Int64{}, httpOrigin: requestHTTPOrigin(r),
 	})
+}
+
+// Apple NSURLSession/WebKit transports advertise permessage-deflate but can
+// fail while receiving the first compressed bootstrap message (POSIX protocol
+// error). Native Swift already opts out; handle Safari and iOS WebViews here,
+// where browser WebSocket APIs cannot override the upgrade headers.
+func webSocketCompressionMode(userAgent string) websocket.CompressionMode {
+	if strings.Contains(userAgent, "CFNetwork/") ||
+		(strings.Contains(userAgent, "AppleWebKit/") && !strings.Contains(userAgent, "Chrome/") && !strings.Contains(userAgent, "Android")) {
+		return websocket.CompressionDisabled
+	}
+	return websocket.CompressionNoContextTakeover
+}
+
+func requestHTTPOrigin(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	// cloudflared connects to the local bridge over HTTP but preserves the
+	// public Host and X-Forwarded-Proto. Trust that scheme only from loopback.
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil && ip.IsLoopback() &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+		scheme = "https"
+	}
+	return (&url.URL{Scheme: scheme, Host: r.Host}).String()
 }
 
 func directPrivateRequest(r *http.Request) bool {
@@ -277,12 +378,16 @@ func (h *Hub) serveConn(ctx context.Context, conn wireConn) {
 		hub:      h,
 		conn:     conn,
 		send:     make(chan []byte, sendQueue),
+		urgent:   make(chan []byte, 8),
 		quit:     make(chan struct{}),
 		ctx:      cctx,
 		cancel:   cancel,
 		clientID: randomID(),
 	}
 	c.uploads = newAttachmentUploads(c, h.cfg.DataDir)
+	if origin, ok := conn.(interface{ HTTPOrigin() string }); ok {
+		c.downloadOrigin = origin.HTTPOrigin()
+	}
 
 	// Governance boundary: the first frame MUST be a valid hello carrying an
 	// accepted auth token (when the bridge is locked or BRIDGE_AUTH_TOKEN is
@@ -300,8 +405,20 @@ func (h *Hub) serveConn(ctx context.Context, conn wireConn) {
 		conn.Close("handshake rejected")
 		return
 	}
+	if c.offlineDeviceGuard {
+		c.deviceID = hello.DeviceID
+		if !h.reserveOfflineDevice(c) {
+			c.writeNow(ctx, protocol.Error{Type: "error", Code: "device_identity_in_use", Message: "This paired identity already has an active connection; select an offline QA identity."})
+			conn.Close("device_identity_in_use")
+			return
+		}
+	}
 
-	h.addClient(c)
+	// Authenticated probes are not application clients: no broadcasts,
+	// offline replay lease, or replacement of the device's active transport.
+	if !c.inventoryProbe {
+		h.addClient(c)
+	}
 	log.Printf("[conn] connected client=%s kind=%s device=%s addr=%s", c.clientID, conn.Kind(), hello.DeviceID, c.remoteAddr())
 
 	go c.writePump(ctx)
@@ -310,6 +427,9 @@ func (h *Hub) serveConn(ctx context.Context, conn wireConn) {
 	closeReason := c.readLoop(ctx)
 
 	h.removeClient(c)
+	if b := c.inventoryBinding.Load(); b != nil && h.deviceInventory != nil {
+		h.deviceInventory.Disconnect(b.key, c.clientID)
+	}
 	h.cleanupWebRTC(c) // drop the answering PC unless its DataChannel was promoted
 	c.shutdown()       // stop the write pump; background enqueuers now drop silently
 	c.uploads.close()
@@ -344,6 +464,18 @@ func (c *Client) handshake(ctx context.Context) (clientproto.Command, bool) {
 		c.writeNow(ctx, protocol.NewError("", "", "Unauthorized: invalid auth token"))
 		return clientproto.Command{}, false
 	}
+	if in.RequireOfflineDevice {
+		if c.enrollmentOnly || in.ConnectionProbe || !c.hub.pairing.MatchesDevice(provided, in.DeviceID) {
+			c.writeNow(ctx, protocol.Error{Type: "error", Code: "offline_device_guard_requires_pair", Message: "An offline QA connection requires its exact existing paired identity."})
+			return clientproto.Command{}, false
+		}
+		c.offlineDeviceGuard = true
+	}
+	c.inventoryName, c.inventoryProbe = in.DeviceName, in.ConnectionProbe
+	if !c.enrollmentOnly && c.hub.pairing.MatchesDevice(provided, in.DeviceID) {
+		c.readIdentity.Store(&pairedReadIdentity{token: provided, deviceID: in.DeviceID})
+	}
+	c.hub.bindDeviceInventory(c, provided, in.DeviceID, in.DeviceName, in.ClientSurface, in.ConnectionProbe)
 	logInbound(in.Type, in.SessionID)
 	return c.hub.client.ParseCommand(in), true
 }
@@ -353,7 +485,7 @@ func (c *Client) handshake(ctx context.Context) (clientproto.Command, bool) {
 // conn at this point.
 func (c *Client) writeNow(ctx context.Context, event any) {
 	logOutbound(event)
-	data, err := marshalEvent(event)
+	data, err := marshalEvent(event, c.wireAuthority())
 	if err != nil {
 		return
 	}
@@ -364,38 +496,92 @@ func (c *Client) writeNow(ctx context.Context, event any) {
 
 func (c *Client) writePump(ctx context.Context) {
 	for {
+		var data []byte
 		select {
 		case <-c.quit:
 			return
-		case data := <-c.send:
-			wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			err := c.conn.Write(wctx, data)
-			cancel()
-			if err != nil {
-				c.shutdown() // unblock enqueuers waiting on a dead socket
+		case data = <-c.urgent:
+		default:
+		}
+		if data == nil {
+			select {
+			case <-c.quit:
 				return
+			case data = <-c.urgent:
+			case data = <-c.send:
 			}
 		}
+		c.writeMu.Lock()
+		// A queued native/replay frame is not a durable read grant. Membership
+		// may have changed while this socket was backpressured.
+		if c.hub != nil && !c.hub.workspaceNativeFrameAllowed(c, data) {
+			c.writeMu.Unlock()
+			continue
+		}
+		wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := c.conn.Write(wctx, data)
+		cancel()
+		c.writeMu.Unlock()
+		if err != nil {
+			c.shutdown() // unblock enqueuers waiting on a dead socket
+			c.conn.Close("write failed")
+			return
+		}
+	}
+}
+
+func (c *Client) enqueuePong() {
+	if c.urgent == nil { // in-memory/legacy transports
+		c.enqueueEvent(c.hub.client.Pong())
+		return
+	}
+	data, err := marshalEvent(c.hub.client.Pong(), c.wireAuthority())
+	if err != nil {
+		return
+	}
+	select {
+	case c.urgent <- data:
+	case <-c.quit:
+	default: // One queued pong already proves liveness; bound probe floods.
 	}
 }
 
 // readLoop consumes inbound frames until the transport errors, returning that
 // error as the close reason (for observability).
 func (c *Client) readLoop(ctx context.Context) error {
-	for {
-		data, err := c.conn.Read(ctx)
-		if err != nil {
-			return err
-		}
-		if c.uploads.writeFrame(data) {
-			continue
-		}
-		in, err := protocol.ParseInbound(data)
-		if err != nil {
-			log.Printf("client %s: bad frame: %v", c.clientID, err)
-			continue
-		}
-		logInbound(in.Type, in.SessionID)
-		c.hub.route(ctx, c, c.hub.client.ParseCommand(in))
+	return readAndDispatchFrames(ctx, c.conn, c.dispatchFrame)
+}
+
+func (c *Client) dispatchFrame(ctx context.Context, data []byte) error {
+	c.dispatchStarted.Store(time.Now().UnixNano())
+	c.dispatchActive.Store(true)
+	defer c.dispatchActive.Store(false)
+	if c.uploads.writeFrame(data) {
+		return nil
 	}
+	var taskHeader struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &taskHeader) == nil && taskHeader.Type == "task_callback_request" {
+		c.hub.handleTaskCallback(ctx, c, data)
+		return nil
+	}
+	if json.Unmarshal(data, &taskHeader) == nil && taskHeader.Type == "task_api_request" {
+		c.hub.handleTaskAPI(ctx, c, data)
+		return nil
+	}
+	in, err := protocol.ParseInbound(data)
+	if err != nil {
+		log.Printf("client %s: bad frame: %v", c.clientID, err)
+		return nil
+	}
+	if c.offlineDeviceGuard && in.Type == "hello" &&
+		(in.DeviceID != c.deviceID || in.ConnectionProbe || (in.AuthToken != "" && !c.hub.pairing.MatchesDevice(in.AuthToken, c.deviceID))) {
+		c.enqueueEvent(protocol.Error{Type: "error", Code: "offline_device_guard_identity_changed", Message: "The guarded QA connection must retain its original paired identity."})
+		return nil
+	}
+	logInbound(in.Type, in.SessionID)
+	c.hub.touchDeviceInventory(c)
+	c.hub.route(ctx, c, c.hub.client.ParseCommand(in))
+	return nil
 }

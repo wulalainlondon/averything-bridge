@@ -1,4 +1,4 @@
-// Package sourcepolicy centralizes Codex session-source isolation.
+// Package sourcepolicy centralizes provider session-source isolation.
 package sourcepolicy
 
 import (
@@ -21,6 +21,20 @@ func CodexSessionsDir() string {
 func CodexHome() string {
 	return filepath.Dir(CodexSessionsDir())
 }
+
+func ClaudeConfigDir() string {
+	if value := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); value != "" {
+		value = expand(value)
+		if absolute, err := filepath.Abs(value); err == nil {
+			return absolute
+		}
+		return filepath.Clean(value)
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude")
+}
+
+func ClaudeProjectsDir() string { return filepath.Join(ClaudeConfigDir(), "projects") }
 
 func CodexIgnoreCWDGlobs() []string {
 	return splitList(os.Getenv("EVERYTHING_GO_CODEX_IGNORE_CWD_GLOBS"))

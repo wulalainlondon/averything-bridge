@@ -1,0 +1,88 @@
+LINE original-voice bridge — Android and browser candidate
+
+What is implemented
+The phone's existing AI voice session is stopped and its closure acknowledged.
+A new WebRTC audio leg connects the phone to the Go Bridge. Go relays Opus to a
+Node worker that resolves one exact LINE friend name, obtains a LINE call route,
+places one personal audio call, and converts both audio directions to 48 kHz mono
+20 ms Opus frames. The AI audio leg is not connected during the LINE conversation.
+
+The Android microphone foreground service can transfer an existing owned voice
+call in the background without starting an unrelated microphone session. The
+browser supports the same handoff while foregrounded. iOS does not advertise the
+LINE entry in this candidate. After hanging up, use the normal voice button to
+resume the original assistant conversation.
+
+The in-app LINE button accepts the exact friend display name. The scoped native
+tool bridge_line.connect_voice accepts peer_name and targets only the calling
+conversation's exact active phone voice. Its receipt means handoff requested,
+not ringing or answered. The phone and server report ringing/connected separately.
+The worker emits ringing only after the SETUP acknowledgement. This proves
+accepted signaling, not that the recipient phone sounded or displayed an incoming
+call. Bounded stage diagnostics distinguish route, transport, invitation and
+answer failures without exposing raw SDK errors. Invitation and answer timeouts
+are separate codes. A remote release is not proof of a manual recipient hangup.
+
+Install prerequisites
+Use Node 24 or newer and run npm ci in this directory. Configure the Bridge process
+with the values described in bridge.env.example, preserving its normal instance,
+session data directory and launch parameters. The feature remains unavailable
+unless LINEJS_ALLOW_CALLS=1 and the worker/data-directory configuration is present.
+Do not use the loopback-fixture.mjs testing worker for a live deployment.
+The worker explicitly loads linejs-transport.mjs for the pinned 3.4.2 reply-
+transaction repair; see TRANSPORT_PATCH.txt. Unknown SDK transport hashes are
+rejected before credentials or dialing. No dependency install script is needed;
+npm ci --ignore-scripts preserves the repair. A safe startup diagnostic on an
+authorized call identifies the original and repaired transport hashes.
+
+Existing credentials
+LINEJS_DATA_DIR must contain the existing session.enc and be writable by the
+Bridge service user. macOS uses the original authorized Keychain helper and the
+existing service name derived from this absolute data path. No credentials or
+key are included in this package. Moving only session.enc to Linux is insufficient;
+the matching encryption key must be provisioned separately. Linux requires a
+systemd credential named linejs-master-key, containing the exact 32 key bytes,
+with no group/world access. The worker will never silently create a replacement
+key or register a new LINE account/device.
+
+Call ownership and limits
+One LINE account and one active LINE call per Bridge are supported. The encrypted
+store is locked for the call; a simultaneous lab CLI operation may report busy.
+Each call has a persistent ID consumed before an invitation. Ambiguous results
+are never automatically redialed. User mute settings carry over. The maximum
+attempt/call lifetime is 30 minutes. Audio queues are bounded and paced; raw
+speech and credentials are not logged or saved. A server-side TURN allocation
+can be configured with LINEJS_ICE_SERVERS_JSON. Real mobile/WAN connectivity,
+headset routing and audible LINE interoperability still require device testing.
+
+Controlled live verification (one explicitly chosen recipient)
+Set the same credential environment, then run:
+  node test-call.mjs --peer '<exact friend name>' --id '<stable test request ID>' --confirm-one-call
+The test plays five seconds of a synthetic tone after connection, observes received
+audio-frame activity, and hangs up ten seconds after connecting by default.
+An explicit --hold-seconds 1200 keeps the connected LINE leg open for twenty
+minutes. The hold begins only after the connected event; setup has a separate
+60-second deadline. Connected tests print cumulative activity once per minute.
+After the initial tone, the test keeps sending valid Opus silence every 20 ms
+until the hold ends, to avoid treating an absent media sender as a long call.
+This standalone test supplies synthetic media, not a phone microphone,
+and does not validate twenty minutes of bidirectional phone audio. Use the
+deployed Bridge phone route to validate a continuous user-to-user conversation.
+The child receives stop on completion and is forcibly reaped after five seconds
+if graceful shutdown fails. It prints state/counts only, never audio or
+credentials. The recipient must confirm hearing the tone; inbound frame activity
+alone is not proof the phone user heard the peer. Reusing the same test ID cannot
+redial. Never silently substitute a new ID after an uncertain outcome.
+
+Validation boundaries
+The offline fixture establishes a real local WebRTC connection through the Node
+Opus codec and returns audio. It never contacts LINE and does not prove a LINE
+call was audible. The existing LINE login was successfully resumed by this worker.
+Full end-to-end acceptance requires an authorized real call and Android listening/
+speaking confirmation, plus mute/hangup and return-to-assistant verification.
+
+Deployment artifacts
+The Android APK is a debug candidate with the existing application ID; do not
+uninstall a personal installation to work around a signing mismatch. Integrate
+the source changes into the normal release/signing workflow for an app update.
+The Go binaries are candidates; building them does not replace a running Bridge.

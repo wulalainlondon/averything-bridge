@@ -43,6 +43,30 @@ func TestPerDeviceAckAndRestartPersistence(t *testing.T) {
 	}
 }
 
+func TestWorkPinSurvivesRestartAndPreventsTTLCollection(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	s.now = func() time.Time { return time.UnixMilli(1_800_000_000_000) }
+	record, added := s.Add(protocol.Media{Type: "media", SessionID: "s1", RequestID: "r1", MediaType: "image", Path: filepath.Join(dir, "pinned.png")})
+	found, pinned := s.Pin(record.AttachmentID, "wi1")
+	if !added || !found || !pinned {
+		t.Fatalf("record=%+v added=%v", record, added)
+	}
+
+	s = New(dir)
+	s.now = func() time.Time { return time.UnixMilli(1_800_000_000_000).Add(ttl + time.Hour) }
+	if got, ok := s.Get(record.AttachmentID); !ok || !got.PinnedByWork["wi1"] {
+		t.Fatalf("pinned record missing after restart: %+v ok=%v", got, ok)
+	}
+	if pending := s.Pending("other-device", "s1", 10); len(pending) != 1 {
+		t.Fatalf("pinned expired record was collected: %+v", pending)
+	}
+	s.Unpin(record.AttachmentID, "wi1")
+	if pending := s.Pending("other-device", "s1", 10); len(pending) != 0 {
+		t.Fatalf("unpinned expired record retained: %+v", pending)
+	}
+}
+
 func TestTTLRemovesExpiredRecords(t *testing.T) {
 	s := New("")
 	now := time.Unix(2_000_000, 0)

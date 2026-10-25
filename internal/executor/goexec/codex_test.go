@@ -31,6 +31,19 @@ func (w *rpcCaptureWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func TestCodexDefaultModelFollowsRuntimeCatalog(t *testing.T) {
+	c := NewCodex(&capSink{}, "codex")
+	if got := c.defaultModel(); got != codexDefaultModel {
+		t.Fatalf("startup fallback = %q, want %q", got, codexDefaultModel)
+	}
+	c.catalogMu.Lock()
+	c.catalog = backend.Definition{ID: backend.Codex, DefaultModel: "gpt-6-astra"}
+	c.catalogMu.Unlock()
+	if got := c.defaultModel(); got != "gpt-6-astra" {
+		t.Fatalf("runtime catalog default = %q, want gpt-6-astra", got)
+	}
+}
+
 func TestCodexSteerUsesExpectedActiveTurnAndClientMessageID(t *testing.T) {
 	c := NewCodex(&capSink{}, "codex")
 	reg := session.NewRegistry()
@@ -116,6 +129,7 @@ func TestCodexRootTurnCompletionFinishesTheOwningSession(t *testing.T) {
 	s := reg.Create("s1", "codex", "/tmp", "codex", "gpt-5.6-sol", "", "")
 	st := c.state(s.ID)
 	st.threadID = "root"
+	st.currentTurnID = "t1"
 	st.turnActive = true
 	st.turnDone = make(chan struct{})
 	c.threadToSession["root"] = s
@@ -167,6 +181,7 @@ func TestCodexActiveTurnRouteCannotBeStolenByDuplicateSession(t *testing.T) {
 	ownerState := c.state(owner.ID)
 	ownerState.threadID = "root"
 	ownerState.reqID = "r-owner"
+	ownerState.currentTurnID = "t1"
 	ownerState.turnActive = true
 	ownerState.turnDone = make(chan struct{})
 	duplicateState := c.state(duplicate.ID)
@@ -464,6 +479,83 @@ func TestCodexInvalidateLiveThreadsClearsAllSessionRoutes(t *testing.T) {
 	}
 }
 
+func TestCodexDisconnectFailsActiveTurnAndExpiresInteractions(t *testing.T) {
+	sink := &capSink{}
+	c := NewCodex(sink, "codex")
+	reg := session.NewRegistry()
+	s := reg.Create("s1", "one", "/tmp", backend.Codex, "", "", "")
+	st := c.state(s.ID)
+	st.threadID = "thread-1"
+	st.currentTurnID = "turn-1"
+	st.reqID = "request-1"
+	st.turnActive = true
+	st.turnDone = make(chan struct{})
+	blocking := true
+	c.interactions["ui-1"] = codexInteraction{payload: backend.UserInputPayload{
+		RequestID: "ui-1", SessionID: s.ID, IsBlocking: &blocking,
+	}}
+
+	c.failLiveOperations("connection lost")
+	c.expireDisconnectedInteractions()
+
+	select {
+	case <-st.turnDone:
+	default:
+		t.Fatal("active turn was not released after daemon disconnect")
+	}
+	st.mu.Lock()
+	turnErr, active := st.turnErr, st.turnActive
+	st.mu.Unlock()
+	if active || !strings.Contains(turnErr, "not retried automatically") {
+		t.Fatalf("disconnect state active=%v err=%q", active, turnErr)
+	}
+	if pending := c.PendingInteractions(s.ID); len(pending) != 0 {
+		t.Fatalf("stale interactions survived disconnect: %+v", pending)
+	}
+	if sink.count(func(event any) bool {
+		resolved, ok := event.(backend.InteractionResolved)
+		return ok && resolved.RequestID == "ui-1" && resolved.Status == "expired"
+	}) != 1 {
+		t.Fatalf("interaction expiration event missing: %+v", sink.events)
+	}
+}
+
+func TestDecodeCodexDaemonVersionReportsRestartRequired(t *testing.T) {
+	got, err := decodeCodexDaemonVersion([]byte(`{
+		"status":"running","backend":"pid","cliVersion":"0.153.0",
+		"managedCodexVersion":"0.153.0","appServerVersion":"0.149.0",
+		"managedCodexPath":"/codex","socketPath":"/codex.sock"
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["status"] != "restart_required" || got["managed_version"] != "0.153.0" || got["running_version"] != "0.149.0" {
+		t.Fatalf("unexpected daemon diagnostics: %+v", got)
+	}
+}
+
+func TestCodexAppliesThreadRuntimeMetadata(t *testing.T) {
+	sink := &capSink{}
+	c := NewCodex(sink, "codex")
+	reg := session.NewRegistry()
+	s := reg.Create("s1", "one", "/tmp", backend.Codex, "old-model", "", "")
+	s.SetEffort("low")
+	c.applyThreadRuntimeMetadata(s, json.RawMessage(`{
+		"thread":{"id":"thread-1","model":"gpt-5.6-sol","reasoningEffort":"high"}
+	}`))
+
+	snap := s.Snapshot()
+	if snap.Model != "gpt-5.6-sol" || snap.Effort != "high" {
+		t.Fatalf("runtime metadata not applied: %+v", snap)
+	}
+	if sink.count(func(event any) bool {
+		updated, ok := event.(protocol.SessionMetaUpdated)
+		return ok && updated.Model != nil && *updated.Model == "gpt-5.6-sol" && updated.Effort != nil && *updated.Effort == "high"
+	}) != 1 {
+		t.Fatalf("session metadata event missing: %+v", sink.events)
+	}
+}
+
 func TestCodexDetectsStaleThreadErrors(t *testing.T) {
 	cases := []string{
 		"Unknown session: abc",
@@ -496,6 +588,95 @@ func TestEnsureThreadClassifiesActiveWriter(t *testing.T) {
 	err := c.ensureThread(s, c.state(s.ID))
 	if !errors.Is(err, backend.ErrThreadActiveWriter) {
 		t.Fatalf("ensureThread error = %v, want ErrThreadActiveWriter", err)
+	}
+}
+
+func TestUpdateSessionSettingsAddressesPersistedThreadWithLegacyUnsetMode(t *testing.T) {
+	c := NewCodex(&capSink{}, "codex")
+	reg := session.NewRegistry()
+	s := reg.Create("logical", "session", t.TempDir(), backend.Codex, "", "danger-full-access", "thread-desktop")
+	// Leave codexState.threadID empty to model a thread owned by Desktop/shared
+	// daemon. An empty legacy mode leaves the runtime mode unspecified; the UI
+	// now sends "default" explicitly when the user leaves Plan.
+	s.SetEffort("")
+	empty := ""
+	s.ApplyCodexSettings(&empty, &empty, &empty)
+
+	writer := &rpcCaptureWriter{writes: make(chan []byte, 1)}
+	c.rpc.setWriter(writer)
+	go func() {
+		request := <-writer.writes
+		var frame struct {
+			ID     int            `json:"id"`
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		if err := json.Unmarshal(request, &frame); err != nil {
+			t.Errorf("decode settings request: %v", err)
+			return
+		}
+		if frame.Method != "thread/settings/update" || frame.Params["threadId"] != "thread-desktop" {
+			t.Errorf("unexpected settings frame: %+v", frame)
+		}
+		for _, key := range []string{"model", "effort", "serviceTier", "personality", "collaborationMode"} {
+			if value, exists := frame.Params[key]; !exists || value != nil {
+				t.Errorf("%s should be null when unspecified, got %#v", key, value)
+			}
+		}
+		c.rpc.dispatchResponse(json.RawMessage(fmt.Sprintf(`{"id":%d,"result":{}}`, frame.ID)))
+	}()
+
+	if err := c.UpdateSessionSettings(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateSessionSettingsSendsExplicitDefaultAndPreservesModel(t *testing.T) {
+	c := NewCodex(&capSink{}, "codex")
+	c.collaborationModes["default"] = map[string]any{
+		"mode": "default", "settings": map[string]any{"model": "catalog-default", "reasoning_effort": nil},
+	}
+	s := session.NewRegistry().Create("logical", "session", t.TempDir(), backend.Codex, "gpt-6-sol", "danger-full-access", "thread-desktop")
+	s.SetEffort("high")
+	defaultMode := "default"
+	s.ApplyCodexSettings(nil, &defaultMode, nil)
+
+	writer := &rpcCaptureWriter{writes: make(chan []byte, 1)}
+	c.rpc.setWriter(writer)
+	done := make(chan error, 1)
+	go func() { done <- c.UpdateSessionSettings(context.Background(), s) }()
+	select {
+	case request := <-writer.writes:
+		var frame struct {
+			ID     int            `json:"id"`
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		if err := json.Unmarshal(request, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Method != "thread/settings/update" || frame.Params["model"] != "gpt-6-sol" || frame.Params["effort"] != "high" {
+			t.Fatalf("unexpected settings update: %+v", frame)
+		}
+		mode, ok := frame.Params["collaborationMode"].(map[string]any)
+		if !ok || mode["mode"] != "default" {
+			t.Fatalf("Default mode was not explicit: %+v", frame.Params["collaborationMode"])
+		}
+		settings, ok := mode["settings"].(map[string]any)
+		if !ok || settings["model"] != "gpt-6-sol" || settings["reasoning_effort"] != "high" {
+			t.Fatalf("Default mode lost session model/effort: %+v", mode)
+		}
+		c.rpc.dispatchResponse(json.RawMessage(fmt.Sprintf(`{"id":%d,"result":{}}`, frame.ID)))
+	case <-time.After(time.Second):
+		t.Fatal("missing settings update")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	turn := c.codexTurnParamsForSession("thread-desktop", nil, s.Snapshot(), "")
+	mode, ok := turn["collaborationMode"].(map[string]any)
+	if !ok || mode["mode"] != "default" {
+		t.Fatalf("next turn did not retain explicit Default mode: %+v", turn)
 	}
 }
 
@@ -685,42 +866,6 @@ func TestCodexTurnLivenessPolicy(t *testing.T) {
 	}
 }
 
-func TestCodexTurnDeadlineWaitsIndefinitelyForUserInput(t *testing.T) {
-	c := NewCodex(&capSink{}, "codex")
-	c.turnTimeout = 20 * time.Millisecond
-	c.interactions["ui_1"] = codexInteraction{payload: backend.UserInputPayload{
-		RequestID: "ui_1",
-		SessionID: "s1",
-		Status:    "pending",
-	}}
-
-	// Model the runTurn deadline branch: the timer has fired, but a pending
-	// interaction must re-arm it instead of allowing the turn to be aborted.
-	timer := time.NewTimer(time.Millisecond)
-	<-timer.C
-	if !c.deferTurnDeadlineForInput("s1", timer) {
-		t.Fatal("pending user input should defer the turn deadline")
-	}
-	select {
-	case <-timer.C:
-		// Re-arming is the expected behavior. Repeating this branch for as long
-		// as the interaction stays pending makes the wait unbounded.
-	case <-time.After(time.Second):
-		t.Fatal("deferred turn deadline was not re-armed")
-	}
-	if !c.deferTurnDeadlineForInput("s1", timer) {
-		t.Fatal("unanswered input should continue deferring every deadline")
-	}
-
-	c.interMu.Lock()
-	delete(c.interactions, "ui_1")
-	c.interMu.Unlock()
-	if c.deferTurnDeadlineForInput("s1", timer) {
-		t.Fatal("resolved input must restore the ordinary turn deadline")
-	}
-	timer.Stop()
-}
-
 func TestCodexStateActivityResetsStallWarning(t *testing.T) {
 	st := newCodexState()
 	st.stallWarned = true
@@ -747,8 +892,28 @@ func TestCodexTurnParamsForwardsSupportedEffort(t *testing.T) {
 	}
 }
 
+func TestCodexTurnSandboxPolicyOverridesReviewAndRestoresSessionDefault(t *testing.T) {
+	c := NewCodex(&capSink{}, "codex")
+	input := []map[string]any{{"type": "text", "text": "review"}}
+	snap := session.Snapshot{Cwd: t.TempDir(), Sandbox: "danger-full-access"}
+
+	review := c.codexTurnParamsForSession("thread-1", input, snap, "read-only")
+	reviewPolicy, ok := review["sandboxPolicy"].(map[string]any)
+	if !ok || reviewPolicy["type"] != "readOnly" || reviewPolicy["networkAccess"] != false {
+		t.Fatalf("review sandbox policy=%+v", review["sandboxPolicy"])
+	}
+
+	interactive := c.codexTurnParamsForSession("thread-1", input, snap, "")
+	interactivePolicy, ok := interactive["sandboxPolicy"].(map[string]any)
+	if !ok || interactivePolicy["type"] != "dangerFullAccess" {
+		t.Fatalf("interactive sandbox policy=%+v", interactive["sandboxPolicy"])
+	}
+}
+
 func TestCodexInputIncludesFilesAndImages(t *testing.T) {
 	c := NewCodex(&capSink{}, "codex")
+	dataDir := t.TempDir()
+	c.SetDataDir(dataDir)
 	reg := session.NewRegistry()
 	cwd := t.TempDir()
 	s := reg.Create("s1", "codex", cwd, "codex", "", "", "")
@@ -757,6 +922,7 @@ func TestCodexInputIncludesFilesAndImages(t *testing.T) {
 
 	input := c.codexInput(
 		s,
+		"r1",
 		"r1",
 		"hello",
 		[]backend.ImageAttachment{{Data: png, MediaType: "image/png"}},
@@ -778,13 +944,62 @@ func TestCodexInputIncludesFilesAndImages(t *testing.T) {
 	if filepath.Ext(path) != ".png" {
 		t.Fatalf("image path extension = %q, want .png", filepath.Ext(path))
 	}
+	if filepath.Dir(path) != filepath.Join(dataDir, "codex-input-images") {
+		t.Fatalf("image staged outside runtime dir: %q", path)
+	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("image temp file missing: %v", err)
 	}
 
-	c.cleanupTempImages(st)
+	c.cleanupTempImages(st, "r1")
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("image temp file should be removed, stat err=%v", err)
+	}
+}
+
+func TestCodexTempImageCleanupIsScopedToOwningTurn(t *testing.T) {
+	c := NewCodex(&capSink{}, "codex")
+	c.SetDataDir(t.TempDir())
+	reg := session.NewRegistry()
+	s := reg.Create("s1", "codex", t.TempDir(), "codex", "", "", "")
+	st := c.state(s.ID)
+	png := base64.StdEncoding.EncodeToString([]byte("fake-png"))
+
+	oldInput := c.codexInput(s, "old-request", "old-request", "old", []backend.ImageAttachment{{Data: png, MediaType: "image/png"}}, nil, st)
+	newInput := c.codexInput(s, "new-request", "new-request", "new", []backend.ImageAttachment{{Data: png, MediaType: "image/png"}}, nil, st)
+	oldPath, _ := oldInput[1]["path"].(string)
+	newPath, _ := newInput[1]["path"].(string)
+
+	// This models the critical ordering: the next turn stages its image after
+	// the old turn emits terminal state but before the old runTurn defer runs.
+	c.cleanupTempImages(st, "old-request")
+
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old turn image should be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("old turn cleanup removed the next turn image: %v", err)
+	}
+	c.cleanupTempImages(st, "new-request")
+}
+
+func TestCodexSteerImagesBelongToActiveTurn(t *testing.T) {
+	c := NewCodex(&capSink{}, "codex")
+	c.SetDataDir(t.TempDir())
+	reg := session.NewRegistry()
+	s := reg.Create("s1", "codex", t.TempDir(), "codex", "", "", "")
+	st := c.state(s.ID)
+	png := base64.StdEncoding.EncodeToString([]byte("fake-png"))
+
+	input := c.codexInput(s, "steer-message", "active-turn", "steer", []backend.ImageAttachment{{Data: png, MediaType: "image/png"}}, nil, st)
+	path, _ := input[1]["path"].(string)
+	c.cleanupTempImages(st, "steer-message")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("client message id must not own active-turn image: %v", err)
+	}
+	c.cleanupTempImages(st, "active-turn")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("active turn cleanup should remove steered image, stat err=%v", err)
 	}
 }
 
@@ -871,6 +1086,90 @@ func TestCodexExtractedAskUserQuestionEmitsFallbackInteraction(t *testing.T) {
 	}
 	if !sawRequest || !sawResolved {
 		t.Fatalf("missing interaction events request=%v resolved=%v events=%+v", sawRequest, sawResolved, sink.events)
+	}
+}
+
+func TestCodexAsyncUserInputCarriesLifecycleAndServerResolution(t *testing.T) {
+	sink := &capSink{}
+	c := NewCodex(sink, "codex")
+	reg := session.NewRegistry()
+	s := reg.Create("s1", "codex", "/tmp", backend.Codex, "", "", "")
+	st := c.state(s.ID)
+	st.threadID = "thread-1"
+	st.reqID = "turn-request"
+	c.threadToSession["thread-1"] = s
+	w := &captureWriter{}
+	c.rpc.setWriter(w)
+	before := time.Now().UnixMilli()
+
+	c.handleServerRequest("rpc-async", "item/tool/requestUserInput", json.RawMessage(`{
+		"threadId":"thread-1","turnId":"turn-1","itemId":"ask-async",
+		"isBlocking":false,"autoResolutionMs":60000,
+		"questions":[{"id":"token","header":"Credential","question":"Enter token","isSecret":true}]
+	}`))
+
+	pending := c.PendingInteractions(s.ID)
+	if len(pending) != 1 {
+		t.Fatalf("async interaction missing: %+v", pending)
+	}
+	got := pending[0]
+	if got.Kind != "request_user_input_async" || got.IsBlocking == nil || *got.IsBlocking ||
+		got.ExpiresAt < before+59000 || len(got.Questions) != 1 || !got.Questions[0].Secret || got.Questions[0].Type != "secret" {
+		t.Fatalf("bad async interaction: %+v", got)
+	}
+	if c.hasPendingInteraction(s.ID) {
+		t.Fatal("non-blocking async question must not extend the turn deadline")
+	}
+
+	c.dispatch(json.RawMessage(`{
+		"method":"serverRequest/resolved",
+		"params":{"threadId":"thread-1","requestId":"rpc-async"}
+	}`))
+	if pending := c.PendingInteractions(s.ID); len(pending) != 0 {
+		t.Fatalf("server-resolved interaction retained: %+v", pending)
+	}
+	if sink.count(func(event any) bool {
+		resolved, ok := event.(backend.InteractionResolved)
+		return ok && resolved.RequestID == got.RequestID && resolved.Status == "expired"
+	}) != 1 {
+		t.Fatalf("server resolution event missing: %+v", sink.events)
+	}
+}
+
+func TestCodexV2UserInputResponseUsesStructuredAnswerArrays(t *testing.T) {
+	c := NewCodex(&capSink{}, "codex")
+	reg := session.NewRegistry()
+	s := reg.Create("s1", "codex", "/tmp", backend.Codex, "", "", "")
+	st := c.state(s.ID)
+	st.threadID = "thread-1"
+	c.threadToSession["thread-1"] = s
+	w := &captureWriter{}
+	c.rpc.setWriter(w)
+
+	c.handleServerRequest(91, "item/tool/requestUserInput", json.RawMessage(`{
+		"threadId":"thread-1","turnId":"turn-1","itemId":"ask-v2","isBlocking":true,
+		"questions":[
+			{"id":"choice","header":"Choice","question":"Pick","options":[{"label":"A","description":"first"}]},
+			{"id":"notes","header":"Notes","question":"Explain","options":null}
+		]
+	}`))
+	if !c.RespondUserInput("ask-v2", map[string]any{"choice": "A", "notes": "because"}, false) {
+		t.Fatal("v2 request was not resolved")
+	}
+	var reply struct {
+		ID     int `json:"id"`
+		Result struct {
+			Answers map[string]struct {
+				Answers []string `json:"answers"`
+			} `json:"answers"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(w.Bytes()), &reply); err != nil {
+		t.Fatalf("bad v2 reply: %v raw=%s", err, w.String())
+	}
+	if reply.ID != 91 || len(reply.Result.Answers["choice"].Answers) != 1 ||
+		reply.Result.Answers["choice"].Answers[0] != "A" || reply.Result.Answers["notes"].Answers[0] != "because" {
+		t.Fatalf("unexpected v2 response: %+v", reply)
 	}
 }
 
@@ -989,6 +1288,35 @@ func TestCodexLiveToolStartNormalizesFunctionCall(t *testing.T) {
 	}
 	if got.ToolUseID != "call_1" || got.Name != "Bash" || got.Command != "pwd" {
 		t.Fatalf("bad normalized tool_start: %+v", got)
+	}
+}
+
+func TestCodexConversationItemsDoNotEmitToolLifecycle(t *testing.T) {
+	for _, itemType := range []string{"userMessage", "agentMessage", "reasoning", "plan"} {
+		t.Run(itemType, func(t *testing.T) {
+			sink := &capSink{}
+			c := NewCodex(sink, "codex")
+			reg := session.NewRegistry()
+			s := reg.Create("s1", "codex", "/tmp", "codex", "", "", "")
+			st := c.state(s.ID)
+			st.threadID = "thread-1"
+			st.reqID = "r1"
+			c.threadToSession["thread-1"] = s
+
+			for _, method := range []string{"item/started", "item/completed"} {
+				c.dispatch(json.RawMessage(fmt.Sprintf(`{
+					"method":%q,
+					"params":{"threadId":"thread-1","item":{"id":"item-1","type":%q}}
+				}`, method, itemType)))
+			}
+
+			for _, event := range sink.events {
+				switch event.(type) {
+				case backend.ToolStart, backend.ToolResult, backend.ToolEnd:
+					t.Fatalf("conversation item %q emitted tool lifecycle event: %#v", itemType, event)
+				}
+			}
+		})
 	}
 }
 

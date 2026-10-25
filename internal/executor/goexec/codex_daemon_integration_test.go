@@ -88,6 +88,58 @@ func TestCodexSharedDaemonIntegration(t *testing.T) {
 	}
 }
 
+// Opt-in protocol probe for the lightweight shared-daemon attach path.
+// excludeTurns keeps thread/resume from serializing the full rollout while
+// preserving the subscription needed for streaming and terminal events.
+func TestCodexSharedDaemonResumeWithoutTurnsThenTurnIntegration(t *testing.T) {
+	if os.Getenv("EVERYTHING_GO_RUN_CODEX_DAEMON_INTEGRATION") != "1" {
+		t.Skip("set EVERYTHING_GO_RUN_CODEX_DAEMON_INTEGRATION=1")
+	}
+	cwd := t.TempDir()
+	sinkA, sinkB := &capSink{}, &capSink{}
+	a := NewCodex(sinkA, "codex")
+	b := NewCodex(sinkB, "codex")
+	a.appServerMode, b.appServerMode = "daemon", "daemon"
+	for _, c := range []*Codex{a, b} {
+		if err := c.ensureServer(); err != nil {
+			t.Fatal(err)
+		}
+		defer func(c *Codex) {
+			c.startMu.Lock()
+			_ = c.stopServerLocked()
+			c.startMu.Unlock()
+		}(c)
+	}
+
+	regA := session.NewRegistry()
+	sa := regA.Create("resume-seed", "daemon resume seed", cwd, backend.Codex, codexDefaultModel, "workspace-write", "")
+	if err := a.Send(context.Background(), sa, "seed", "Reply exactly RESUME_WITHOUT_TURNS_SEED", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitForCodexDone(t, sinkA, 2*time.Minute)
+	threadID := sa.ResumeID()
+	if err := a.ReleaseSession(context.Background(), sa); err != nil {
+		t.Fatalf("release seed client: %v", err)
+	}
+
+	regB := session.NewRegistry()
+	sb := regB.Create("resume-client", "daemon resume client", cwd, backend.Codex, codexDefaultModel, "workspace-write", threadID)
+	raw, err := b.rpcCall("thread/resume", map[string]any{"threadId": threadID, "excludeTurns": true}, 15*time.Second)
+	if err != nil {
+		t.Fatalf("thread/resume without turns: %v", err)
+	}
+	if got := extractThreadID(raw, threadID); got != threadID {
+		t.Fatalf("thread/resume id=%q, want %q", got, threadID)
+	}
+	st := b.state(sb.ID)
+	st.threadID = threadID
+	b.threadToSession[threadID] = sb
+	if err := b.Send(context.Background(), sb, "resume-turn", "Reply exactly RESUME_WITHOUT_TURNS_OK", nil, nil); err != nil {
+		t.Fatalf("turn after lightweight resume: %v", err)
+	}
+	waitForCodexDone(t, sinkB, 2*time.Minute)
+}
+
 // Opt-in read-only probe for a thread currently attached to another daemon
 // client (typically a desktop TUI). It never resumes, starts, or mutates the
 // thread; it verifies which metadata RPCs are safe across client connections.
@@ -114,6 +166,41 @@ func TestCodexSharedDaemonReadsDesktopOwnedThread(t *testing.T) {
 	if err := c.GetGoal(context.Background(), s); err != nil {
 		t.Fatalf("GetGoal on desktop-owned thread: %v", err)
 	}
+}
+
+// Opt-in non-turn probe for the exact attach operation used by Bridge. It may
+// briefly subscribe this client to the thread, then immediately unsubscribes;
+// it never starts, interrupts, archives, or deletes a turn.
+func TestCodexSharedDaemonResumesDesktopOwnedThreadWithoutTurns(t *testing.T) {
+	threadID := os.Getenv("EVERYTHING_GO_CODEX_DESKTOP_THREAD_ID")
+	if threadID == "" {
+		t.Skip("set EVERYTHING_GO_CODEX_DESKTOP_THREAD_ID to an attached desktop thread")
+	}
+	c := NewCodex(&capSink{}, "codex")
+	c.appServerMode = "daemon"
+	if err := c.ensureServer(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c.startMu.Lock()
+		_ = c.stopServerLocked()
+		c.startMu.Unlock()
+	})
+	started := time.Now()
+	raw, err := c.rpcCall("thread/resume", map[string]any{"threadId": threadID, "excludeTurns": true}, 15*time.Second)
+	if err != nil {
+		t.Fatalf("thread/resume without turns: %v", err)
+	}
+	if got := extractThreadID(raw, threadID); got != threadID {
+		t.Fatalf("thread/resume id=%q, want %q", got, threadID)
+	}
+	if len(raw) > 1024*1024 {
+		t.Fatalf("metadata-only resume response=%d bytes, want <=1 MiB", len(raw))
+	}
+	if _, err := c.rpcCall("thread/unsubscribe", map[string]any{"threadId": threadID}, 15*time.Second); err != nil {
+		t.Fatalf("thread/unsubscribe: %v", err)
+	}
+	t.Logf("thread_id=%s response_bytes=%d elapsed=%s", threadID, len(raw), time.Since(started))
 }
 
 func waitForCodexDone(t *testing.T, sink *capSink, timeout time.Duration) {

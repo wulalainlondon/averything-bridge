@@ -1,0 +1,39 @@
+{
+  "contracts": [
+    {
+      "version": "1.0.0-rc.1",
+      "schema_sha256": "674aada21ce809c5bec8324b192163c4f3c4acf7f5b57f39042eacd9982d23fa",
+      "operations": "retained independent general TaskAPI"
+    },
+    {
+      "version": "1.0.0-rc.2",
+      "status": "obsolete/unsupported; no alias"
+    },
+    {
+      "version": "1.0.0-rc.3",
+      "schema_sha256": "a981431618cc0f0b7f493b6907cfecf7940a1dd95f258bff609538e04cab135e",
+      "operations": [
+        "artifact_capabilities",
+        "read_artifact_bytes"
+      ],
+      "status": "candidate-only explicit artifact family"
+    },
+    {
+      "version": "1.0.0-rc.4",
+      "schema_sha256": "bc435ada82f2cad34f8c0bcc4df7a6a3c9029e38d3e3211fc7581d08e55d9bea",
+      "operations": [
+        "artifact_capabilities",
+        "read_artifact_bytes"
+      ],
+      "status": "candidate-only artifact family; explicit owner request selector"
+    },
+    {
+      "version": "1.0.0-rc.5",
+      "schema_sha256": "3e78613002191eb5e4080da40cd94adbd4c870a6e8c2c6ecf8fa1a1834bb8892",
+      "operations": [
+        "interactions"
+      ],
+      "status": "candidate-only original-parent interaction extension"
+    }
+  ]
+}

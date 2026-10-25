@@ -1,21 +1,17 @@
-# Release and Update Flow
+# Reviewed public Go releases
 
-The public repository is `wulalainlondon/averything-bridge`. A `v*` tag triggers `.github/workflows/release.yml`.
+The canonical source and macOS ARM64/Intel release is [everything-go](https://github.com/wulalainlondon/everything-go). The support repository averything-bridge retains historical releases and redirects new installation to the same fixed canonical tag. Historical tag bytes must never be replaced.
 
-Required repository secrets:
+The current source version is read from `RELEASE_VERSION`. The former v0.2.86 installer default was historical preparation, not evidence of a current publication. The installer now requires an explicit published `EVERYTHING_GO_TAG` or a reviewed local `.app.zip` plus its independently recorded SHA256. It never falls back to another tag or `latest`. See [deployment](DEPLOYMENT.md) for exact fresh-install and preserved-data update steps. Legacy Linux/Windows delivery is not newly qualified by the macOS deployment evidence.
 
-- `MACOS_CERTIFICATE_P12_BASE64`
-- `MACOS_CERTIFICATE_PASSWORD`
-- `MACOS_KEYCHAIN_PASSWORD`
-- `MACOS_CODESIGN_IDENTITY`
-- `APPSTORE_CONNECT_API_KEY_ID`
-- `APPSTORE_CONNECT_API_ISSUER_ID`
-- `APPSTORE_CONNECT_API_KEY_P8_BASE64`
+For each release, RELEASE_VERSION, both native Go main-module versions, bundle versions, clean binary VCS and embedded release provenance must agree. Intel and ARM64 packages must be qualified separately; one architecture's acceptance does not certify the other. Do not claim a release URL is available until publication and independent readback.
 
-FCM service-account credentials are never release secrets and must never be
-embedded in a public binary. Deployments that need push notifications pass a
-local `0600` JSON file with `--service-account`.
+Production packages require Developer ID Application team UPWLTJL6S2, hardened runtime and timestamp, Apple Accepted submission, staple validation, Gatekeeper, artifact credential scan, source archive/provenance and SHA256SUMS. Both architecture payloads come from one clean reviewed source. Remote capture helpers require macOS14; the Go service bundle minimum remains12. Existing CLI installation/login, account/quota and voice availability remain operator prerequisites. Codex0.160 is the tested app-server protocol baseline; Claude2.1.280 and2.1.291 evidence is separately tagged, not universal model parity. PM narrower targets, BG/steer/active cancellation can remain typed unsupported.
 
-The workflow cross-builds macOS, Linux, and Windows; packages both macOS architectures as app bundles; enforces the exact Developer ID identity; notarizes and staples; then publishes installers, binaries, app bundles, and `SHA256SUMS`.
+Tag CI only verifies source and compiles; it does not read signing credentials or publish. After independent exact-source, credential-flow and signed/stapled artifact gates, the authorized release controller pushes a new release branch/tag without force and publishes only those frozen bytes. Check advertised remote refs against recorded expected heads immediately before push. Divergent remote main is preserved; use a new branch/tag and a reviewed non-force merge separately. Do not use git add . or replace dirty source overlays.
 
-Before tagging, follow [the release checklist](../RELEASE_CHECKLIST.md). To update a normal installation, re-run the installer from the latest release. The macOS installer verifies checksum, code signature, team ID, Gatekeeper, and notarization before it changes the service, and restores the previous signed app if the health check fails.
+Local public preparation uses the independently reviewed RAM credential flow: private API PEM only in a proved owned RAM filesystem, no argv/env/physical temporary-file fallback, output allowlist and persisted original notary receipt with no automatic replay. The old disk-P8 adapters/incident are not relabeled compliant. scripts/notarize_macos_app_zip.sh accepts only a pre-provisioned notarytool Keychain profile and creates no credential file. Never run the historical helper to obtain a key. Missing credential/GUI authorization is a concrete blocker, not grounds to copy another machine's credentials.
+
+The fresh installer refuses existing data, wrappers, service labels and occupied ports before replacing anything. Existing installations use the separate preserved-data update procedure, retaining pairing/config/data, launch flags, service guards and the preceding app backup. Update only the necessary Go launchd label when separately authorized; leave official Codex/Claude supervisors and original native work running. Record receipt uncertainty across restart without replay or cancellation. Runtime role differences are lawful configuration, not different source payloads.
+
+Compatible rollback uses the same-source taskapihold build: only NEW TaskAPI create/append admission pauses; original same-key receipts/conflicts, reads, internal delivery and scoped accepted work remain authoritative. Never use an old unsafe executor or restore a DB while scoped children remain. A public release alone does not authorize Wulala/Morrie promotion or device installation.

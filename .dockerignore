@@ -1,0 +1,26 @@
+# Runtime credentials/state must never enter a container build context.
+**/everything-go
+!cmd/everything-go
+!cmd/everything-go/**
+# Private exclusions come after source-directory re-inclusion.
+.git
+.env
+.env.*
+cmd/everything-go/keys/*.json
+**/fcm_service_account.json
+**/serviceAccountKey.json
+**/push_relay_client.json
+**/.push-relay-client-*
+**/*_secret
+**/pairing.json
+**/fcm_tokens.json
+**/fcm_token.txt
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+push-relay-data
+build
+dist
+release-artifacts
+.tmp

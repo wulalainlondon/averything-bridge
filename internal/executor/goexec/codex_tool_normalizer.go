@@ -30,7 +30,7 @@ type codexToolPayload struct {
 	CallID    string          `json:"call_id"`
 	CallID2   string          `json:"callId"`
 	ID        string          `json:"id"`
-	Output    string          `json:"output"`
+	Output    json.RawMessage `json:"output"`
 }
 
 func normalizeCodexResponseTool(payload json.RawMessage, output string) (codexToolCall, bool) {
@@ -68,7 +68,35 @@ func codexResponseToolOutput(payload json.RawMessage) (string, string, bool) {
 	if id == "" {
 		return "", "", false
 	}
-	return id, p.Output, true
+	return id, codexResponseOutputText(p.Output), true
+}
+
+// Rollouts may store tool output as typed text parts instead of a string.
+// Preserve each text part and its ordering; unfamiliar structured content
+// keeps its original JSON rather than silently disappearing.
+func codexResponseOutputText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var parts []struct {
+		Type string  `json:"type"`
+		Text *string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		texts := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if part.Text == nil || (part.Type != "input_text" && part.Type != "output_text" && part.Type != "text") {
+				return string(raw)
+			}
+			texts = append(texts, *part.Text)
+		}
+		return strings.Join(texts, "\n")
+	}
+	return string(raw)
 }
 
 func normalizeCodexLiveTool(params json.RawMessage) (codexToolCall, bool) {
@@ -102,6 +130,10 @@ func normalizeCodexLiveTool(params json.RawMessage) (codexToolCall, bool) {
 		raw, _ := json.Marshal(p.Item)
 		return normalizeCodexResponseTool(raw, "")
 	}
+	itemType := firstNonEmpty(p.Type, p.Item.Type)
+	if !isCodexLiveToolType(itemType) {
+		return codexToolCall{}, false
+	}
 	rawName := firstNonEmpty(p.Name, p.Item.Name, p.Type, p.Item.Type, "codex_tool")
 	if rawName == "update_plan" {
 		return codexToolCall{}, false
@@ -113,6 +145,26 @@ func normalizeCodexLiveTool(params json.RawMessage) (codexToolCall, bool) {
 		Name:    name,
 		Command: command,
 	}, true
+}
+
+// isCodexLiveToolType is intentionally an allow-list. App-server emits
+// item/started and item/completed for conversational lifecycle items such as
+// userMessage, agentMessage, reasoning and plan as well as real tool calls.
+// Treating every unknown item as a tool makes an ordinary first response flash
+// "running tool: userMessage/agentMessage" in the authoritative runtime UI.
+func isCodexLiveToolType(itemType string) bool {
+	switch itemType {
+	case "commandExecution", "command_execution", "command",
+		"fileChange", "file_change", "applyPatch",
+		"mcpToolCall", "mcp_tool_call",
+		"dynamicToolCall", "dynamic_tool_call",
+		"webSearch", "web_search",
+		"imageGeneration", "image_generation",
+		"imageView", "image_view":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeCodexToolNameCommand(rawName string, raw json.RawMessage) (string, string) {

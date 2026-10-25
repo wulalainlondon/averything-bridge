@@ -7,6 +7,7 @@ if [ "$#" -ne 3 ]; then
 fi
 
 BIN_SRC="$1"
+node "$(dirname "$0")/check_release_secrets.mjs" "$BIN_SRC"
 ARCH="$2"
 OUT_ZIP="$3"
 OUT_DIR="$(dirname "$OUT_ZIP")"
@@ -16,8 +17,14 @@ OUT_ZIP="$(cd "$OUT_DIR" && pwd)/$OUT_BASE"
 
 APP_NAME="Everything Go"
 BUNDLE_ID="${EVERYTHING_GO_BUNDLE_ID:-com.everything-go.app}"
-VERSION="${EVERYTHING_GO_VERSION:-0.0.0}"
+RELEASE_VERSION="$(cat "$(dirname "$0")/../RELEASE_VERSION")"
+VERSION="${EVERYTHING_GO_VERSION:-$RELEASE_VERSION}"
+[ "$VERSION" = "$RELEASE_VERSION" ] || { echo "release version mismatch" >&2; exit 1; }
+[ -z "$(git -C "$(dirname "$0")/.." status --porcelain --untracked-files=all)" ] || { echo "release source must be clean" >&2; exit 1; }
 SIGN_IDENTITY="${EVERYTHING_GO_CODESIGN_IDENTITY:--}"
+RELEASE_MODE="${EVERYTHING_GO_RELEASE_MODE:-normal}"
+case "$RELEASE_MODE" in normal|compatible-hold) ;; *) echo "invalid release mode" >&2; exit 1 ;; esac
+export EVERYTHING_GO_RELEASE_MODE="$RELEASE_MODE"
 
 if [ "$SIGN_IDENTITY" != "Developer ID Application: YuDi Huang (UPWLTJL6S2)" ]; then
   echo "refusing to package release with unexpected signing identity: $SIGN_IDENTITY" >&2
@@ -34,6 +41,19 @@ mkdir -p "$MACOS_DIR" "$RES_DIR"
 
 cp "$BIN_SRC" "$MACOS_DIR/everything-go"
 chmod +x "$MACOS_DIR/everything-go"
+case "$ARCH" in
+  arm64) SWIFT_TARGET="arm64-apple-macosx14.0" ;;
+  amd64) SWIFT_TARGET="x86_64-apple-macosx14.0" ;;
+  *) echo "unsupported macOS architecture: $ARCH" >&2; exit 2 ;;
+esac
+xcrun swiftc -parse-as-library -O -target "$SWIFT_TARGET" \
+  -o "$MACOS_DIR/bridge-remote-helper" "$(dirname "$0")/../native/bridge-remote-helper.swift"
+xcrun swiftc -parse-as-library -O -target "$SWIFT_TARGET" \
+  -o "$MACOS_DIR/bridge-remote-stream" "$(dirname "$0")/../native/bridge-remote-stream.swift"
+if [ "${EVERYTHING_GO_INCLUDE_LINE:-0}" = "1" ]; then
+  node "$(dirname "$0")/stage_line_runtime.mjs" "$RES_DIR/line"
+fi
+"$(dirname "$0")/write_release_provenance.sh" "$RES_DIR/release-provenance.json"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -49,6 +69,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>BridgeReleaseMode</key><string>$RELEASE_MODE</string>
+  <key>BridgeSourceRevision</key><string>$(git -C "$(dirname "$0")/.." rev-parse HEAD)</string>
   <key>LSBackgroundOnly</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>

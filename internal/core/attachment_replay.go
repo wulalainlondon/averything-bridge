@@ -22,6 +22,13 @@ func attachmentReplayKey(deviceID, sessionID string) string {
 }
 
 func (h *Hub) emitAttachment(event any) {
+	// Fresh room workers have no host-file output authority. Room attachments
+	// are saved through the scoped hash/blob gateway, never the global media
+	// URL registry or per-device legacy attachment journal.
+	if h.workspaceRoomNativeEvent(event) {
+		logOutbound(workspaceWire{Type: "workspace_artifact_requires_room_gateway"})
+		return
+	}
 	record, added := h.attachments.Add(event)
 	if !added {
 		return

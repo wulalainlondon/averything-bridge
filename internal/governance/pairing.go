@@ -26,6 +26,22 @@ type pairedDevice struct {
 	PairedAt int64  `json:"paired_at"`
 }
 
+// DeviceBinding is an internal snapshot. Credentials are never JSON-encoded.
+type DeviceBinding struct {
+	Token    string `json:"-"`
+	DeviceID string `json:"-"`
+}
+
+func (p *Pairing) DeviceBindings() []DeviceBinding {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]DeviceBinding, 0, len(p.devices))
+	for _, device := range p.devices {
+		out = append(out, DeviceBinding{Token: device.Token, DeviceID: device.DeviceID})
+	}
+	return out
+}
+
 type pairingFile struct {
 	Version int            `json:"version,omitempty"`
 	Devices []pairedDevice `json:"devices,omitempty"`
@@ -81,6 +97,15 @@ func (p *Pairing) LockedTo(token string) bool {
 	defer p.mu.Unlock()
 	_, ok := p.devices[token]
 	return token != "" && ok
+}
+
+// Read scope membership comes from the authenticated credential's persisted
+// binding, never from the device ID or owner name asserted by a hello frame.
+func (p *Pairing) MatchesDevice(token, deviceID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	device, ok := p.devices[token]
+	return ok && token != "" && deviceID != "" && device.DeviceID == deviceID
 }
 
 func (p *Pairing) OpenEnrollment(duration time.Duration) time.Time {

@@ -13,19 +13,16 @@ import (
 	"everything-go/internal/session"
 )
 
-const defaultTerminalTimeout = 2 * time.Hour
-
 type turnKey struct {
 	sessionID string
 	reqID     string
 }
 
 // TerminalSink wraps the real outbound sink and tracks terminal turn events.
-// Reliable executors use it to guarantee a started turn eventually emits one of
-// done/error/stopped, even when the backend returns an error, panics, or wedges.
+// Reliable executors report confirmed terminals, send failures and panics.
+// Elapsed time alone is not a terminal: it cannot settle an active native turn.
 type TerminalSink struct {
 	delegate Sink
-	timeout  time.Duration
 
 	mu       sync.Mutex
 	inflight map[turnKey]chan struct{}
@@ -33,16 +30,13 @@ type TerminalSink struct {
 }
 
 func NewTerminalSink(delegate Sink) *TerminalSink {
-	return NewTerminalSinkWithTimeout(delegate, defaultTerminalTimeout)
+	return &TerminalSink{delegate: delegate, inflight: make(map[turnKey]chan struct{}), bySess: make(map[string]map[turnKey]bool)}
 }
 
-func NewTerminalSinkWithTimeout(delegate Sink, timeout time.Duration) *TerminalSink {
-	return &TerminalSink{
-		delegate: delegate,
-		timeout:  timeout,
-		inflight: make(map[turnKey]chan struct{}),
-		bySess:   make(map[string]map[turnKey]bool),
-	}
+// Deprecated: the duration is ignored. Keep source compatibility for embedders,
+// but never manufacture an error or free a live turn on a wall-clock deadline.
+func NewTerminalSinkWithTimeout(delegate Sink, _ time.Duration) *TerminalSink {
+	return NewTerminalSink(delegate)
 }
 
 func (s *TerminalSink) Emit(event any) {
@@ -61,17 +55,6 @@ func (s *TerminalSink) Begin(sessionID, reqID string) turnKey {
 	s.bySess[sessionID][k] = true
 	s.mu.Unlock()
 
-	if s.timeout > 0 {
-		go func() {
-			select {
-			case <-done:
-			case <-time.After(s.timeout):
-				if s.complete(k) {
-					s.delegate.Emit(backend.NewError(sessionID, "", backend.ErrTimeout, "executor turn timed out without a terminal event"))
-				}
-			}
-		}()
-	}
 	return k
 }
 
@@ -113,6 +96,10 @@ func (s *TerminalSink) completeSession(sessionID string) {
 
 func (s *TerminalSink) observeTerminal(event any) {
 	switch e := event.(type) {
+	case backend.NativeSubmissionUncertain:
+		// This settles the adapter invocation, not the native work. The Hub
+		// retains its uncertain receipt; do not overwrite it with send_error.
+		s.complete(turnKey{sessionID: e.SessionID, reqID: e.RequestID})
 	case protocol.Done:
 		s.complete(turnKey{sessionID: e.SessionID, reqID: e.RequestID})
 	case protocol.Stopped:
@@ -147,7 +134,7 @@ func sendReliable(ctx context.Context, inner Executor, sink *TerminalSink, s *se
 		}
 	}()
 	err = inner.Send(ctx, s, reqID, content, images, files)
-	if errors.Is(err, backend.ErrThreadActiveWriter) {
+	if errors.Is(err, backend.ErrThreadActiveWriter) || errors.Is(err, backend.ErrNativeSubmissionBusy) {
 		// The Hub converts this ownership conflict into a durable session_control
 		// event plus a request-scoped rejection. Do not manufacture a generic red
 		// send_error before it gets that opportunity.

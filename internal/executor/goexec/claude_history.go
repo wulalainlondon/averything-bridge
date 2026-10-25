@@ -30,23 +30,43 @@ func (c *Claude) TranscriptPath(resumeID string) (string, bool) {
 
 // findSessionFile locates <uuid>.jsonl under any ~/.claude/projects/* dir.
 func (c *Claude) findSessionFile(uuid string) string {
+	path, _ := c.findSessionFileChecked(uuid)
+	return path
+}
+
+func (c *Claude) findSessionFileChecked(uuid string) (string, error) {
+	if uuid == "" {
+		return "", nil
+	}
 	entries, err := os.ReadDir(c.projectsDir)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
 	if err != nil {
-		return ""
+		return "", history.SourceError("claude", c.projectsDir, err)
 	}
 	for _, proj := range entries {
 		if !proj.IsDir() {
 			continue
 		}
-		candidate := filepath.Join(c.projectsDir, proj.Name(), uuid+".jsonl")
-		if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() {
-			return candidate
+		project := filepath.Join(c.projectsDir, proj.Name())
+		if err := history.CheckDirectory("claude", project); err != nil {
+			return "", err
+		}
+		candidate := filepath.Join(project, uuid+".jsonl")
+		fi, err := os.Stat(candidate)
+		if err == nil && !fi.IsDir() {
+			return candidate, nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return "", history.SourceError("claude", candidate, err)
 		}
 	}
-	return ""
+	return "", nil
 }
 
 type claudeRow struct {
+	UUID                      string `json:"uuid"`
 	Type                      string `json:"type"`
 	IsSidechain               bool   `json:"isSidechain"`
 	IsCompactSummary          bool   `json:"isCompactSummary"`
@@ -54,7 +74,8 @@ type claudeRow struct {
 	Timestamp                 string `json:"timestamp"`
 	Cwd                       string `json:"cwd"`
 	Message                   struct {
-		Content json.RawMessage `json:"content"`
+		Content    json.RawMessage `json:"content"`
+		StopReason string          `json:"stop_reason"`
 	} `json:"message"`
 }
 
@@ -71,13 +92,38 @@ type claudeBlock struct {
 
 // LoadHistory parses the session JSONL into wire messages and slices it.
 func (c *Claude) LoadHistory(resumeID string, opts history.Opts) (*history.Result, error) {
-	path := c.findSessionFile(resumeID)
+	path, findErr := c.findSessionFileChecked(resumeID)
+	if findErr != nil {
+		return nil, findErr
+	}
 	if path == "" {
 		return history.Slice(nil, opts), nil
 	}
+	if err := history.CheckFile("claude", path); err != nil {
+		return nil, err
+	}
 	fi, err := os.Stat(path)
-	if err != nil || fi.IsDir() {
+	if err != nil {
+		return nil, history.SourceError("claude", path, err)
+	}
+	if fi.IsDir() {
 		return history.Slice(nil, opts), nil
+	}
+	if opts.Scoped || opts.Before != "" || opts.Mode == "continuation" || opts.Mode == "beginning" {
+		if _, ok := physicalHistoryCursor("claude", resumeID, opts); ok {
+			return loadNativeWindowPage("claude", resumeID, opts, func(cursor int) (history.FileWindow, error) {
+				return history.ReadFileWindow(path, cursor, history.LoadMaxBytes())
+			}, func(window history.FileWindow) ([]map[string]any, error) {
+				messages, _, e := parseClaudeHistoryLines(window.Lines, resumeID, fi.ModTime().UnixMilli(), window.MoreBefore)
+				if e != nil {
+					return nil, e
+				}
+				if !opts.IncludeThinking {
+					messages = history.StripThinkingBlocks(messages)
+				}
+				return messages, nil
+			})
+		}
 	}
 	mtimeNS := fi.ModTime().UnixNano()
 	size := fi.Size()
@@ -90,29 +136,43 @@ func (c *Claude) LoadHistory(resumeID string, opts history.Opts) (*history.Resul
 		return history.Slice(messages, opts), nil
 	}
 
-	messages, truncated := loadClaudeHistoryMessages(path, resumeID, fi.ModTime().UnixMilli())
+	messages, truncated, loadErr := loadClaudeHistoryMessagesChecked(path, resumeID, fi.ModTime().UnixMilli())
+	if loadErr != nil {
+		return nil, history.SourceError("claude", path, loadErr)
+	}
 	if !truncated {
 		history.DefaultCache().SaveAsync(cacheName, key, messages)
 	}
 	if !opts.IncludeThinking {
 		messages = history.StripThinkingBlocks(messages)
 	}
-	return history.Slice(messages, opts), nil
+	result := history.Slice(messages, opts)
+	result.HasMoreBefore = result.HasMoreBefore || truncated
+	return result, nil
 }
 
 // loadClaudeHistoryMessages parses the transcript and returns its wire messages
 // plus whether the file was tail-truncated (too large to hold whole). A
 // truncated result must not be cached, since it is only the most recent window.
 func loadClaudeHistoryMessages(path, resumeID string, fileMtimeMs int64) ([]map[string]any, bool) {
+	messages, truncated, _ := loadClaudeHistoryMessagesChecked(path, resumeID, fileMtimeMs)
+	return messages, truncated
+}
+
+func loadClaudeHistoryMessagesChecked(path, resumeID string, fileMtimeMs int64) ([]map[string]any, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	defer f.Close()
 	lines, truncated, err := history.StreamTailLines(f, history.LoadMaxBytes())
 	if err != nil {
-		return nil, truncated
+		return nil, truncated, err
 	}
+	return parseClaudeHistoryLines(lines, resumeID, fileMtimeMs, truncated)
+}
+
+func parseClaudeHistoryLines(lines []history.TailLine, resumeID string, fileMtimeMs int64, truncated bool) ([]map[string]any, bool, error) {
 	type rec struct {
 		lineNo int
 		row    claudeRow
@@ -173,17 +233,23 @@ func loadClaudeHistoryMessages(path, resumeID string, fileMtimeMs int64) ([]map[
 			blocks = []map[string]any{{"type": "text", "text": text}}
 		}
 		tsMs := parseISOms(d.Timestamp)
+		verifiedTimestamp := tsMs > 0
 		if tsMs == 0 {
 			tsMs = fileMtimeMs
 		}
-		messages = append(messages, history.CompleteMsg(
+		message := history.CompleteMsg(
 			"claude", resumeID,
 			"claude:"+resumeID+":line:"+itoa(rc.lineNo),
 			d.Type, text, tsMs, blocks,
-		))
+		)
+		message["history_timestamp_verified"] = verifiedTimestamp
+		// A fresh thinking/tool/progress row from the same API request is not
+		// proof that the completed answer has reached native history.
+		message["history_read_result_verified"] = d.Type == "assistant" && d.Message.StopReason == "end_turn" && strings.TrimSpace(text) != ""
+		messages = append(messages, message)
 	}
 
-	return messages, truncated
+	return messages, truncated, nil
 }
 
 func parseBlocks(content json.RawMessage) []claudeBlock {
@@ -258,8 +324,11 @@ func flattenToolResult(content json.RawMessage) string {
 // ResumableSessions scans ~/.claude/projects for session transcripts.
 func (c *Claude) ResumableSessions(limit int) ([]history.ResumableSession, error) {
 	projs, err := os.ReadDir(c.projectsDir)
-	if err != nil {
+	if os.IsNotExist(err) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, history.SourceError("claude", c.projectsDir, err)
 	}
 	var sessions []history.ResumableSession
 	for _, proj := range projs {
@@ -268,8 +337,11 @@ func (c *Claude) ResumableSessions(limit int) ([]history.ResumableSession, error
 		}
 		projPath := filepath.Join(c.projectsDir, proj.Name())
 		files, err := os.ReadDir(projPath)
-		if err != nil {
+		if os.IsNotExist(err) {
 			continue
+		}
+		if err != nil {
+			return nil, history.SourceError("claude", projPath, err)
 		}
 		for _, entry := range files {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
@@ -278,7 +350,10 @@ func (c *Claude) ResumableSessions(limit int) ([]history.ResumableSession, error
 			uuid := strings.TrimSuffix(entry.Name(), ".jsonl")
 			fi, err := entry.Info()
 			if err != nil {
-				continue
+				return nil, history.SourceError("claude", filepath.Join(projPath, entry.Name()), err)
+			}
+			if err := history.CheckFile("claude", filepath.Join(projPath, entry.Name())); err != nil {
+				return nil, err
 			}
 			cwd, name := scanCwdAndName(filepath.Join(projPath, entry.Name()))
 			if cwd == "" {
@@ -381,4 +456,43 @@ func itoa(n int) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
+}
+
+// NativeTaskFinalAnchor retains the existing line-based public anchor while
+// verifying the exact UUID in the provider's canonical native transcript.
+// Stream stdout alone is never the final anchor authority.
+func (c *Claude) NativeTaskFinalAnchor(conversation, uuid, text string) (string, bool) {
+	path := c.findSessionFile(conversation)
+	if path == "" || uuid == "" {
+		return "", false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	lines, _, err := history.StreamTailLines(f, history.LoadMaxBytes())
+	if err != nil {
+		return "", false
+	}
+	match := ""
+	for _, ln := range lines {
+		var r claudeRow
+		if json.Unmarshal(ln.Data, &r) != nil || r.UUID != uuid {
+			continue
+		}
+		if r.Type != "assistant" || r.IsSidechain || r.IsCompactSummary || r.IsVisibleInTranscriptOnly || r.Message.StopReason != "end_turn" {
+			return "", false
+		}
+		content, _ := buildClaudeBlocks(r.Message.Content, "assistant", map[string]string{})
+		if content != text {
+			return "", false
+		}
+		id := "claude:" + conversation + ":line:" + itoa(ln.LineNo)
+		if match != "" && match != id {
+			return "", false
+		}
+		match = id
+	}
+	return match, match != ""
 }

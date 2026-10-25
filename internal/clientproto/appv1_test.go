@@ -202,3 +202,41 @@ func TestAppV1ParseCommandMapsOperationalFields(t *testing.T) {
 		t.Fatalf("fork/feed fields not mapped: %+v", cmd)
 	}
 }
+
+func TestAppV1ParseCommandMapsNativeWorkItemFields(t *testing.T) {
+	app := NewAppV1()
+	in, err := protocol.ParseInbound([]byte(`{
+		"type":"work_item_move",
+		"project_id":"p1",
+		"work_item_id":"wi1",
+		"mutation_id":"m1",
+		"expected_version":7,
+		"revision":11,
+		"lifecycle":"active",
+		"priority":"high",
+		"sort_key":2000000,
+		"description":"ship it",
+		"workspace_path":"/repo",
+		"thread_id":"t1",
+		"role":"primary",
+		"depends_on_id":"wi0",
+		"blocked_reason_code":"input",
+		"blocked_note":"waiting",
+		"delivered_revision":10,
+		"acked_revision":9,
+		"fields":["description","priority"]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := app.ParseCommand(in)
+	if cmd.WorkItemID != "wi1" || cmd.ProjectID != "p1" || cmd.MutationID != "m1" || cmd.ExpectedVersion != 7 {
+		t.Fatalf("bad work identity: %+v", cmd)
+	}
+	if cmd.Lifecycle != "active" || cmd.Priority != "high" || cmd.SortKey != 2_000_000 || cmd.Description != "ship it" {
+		t.Fatalf("bad work mutation: %+v", cmd)
+	}
+	if cmd.DeliveredRevision != 10 || cmd.AckedRevision != 9 || len(cmd.Fields) != 2 {
+		t.Fatalf("bad work sync fields: %+v", cmd)
+	}
+}

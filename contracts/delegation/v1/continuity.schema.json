@@ -1,0 +1,158 @@
+{
+  "version": "1",
+  "authority": "bound_original_parent_native_tool",
+  "tools": [
+    {
+      "type": "function",
+      "name": "continue_delegation",
+      "description": "Continue this original parent's own legacy delegated logical task on the same session/native thread with an immutable profile and a distinct durable r_ request/round/parent return. queue waits for capacity; steer must explicitly name this task's active request and never falls back to a new turn. Refusals never create a successor. For TaskAPI queue continuation use bridge_tasks.append with return_to_parent=true; explicit steer uses this confined original-parent entry and the original active task scope. ACK is acceptance only; on uncertainty read get_delegation_rounds/original receipt, never replay under a new call ID.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "delegation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "expected_previous_round_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "instance_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "expected_thread_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "expected_config_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32000
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "queue",
+              "steer"
+            ]
+          },
+          "active_request_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "delegation_id",
+          "expected_previous_round_id",
+          "instance_id",
+          "expected_thread_id",
+          "expected_config_revision",
+          "content",
+          "mode"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "mode": {
+                  "const": "steer"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "active_request_id"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "get_delegation_rounds",
+      "description": "Read bounded history and independent execution/delivery/QA axes for this parent’s logical task; no global management permission.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "delegation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "after_version": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "delegation_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "bind_delegation_qa",
+      "description": "Bind an immutable responsibility relation between this parent’s owner and a distinct QA session/native thread. No same-session self QA or replacement QA.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "owner_delegation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "qa_delegation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "owner_delegation_id",
+          "qa_delegation_id"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "record_delegation_review",
+      "description": "Link exact completed owner and independent QA rounds. Verdict is parsed from the sealed QA final JSON {owner_round_id,verdict:PASS|FAIL}; model cannot supply/override a verdict. Prior failures are immutable.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "owner_round_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "qa_round_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "owner_round_id",
+          "qa_round_id"
+        ]
+      }
+    }
+  ]
+}

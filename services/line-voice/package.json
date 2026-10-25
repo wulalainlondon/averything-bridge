@@ -1,0 +1,20 @@
+{
+  "name": "bridge-linejs-voice",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "start": "node worker.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@evex/linejs": "npm:@jsr/evex__linejs@3.4.2",
+    "undici": "7.30.0"
+  },
+  "overrides": {
+    "thrift": "0.23.0",
+    "@jsr/evex__linejs-types": "3.5.0"
+  }
+}
